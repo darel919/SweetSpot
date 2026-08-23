@@ -36,8 +36,8 @@ class DynamicsProcessingProbe {
         // Primary candidate band counts required by the milestone.
         private val CANDIDATE_BANDS = intArrayOf(10, 20, 32, 64)
         // Only probed if 64 passes cleanly.
-        private val EXTRA_BANDS = intArrayOf(96, 128)
-        // 128 is the maximum band count we use — the calibration-resolution
+        private val EXTRA_BANDS = intArrayOf()
+        // 64 is the maximum band count we use — the calibration-resolution
         // cap (derived from iPhone-mic calibration). No higher ladder is probed.
         private val CEILING_BANDS = intArrayOf()
     }

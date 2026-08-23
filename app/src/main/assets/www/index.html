@@ -102,14 +102,14 @@
       <h3>Persistent instance</h3>
       <p class="muted">Long-lived enabled effect for memory / CPU / reliability checks.</p>
       <div class="save-row">
-        <input type="number" v-model.number="persistBands" min="1" max="128" />
+        <input type="number" v-model.number="persistBands" min="1" max="64" />
         <button @click="createPersistent">Create (enabled)</button>
         <button @click="releasePersistent">Release</button>
       </div>
       <p>Status: <strong :style="{ color: persistent.active ? '#6ee7a8' : '#f06a6a' }">{{ persistent.active ? 'ACTIVE' : 'none' }}</strong><span v-if="persistent.active"> @ {{ persistent.bands }} bands</span></p>
 
       <h3>Test curve (audible proof)</h3>
-      <p class="muted">Applies a dramatic EQ to prove the instance is on the live path. Auto-creates a 1024-band instance if none exists.</p>
+      <p class="muted">Applies a dramatic EQ to prove the instance is on the live path. Auto-creates a 64-band instance if none exists.</p>
       <div class="save-row">
         <button @click="applyCurve('hollow')">Hollow −15 dB mids</button>
         <button @click="applyCurve('flat')">Reset (flat)</button>
@@ -121,7 +121,7 @@
       <div class="save-row">
         <button @click="quickAudible(32)">Test 32</button>
         <button @click="quickAudible(64)">Test 64</button>
-        <button @click="quickAudible(128)">Test 128</button>
+        <button @click="quickAudible(16)">Test 16</button>
       </div>
 
       <h3>Device / Memory</h3>
@@ -132,8 +132,8 @@
     <div class="modal-mask" v-if="showCalWizard" @click.self="showCalWizard=false">
       <div class="modal">
         <h3>Calibration Wizard (stub)</h3>
-        <p>Paste a JSON array of 128 dB values (20 Hz–20 kHz, log-spaced) from the iPhone measurement, or load a test curve.</p>
-        <textarea v-model="calJson" rows="5" placeholder="[0, -1.2, 3.0, ... 128 numbers]"></textarea>
+        <p>Paste a JSON array of 64 dB values (20 Hz–20 kHz, log-spaced) from the iPhone measurement, or load a test curve.</p>
+        <textarea v-model="calJson" rows="5" placeholder="[0, -1.2, 3.0, ... 64 numbers]"></textarea>
         <div class="modal-actions">
           <button @click="applyCalibrationCurve()">Apply curve</button>
           <button @click="loadTestCalibration()">Load test (hollow)</button>

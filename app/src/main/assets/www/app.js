@@ -32,7 +32,7 @@ createApp({
       cpuPercent: 0, persistentProbeActive: false, persistentProbeBands: 0,
       audioserverCpuPercent: 0, audioserverPid: null
     });
-    const persistBands = ref(128);
+    const persistBands = ref(64);
     const showCalWizard = ref(false);
     const calJson = ref('');
     const calStatus = ref('');
@@ -241,7 +241,7 @@ createApp({
     function applyCalibrationCurve() {
       let arr;
       try { arr = JSON.parse(calJson.value); } catch (e) { calStatus.value = 'Invalid JSON'; return; }
-      if (!Array.isArray(arr) || arr.length !== 128) { calStatus.value = 'Need exactly 128 numbers'; return; }
+      if (!Array.isArray(arr) || arr.length !== 64) { calStatus.value = 'Need exactly 64 numbers'; return; }
       fetch('/api/eq/calibration', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ gains: arr }) })
         .then(r => r.json()).then(d => { calStatus.value = d.error ? ('Failed: ' + d.error) : 'Applied'; getState(); })
         .catch(() => { calStatus.value = 'Request failed'; });

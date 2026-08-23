@@ -279,7 +279,7 @@ class WebServer(
             method == "POST" && path == "/api/eq/calibration" -> {
                 val gains = parseFloatArrayField(body, "gains")
                 val ok = gains != null && (serviceActions?.setCalibrationBands(gains) ?: false)
-                sendJson(client, if (ok) calibrationJson() else """{"error":"invalid","expected":128}""")
+                sendJson(client, if (ok) calibrationJson() else """{"error":"invalid","expected":64}""")
             }
 
             method == "POST" && path == "/api/eq/calibration/reset" -> {

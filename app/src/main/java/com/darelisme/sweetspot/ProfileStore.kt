@@ -88,7 +88,7 @@ class ProfileStore(context: Context) {
             ?.split(',')
             ?.mapNotNull { it.toFloatOrNull() }
             ?.toFloatArray()
-        return if (s != null && s.size == 128) s else null
+        return if (s != null && s.size == 64) s else null
     }
 
     fun saveCalibration(gains: FloatArray) {

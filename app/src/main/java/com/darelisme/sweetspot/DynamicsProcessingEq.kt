@@ -22,7 +22,7 @@ import kotlin.math.*
 class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine {
 
     companion object {
-        const val INTERNAL_BANDS = 128
+        const val INTERNAL_BANDS = 64
         const val USER_BANDS = 24
         private const val SESSION_ID = 0
         private const val PRIORITY = 1000

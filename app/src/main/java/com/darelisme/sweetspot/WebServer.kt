@@ -56,6 +56,11 @@ interface ServiceActions {
     fun getPersistentProbeCurve(): String?
     fun getPersistentProbeCurveSummary(): DynamicsProcessingProbe.CurveSummary?
 
+    /** Audio effect chain diagnostics (effect inventory + session-0 probes). */
+    fun runEffectDiagnostics()
+    fun getEffectInventory(): List<AudioEffectDiagnostics.EffectInventoryEntry>
+    fun getSessionProbes(): List<AudioEffectDiagnostics.SessionProbe>
+
     // Calibration (64-band read-only base curve; wizard/API only).
     fun getCalibrationBands(): FloatArray?
     fun getCalibrationFrequenciesHz(): IntArray?
@@ -277,6 +282,14 @@ class WebServer(
             method == "GET" && path == "/api/probe/persistent" ->
                 sendJson(client, persistentStatusJson())
 
+            method == "POST" && path == "/api/effects/diagnose" -> {
+                serviceActions?.runEffectDiagnostics()
+                sendJson(client, """{"status":"started"}""")
+            }
+
+            method == "GET" && path == "/api/effects/diagnostics" ->
+                sendJson(client, effectDiagnosticsJson())
+
             // --- Calibration (read-only base curve; wizard/API only) ---
             method == "GET" && path == "/api/eq/calibration" ->
                 sendJson(client, calibrationJson())
@@ -388,6 +401,13 @@ class WebServer(
                 })
             }
         }.toString()
+    }
+
+    private fun effectDiagnosticsJson(): String {
+        val inv = serviceActions?.getEffectInventory()
+        val probes = serviceActions?.getSessionProbes()
+        if (inv == null || probes == null) return """{"error":"not_run_yet"}"""
+        return AudioEffectDiagnostics.payloadJson(inv, probes).put("available", true).toString()
     }
 
     private fun deviceInfoJson(): String {

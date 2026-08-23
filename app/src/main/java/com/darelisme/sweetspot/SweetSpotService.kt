@@ -84,7 +84,8 @@ class SweetSpotService : Service(), ServiceActions {
         }
         relay = MailboxClient(
             roomProvider = { pairCodes.current() },
-            snapshotProvider = { stateSnapshotJson() }
+            snapshotProvider = { stateSnapshotJson() },
+            effectsDiagnosticsProvider = { runEffectDiagnosticsBlocking() }
         ).also { client ->
             client.listener = object : MailboxClient.Listener {
                 override fun onDeviceOnline(online: Boolean) {
@@ -248,6 +249,46 @@ class SweetSpotService : Service(), ServiceActions {
     }
 
     override fun getPersistentProbeCurve(): String? = persistentCurveName
+
+    // --- Effect chain diagnostics (matrixing capability check) ---
+
+    @Volatile private var effectInventory: List<AudioEffectDiagnostics.EffectInventoryEntry>? = null
+    @Volatile private var sessionProbes: List<AudioEffectDiagnostics.SessionProbe>? = null
+
+    /** Runs diagnostics synchronously; called from the mailbox poll thread. */
+    fun runEffectDiagnosticsBlocking(): JSONObject {
+        suspendProduction()
+        try {
+            val (inv, probes) = AudioEffectDiagnostics().runAll()
+            effectInventory = inv
+            sessionProbes = probes
+            return AudioEffectDiagnostics.payloadJson(inv, probes)
+        } finally {
+            resumeProduction()
+        }
+    }
+
+    override fun runEffectDiagnostics() {
+        Log.i(TAG, "Audio effect diagnostics requested")
+        suspendProduction()
+        probeExecutor.submit {
+            try {
+                val (inv, probes) = AudioEffectDiagnostics().runAll()
+                effectInventory = inv
+                sessionProbes = probes
+            } catch (e: Throwable) {
+                Log.e(TAG, "Effect diagnostics error", e)
+            } finally {
+                resumeProduction()
+            }
+        }
+    }
+
+    override fun getEffectInventory(): List<AudioEffectDiagnostics.EffectInventoryEntry> =
+        effectInventory ?: emptyList()
+
+    override fun getSessionProbes(): List<AudioEffectDiagnostics.SessionProbe> =
+        sessionProbes ?: emptyList()
 
     override fun getPersistentProbeCurveSummary(): DynamicsProcessingProbe.CurveSummary? {
         val dp = persistentDp ?: return null

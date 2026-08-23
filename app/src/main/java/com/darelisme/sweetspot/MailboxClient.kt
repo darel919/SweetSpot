@@ -19,6 +19,8 @@ import org.json.JSONObject
 class MailboxClient(
     private val roomProvider: () -> String,
     private val snapshotProvider: () -> JSONObject,
+    /** Runs effect-chain diagnostics on a background thread; called for 'diagnostics.effects'. */
+    private val effectsDiagnosticsProvider: (() -> JSONObject)? = null,
 ) {
 
     companion object {
@@ -107,6 +109,19 @@ class MailboxClient(
         when (env.optString("type")) {
             "ping" -> postToDevice(env, "pong")
             "state.get" -> postToDevice(env, "state.snapshot", snapshotProvider())
+            "diagnostics.effects" -> {
+                val provider = effectsDiagnosticsProvider
+                if (provider == null) {
+                    postToDevice(env, "diagnostics.effects", JSONObject().put("error", "unavailable"))
+                } else {
+                    try {
+                        postToDevice(env, "diagnostics.effects", provider())
+                    } catch (e: Exception) {
+                        Log.e(TAG, "diagnostics.effects failed", e)
+                        postToDevice(env, "diagnostics.effects", JSONObject().put("error", "${e.javaClass.simpleName}: ${e.message}"))
+                    }
+                }
+            }
             else -> Log.d(TAG, "Ignoring command type ${env.optString("type")}")
         }
     }

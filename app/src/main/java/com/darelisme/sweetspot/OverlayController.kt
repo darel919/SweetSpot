@@ -35,7 +35,7 @@ class OverlayController(private val context: Context) {
         private const val TAG = "SweetSpotOverlay"
         private const val QR_SIZE_PX = 320
 
-        // Relay states, mirrored from RelayClient.
+        // Mailbox presence states, mirrored from MailboxClient.
         const val RELAY_DISCONNECTED = "disconnected"
         const val RELAY_CONNECTING = "connecting"
         const val RELAY_WAITING = "waiting"

@@ -48,7 +48,7 @@ class SweetSpotService : Service(), ServiceActions {
     private var engine: AudioEngine? = null
     private var webServer: WebServer? = null
     private var overlay: OverlayController? = null
-    private var relay: RelayClient? = null
+    private var relay: MailboxClient? = null
     private val pairCodes = PairCodeManager()
     private lateinit var profileStore: ProfileStore
 
@@ -82,17 +82,15 @@ class SweetSpotService : Service(), ServiceActions {
             }
             it.start()
         }
-        relay = RelayClient(
+        relay = MailboxClient(
             roomProvider = { pairCodes.current() },
             snapshotProvider = { stateSnapshotJson() }
         ).also { client ->
-            client.listener = object : RelayClient.Listener {
-                override fun onRelayState(state: String) {
-                    overlay?.updateRelayState(state)
-                    if (state == RelayClient.STATE_CONNECTED) {
-                        // A dashboard just joined; push fresh state unprompted.
-                        relay?.sendStateSnapshot()
-                    }
+            client.listener = object : MailboxClient.Listener {
+                override fun onDeviceOnline(online: Boolean) {
+                    overlay?.updateRelayState(
+                        if (online) OverlayController.RELAY_CONNECTED else OverlayController.RELAY_CONNECTING
+                    )
                 }
             }
             client.start()

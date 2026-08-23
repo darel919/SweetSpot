@@ -309,7 +309,6 @@ class WebServer(
             else -> sendError(client, 404, "Not Found")
         }
     }
-
     private fun stateJson(): String {
         val caps = engine.getCapabilities()
         val levels = engine.getBandLevels()

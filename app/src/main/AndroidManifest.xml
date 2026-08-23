@@ -51,6 +51,7 @@
                 <action android:name="com.darelisme.sweetspot.START" />
                 <action android:name="com.darelisme.sweetspot.PRESET" />
                 <action android:name="com.darelisme.sweetspot.BYPASS" />
+                <action android:name="com.darelisme.sweetspot.PROBE_DYNAMICS" />
             </intent-filter>
         </receiver>
 

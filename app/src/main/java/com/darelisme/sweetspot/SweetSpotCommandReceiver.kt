@@ -26,7 +26,8 @@ class SweetSpotCommandReceiver : BroadcastReceiver() {
         val handled = when (action) {
             SweetSpotService.ACTION_START,
             SweetSpotService.ACTION_PRESET,
-            SweetSpotService.ACTION_BYPASS -> true
+            SweetSpotService.ACTION_BYPASS,
+            SweetSpotService.ACTION_PROBE -> true
             else -> false
         }
         if (!handled) {

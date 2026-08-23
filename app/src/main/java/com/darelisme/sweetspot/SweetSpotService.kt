@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import android.util.Log
+import java.util.concurrent.Executors
 
 /**
  * Long-lived owner of the audio DSP objects and the control web server.
@@ -29,6 +30,7 @@ class SweetSpotService : Service() {
         const val ACTION_START = "com.darelisme.sweetspot.START"
         const val ACTION_PRESET = "com.darelisme.sweetspot.PRESET"
         const val ACTION_BYPASS = "com.darelisme.sweetspot.BYPASS"
+        const val ACTION_PROBE = "com.darelisme.sweetspot.PROBE_DYNAMICS"
         const val EXTRA_PRESET = "preset"
         const val EXTRA_SHOW_UI = "showUi"
 
@@ -40,6 +42,9 @@ class SweetSpotService : Service() {
     private var webServer: WebServer? = null
     private var overlay: OverlayController? = null
     private lateinit var profileStore: ProfileStore
+
+    // Serializes probe runs so a burst of broadcasts cannot overlap probes.
+    private val probeExecutor = Executors.newSingleThreadExecutor()
 
     override fun onCreate() {
         super.onCreate()
@@ -60,6 +65,7 @@ class SweetSpotService : Service() {
                 engine?.applyPreset(preset)
             }
             ACTION_BYPASS -> engine?.setEnabled(false)
+            ACTION_PROBE -> runDynamicsProcessingProbe()
             ACTION_START -> {
                 // Already initialized in onCreate; ensure still alive.
                 if (engine == null) engine = EqualizerEngine(profileStore).also { it.initialize() }
@@ -74,6 +80,22 @@ class SweetSpotService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /**
+     * Runs the temporary DynamicsProcessing band-capacity probe off the main
+     * thread. This is strictly diagnostic and never touches the production
+     * [EqualizerEngine] or any saved profiles.
+     */
+    private fun runDynamicsProcessingProbe() {
+        Log.i(TAG, "DynamicsProcessing probe requested via broadcast")
+        probeExecutor.submit {
+            try {
+                DynamicsProcessingProbe().run()
+            } catch (e: Throwable) {
+                Log.e(TAG, "Probe execution error", e)
+            }
+        }
+    }
+
     override fun onDestroy() {
         Log.i(TAG, "Service onDestroy — hiding overlay, stopping web server, releasing engine")
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -83,6 +105,7 @@ class SweetSpotService : Service() {
         overlay = null
         engine?.release()
         engine = null
+        probeExecutor.shutdownNow()
         super.onDestroy()
     }
 

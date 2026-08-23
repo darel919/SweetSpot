@@ -242,8 +242,12 @@ class RelayClient(
     }
 
     private fun jitteredBackoff(attempt: Int): Long {
-        val exp = minOf(BACKOFF_BASE_MS * (1L shl attempt.coerceAtMost(5)), BACKOFF_MAX_MS)
-        return (exp * (500 + (Math.random() * 500))).toLong()
+        val exp = minOf(
+            BACKOFF_BASE_MS * (1L shl attempt.coerceAtMost(5)),
+            BACKOFF_MAX_MS
+        )
+        val factor = 0.5 + Math.random() * 0.5
+        return (exp * factor).toLong().coerceIn(500, BACKOFF_MAX_MS)
     }
 
     private fun sleep(ms: Long) {

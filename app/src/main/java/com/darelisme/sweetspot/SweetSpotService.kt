@@ -9,6 +9,8 @@ import android.content.Intent
 import android.media.audiofx.DynamicsProcessing
 import android.os.IBinder
 import android.util.Log
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -46,6 +48,8 @@ class SweetSpotService : Service(), ServiceActions {
     private var engine: AudioEngine? = null
     private var webServer: WebServer? = null
     private var overlay: OverlayController? = null
+    private var relay: MailboxClient? = null
+    private val pairCodes = PairCodeManager()
     private lateinit var profileStore: ProfileStore
 
     // Serializes probe runs so a burst of broadcasts cannot overlap probes.
@@ -67,10 +71,39 @@ class SweetSpotService : Service(), ServiceActions {
         profileStore = ProfileStore(this)
         createNotificationChannel()
         engine = DynamicsProcessingEq(profileStore).also { it.initialize() }
-        overlay = OverlayController(this)
-        webServer = WebServer(engine!!, overlay, this).also { it.start() }
+        overlay = OverlayController(this).also {
+            it.updatePairInfo(pairCodes.current())
+            it.show()
+        }
+        webServer = WebServer(engine!!, overlay, this).also {
+            it.pairCodeProvider = { pairCodes.current() }
+            it.pairCodeRotateProvider = {
+                pairCodes.rotate().also { code -> overlay?.updatePairInfo(code) }
+            }
+            it.start()
+        }
+        relay = MailboxClient(
+            roomProvider = { pairCodes.current() },
+            snapshotProvider = { stateSnapshotJson() },
+            effectsDiagnosticsProvider = { runEffectDiagnosticsBlocking() }
+        ).also { client ->
+            client.listener = object : MailboxClient.Listener {
+                override fun onDeviceOnline(online: Boolean) {
+                    overlay?.updateRelayState(
+                        if (online) OverlayController.RELAY_WAITING else OverlayController.RELAY_CONNECTING
+                    )
+                }
+
+                override fun onClientPresence(present: Boolean) {
+                    overlay?.updateRelayState(
+                        if (present) OverlayController.RELAY_CONNECTED else OverlayController.RELAY_WAITING
+                    )
+                }
+            }
+            client.start()
+        }
         startForeground(NOTIFICATION_ID, buildNotification())
-        Log.i(TAG, "Service started in foreground (engine + web server + overlay)")
+        Log.i(TAG, "Service started in foreground (engine + web server + overlay + relay)")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -122,8 +155,10 @@ class SweetSpotService : Service(), ServiceActions {
     }
 
     override fun onDestroy() {
-        Log.i(TAG, "Service onDestroy — hiding overlay, stopping web server, releasing engine")
+        Log.i(TAG, "Service onDestroy — hiding overlay, stopping web server, releasing engine, closing relay")
         stopForeground(STOP_FOREGROUND_REMOVE)
+        relay?.stop()
+        relay = null
         webServer?.stop()
         webServer = null
         overlay?.hide()
@@ -221,6 +256,46 @@ class SweetSpotService : Service(), ServiceActions {
 
     override fun getPersistentProbeCurve(): String? = persistentCurveName
 
+    // --- Effect chain diagnostics (matrixing capability check) ---
+
+    @Volatile private var effectInventory: List<AudioEffectDiagnostics.EffectInventoryEntry>? = null
+    @Volatile private var sessionProbes: List<AudioEffectDiagnostics.SessionProbe>? = null
+
+    /** Runs diagnostics synchronously; called from the mailbox poll thread. */
+    fun runEffectDiagnosticsBlocking(): JSONObject {
+        suspendProduction()
+        try {
+            val (inv, probes) = AudioEffectDiagnostics().runAll()
+            effectInventory = inv
+            sessionProbes = probes
+            return AudioEffectDiagnostics.payloadJson(inv, probes)
+        } finally {
+            resumeProduction()
+        }
+    }
+
+    override fun runEffectDiagnostics() {
+        Log.i(TAG, "Audio effect diagnostics requested")
+        suspendProduction()
+        probeExecutor.submit {
+            try {
+                val (inv, probes) = AudioEffectDiagnostics().runAll()
+                effectInventory = inv
+                sessionProbes = probes
+            } catch (e: Throwable) {
+                Log.e(TAG, "Effect diagnostics error", e)
+            } finally {
+                resumeProduction()
+            }
+        }
+    }
+
+    override fun getEffectInventory(): List<AudioEffectDiagnostics.EffectInventoryEntry> =
+        effectInventory ?: emptyList()
+
+    override fun getSessionProbes(): List<AudioEffectDiagnostics.SessionProbe> =
+        sessionProbes ?: emptyList()
+
     override fun getPersistentProbeCurveSummary(): DynamicsProcessingProbe.CurveSummary? {
         val dp = persistentDp ?: return null
         return try {
@@ -247,6 +322,55 @@ class SweetSpotService : Service(), ServiceActions {
     private fun resumeProduction() {
         engine?.initialize()
     }
+
+    /**
+     * Canonical state snapshot for the hosted dashboard (protocol v1).
+     * Mirrors shared/types/protocol.ts StateSnapshot in sweetspot-web.
+     */
+    private fun stateSnapshotJson(): JSONObject {
+        val engine = engine ?: DynamicsProcessingEq(profileStore)
+        val caps = engine.getCapabilities()
+        val calBands = dpEq()?.getCalibrationBands() ?: FloatArray(0)
+        val calFreqs = dpEq()?.getCalibrationFrequenciesHz() ?: IntArray(0)
+        val userLevels = engine.getBandLevels()
+        return JSONObject().apply {
+            put("device", JSONObject().apply {
+                put("id", DeviceIdentity.get(this@SweetSpotService))
+                put("name", DeviceIdentity.getName(this@SweetSpotService))
+                put("appVersion", "0.1.0")
+            })
+            put("engine", JSONObject().apply {
+                put("enabled", engine.isEnabled())
+                put("hasControl", engine.hasControl())
+                put("activePreset", engine.getActivePreset())
+                put("presetName", caps.presets[engine.getActivePreset()] ?: "Custom")
+            })
+            put("userEq", JSONObject().apply {
+                put("bandsDb", JSONArray(userLevels.map { it / 100.0 }))
+                put("frequenciesHz", JSONArray(caps.centerFrequenciesHz.toList()))
+                put("minDb", caps.bandLevelRange[0] / 100.0)
+                put("maxDb", caps.bandLevelRange[1] / 100.0)
+            })
+            put("calibration", JSONObject().apply {
+                put("active", serviceActionsIsCalibrationActive())
+                put("bandsDb", JSONArray(calBands.toList()))
+                put("frequenciesHz", JSONArray(calFreqs.toList()))
+            })
+            put("profiles", JSONArray(engine.listProfiles().map { name ->
+                JSONObject().put("id", name).put("name", name)
+            }))
+            put("capabilities", JSONObject().apply {
+                put("channels", 2)
+                put("calibrationBandCount", if (calBands.isNotEmpty()) calBands.size else 64)
+                put("userBandCount", caps.bandCount)
+                put("supportsSweep", false)
+            })
+        }
+    }
+
+    private fun serviceActionsIsCalibrationActive(): Boolean = try {
+        (engine as? DynamicsProcessingEq)?.isCalibrationActive() ?: false
+    } catch (_: Exception) { false }
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(

@@ -56,6 +56,11 @@ interface ServiceActions {
     fun getPersistentProbeCurve(): String?
     fun getPersistentProbeCurveSummary(): DynamicsProcessingProbe.CurveSummary?
 
+    /** Audio effect chain diagnostics (effect inventory + session-0 probes). */
+    fun runEffectDiagnostics()
+    fun getEffectInventory(): List<AudioEffectDiagnostics.EffectInventoryEntry>
+    fun getSessionProbes(): List<AudioEffectDiagnostics.SessionProbe>
+
     // Calibration (64-band read-only base curve; wizard/API only).
     fun getCalibrationBands(): FloatArray?
     fun getCalibrationFrequenciesHz(): IntArray?
@@ -70,6 +75,9 @@ class WebServer(
     private val serviceActions: ServiceActions? = null,
     private val port: Int = Config.WEB_PORT
 ) {
+    /** Providers wired by [SweetSpotService]; nullable for legacy construction. */
+    var pairCodeProvider: (() -> String)? = null
+    var pairCodeRotateProvider: (() -> String)? = null
     companion object {
         private const val TAG = "SweetSpotWeb"
     }
@@ -274,6 +282,14 @@ class WebServer(
             method == "GET" && path == "/api/probe/persistent" ->
                 sendJson(client, persistentStatusJson())
 
+            method == "POST" && path == "/api/effects/diagnose" -> {
+                serviceActions?.runEffectDiagnostics()
+                sendJson(client, """{"status":"started"}""")
+            }
+
+            method == "GET" && path == "/api/effects/diagnostics" ->
+                sendJson(client, effectDiagnosticsJson())
+
             // --- Calibration (read-only base curve; wizard/API only) ---
             method == "GET" && path == "/api/eq/calibration" ->
                 sendJson(client, calibrationJson())
@@ -292,10 +308,20 @@ class WebServer(
             method == "GET" && path == "/api/deviceinfo" ->
                 sendJson(client, deviceInfoJson())
 
+            // --- Pairing (relay room code shown in QR + dashboard URL) ---
+            method == "GET" && path == "/api/paircode" -> {
+                val code = pairCodeProvider?.invoke() ?: ""
+                sendJson(client, """{"pairCode":"$code","url":"${Config.DASHBOARD_URL}/connect/${PairCodeManager.normalize(code)}"}""")
+            }
+
+            method == "POST" && path == "/api/paircode/rotate" -> {
+                val code = pairCodeRotateProvider?.invoke() ?: ""
+                sendJson(client, """{"pairCode":"$code","rotated":true}""")
+            }
+
             else -> sendError(client, 404, "Not Found")
         }
     }
-
     private fun stateJson(): String {
         val caps = engine.getCapabilities()
         val levels = engine.getBandLevels()
@@ -375,6 +401,13 @@ class WebServer(
                 })
             }
         }.toString()
+    }
+
+    private fun effectDiagnosticsJson(): String {
+        val inv = serviceActions?.getEffectInventory()
+        val probes = serviceActions?.getSessionProbes()
+        if (inv == null || probes == null) return """{"error":"not_run_yet"}"""
+        return AudioEffectDiagnostics.payloadJson(inv, probes).put("available", true).toString()
     }
 
     private fun deviceInfoJson(): String {

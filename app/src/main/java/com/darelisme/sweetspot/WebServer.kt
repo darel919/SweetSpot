@@ -299,7 +299,7 @@ class WebServer(
         val arr = JSONArray()
         var highest = -1
         results?.forEach { r ->
-            val pass = r.constructed && r.actualBands == r.requested
+            val pass = r.constructed && r.hasControl && r.enabled && r.actualBands == r.requested
             if (pass) highest = maxOf(highest, r.requested)
             arr.put(JSONObject().apply {
                 put("requested", r.requested)

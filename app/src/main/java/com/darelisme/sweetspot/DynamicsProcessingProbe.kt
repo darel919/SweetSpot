@@ -119,7 +119,7 @@ class DynamicsProcessingProbe {
             val enabled = try { dp.enabled } catch (_: Throwable) { false }
             val actualBands = readBackBandCount(dp, n)
 
-            val pass = constructed && actualBands == n
+            val pass = constructed && hasControl && enabled && actualBands == n
             Log.i(TAG, "Requested bands: $n")
             Log.i(TAG, "Constructed: $constructed")
             Log.i(TAG, "Session: $SESSION_ID")
@@ -234,9 +234,9 @@ class DynamicsProcessingProbe {
         Log.i(TAG, "=== DynamicsProcessing Summary ===")
         var highest = -1
         for (r in results) {
-            val status = if (r.constructed && r.actualBands == r.requested) "PASS" else "FAIL"
+            val status = if (r.constructed && r.hasControl && r.enabled && r.actualBands == r.requested) "PASS" else "FAIL"
             Log.i(TAG, "${r.requested} bands: $status")
-            if (r.constructed && r.actualBands == r.requested) {
+            if (r.constructed && r.hasControl && r.enabled && r.actualBands == r.requested) {
                 highest = max(highest, r.requested)
             }
         }

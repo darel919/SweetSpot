@@ -1,0 +1,157 @@
+:root {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background: #0e0e12;
+  color: #e8e8ea;
+}
+
+.container {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 24px 16px 48px;
+}
+
+h1 {
+  font-size: 28px;
+  margin: 0 0 4px;
+}
+
+h2 {
+  font-size: 16px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #9aa0a6;
+  margin: 24px 0 8px;
+}
+
+.status {
+  font-size: 18px;
+  font-weight: 600;
+  color: #6ee7a8;
+  margin: 0 0 8px;
+}
+
+section {
+  background: #17171d;
+  border: 1px solid #26262e;
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin-top: 12px;
+}
+
+button {
+  appearance: none;
+  border: 1px solid #3a3a44;
+  background: #23232b;
+  color: #e8e8ea;
+  font-size: 15px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  margin: 4px 6px 4px 0;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #2c2c36;
+}
+
+button:active {
+  background: #3a3a44;
+}
+
+.band {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0;
+}
+
+.band span {
+  width: 84px;
+  font-variant-numeric: tabular-nums;
+  color: #b8bcc4;
+}
+
+.bandval {
+  width: 76px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: #d8dce4;
+}
+
+.profile {
+  margin: 0 0 10px;
+  font-size: 15px;
+  color: #b8bcc4;
+}
+
+.profile #profile {
+  color: #6ee7a8;
+  font-weight: 600;
+}
+
+.band input[type="range"] {
+  flex: 1;
+}
+
+input[type="text"] {
+  appearance: none;
+  border: 1px solid #3a3a44;
+  background: #0e0e12;
+  color: #e8e8ea;
+  font-size: 15px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  margin: 4px 6px 4px 0;
+  min-width: 200px;
+}
+
+input[type="text"]:focus {
+  outline: none;
+  border-color: #6ee7a8;
+}
+
+.save-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.profile-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0;
+}
+
+.profile-name {
+  flex: 1;
+  font-variant-numeric: tabular-nums;
+  color: #d8dce4;
+}
+
+.muted {
+  color: #9aa0a6;
+  font-size: 14px;
+  margin: 4px 0;
+}
+
+#state {
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #b8bcc4;
+  background: #0e0e12;
+  border-radius: 8px;
+  padding: 10px;
+  margin: 0;
+}

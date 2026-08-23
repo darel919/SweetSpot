@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SweetSpot</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+</head>
+<body>
+  <div id="app" class="container">
+    <h1>SweetSpot</h1>
+    <p class="status" :style="{ color: statusColor }">{{ statusText }}</p>
+
+    <section>
+      <h2>Presets</h2>
+      <button v-for="p in state.presets" :key="p.id" @click="applyPreset(p.id)">{{ p.name }}</button>
+    </section>
+
+    <section>
+      <h2>Power</h2>
+      <button @click="enable">Enable</button>
+      <button @click="bypass">Bypass</button>
+    </section>
+
+    <section>
+      <h2>TV Overlay</h2>
+      <button @click="showUi">Show TV UI</button>
+      <button @click="hideUi">Hide TV UI</button>
+    </section>
+
+    <section>
+      <h2>Save Profile</h2>
+      <div class="save-row">
+        <input type="text" v-model="profileName" placeholder="Profile name" @keyup.enter="saveProfile" />
+        <button @click="saveProfile" :disabled="!profileName.trim()">Save</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Saved Profiles</h2>
+      <p v-if="state.profiles.length === 0" class="muted">No saved profiles yet.</p>
+      <div v-for="name in state.profiles" :key="name" class="profile-row">
+        <span class="profile-name">{{ name }}</span>
+        <button @click="loadProfile(name)">Load</button>
+        <button @click="deleteProfile(name)">Delete</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Bands (dB)</h2>
+      <p class="profile">Profile: <span>{{ state.presetName }}</span></p>
+      <div class="band" v-for="(lvl, i) in state.bands" :key="i">
+        <span>{{ centerHz(i) }} Hz</span>
+        <input type="range" :min="state.bandLevelRange[0]" :max="state.bandLevelRange[1]" step="100"
+               :value="lvl" @input="onInput(i, $event)" @change="onChange" />
+        <span class="bandval">{{ (lvl / 100).toFixed(1) }} dB</span>
+      </div>
+    </section>
+
+    <section>
+      <h2>State</h2>
+      <pre id="state">{{ stateText }}</pre>
+    </section>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

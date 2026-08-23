@@ -3,11 +3,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.sweetspot"
+    namespace = "com.darelisme.sweetspot"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.example.sweetspot"
+        applicationId = "com.darelisme.sweetspot"
         minSdk = 28
         targetSdk = 36
 

@@ -27,7 +27,9 @@ class SweetSpotCommandReceiver : BroadcastReceiver() {
             SweetSpotService.ACTION_START,
             SweetSpotService.ACTION_PRESET,
             SweetSpotService.ACTION_BYPASS,
-            SweetSpotService.ACTION_PROBE -> true
+            SweetSpotService.ACTION_PROBE,
+            SweetSpotService.ACTION_PROBE_PERSIST,
+            SweetSpotService.ACTION_PROBE_RELEASE -> true
             else -> false
         }
         if (!handled) {
@@ -41,6 +43,12 @@ class SweetSpotCommandReceiver : BroadcastReceiver() {
                 putExtra(
                     SweetSpotService.EXTRA_PRESET,
                     intent.getIntExtra(SweetSpotService.EXTRA_PRESET, 1)
+                )
+            }
+            if (intent.hasExtra(SweetSpotService.EXTRA_PROBE_BANDS)) {
+                putExtra(
+                    SweetSpotService.EXTRA_PROBE_BANDS,
+                    intent.getIntExtra(SweetSpotService.EXTRA_PROBE_BANDS, 128)
                 )
             }
         }

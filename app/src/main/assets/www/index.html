@@ -62,6 +62,40 @@
       <h2>State</h2>
       <pre id="state">{{ stateText }}</pre>
     </section>
+
+    <section>
+      <h2>DynamicsProcessing Probe</h2>
+      <button @click="runProbe" :disabled="probe.running">Run capacity probe</button>
+      <span v-if="probe.running" class="muted"> running… (~15s)</span>
+      <p v-if="probe.available && !probe.running" class="profile">
+        Highest reliable: <strong>{{ probe.highest }}</strong> bands &nbsp;·&nbsp;
+        Recommended: <strong>{{ probe.recommended }}</strong>
+      </p>
+      <table v-if="probe.results.length" class="probe-table">
+        <thead><tr><th>Bands</th><th>Result</th><th>Actual</th><th>Control</th><th>Enabled</th></tr></thead>
+        <tbody>
+          <tr v-for="r in probe.results" :key="r.requested">
+            <td>{{ r.requested }}</td>
+            <td :style="{ color: r.pass ? '#6ee7a8' : '#f06a6a' }">{{ r.pass ? 'PASS' : 'FAIL' }}</td>
+            <td>{{ r.actualBands }}</td>
+            <td>{{ r.hasControl }}</td>
+            <td>{{ r.enabled }}</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Persistent instance</h3>
+      <p class="muted">Long-lived enabled effect for memory / CPU / reliability checks.</p>
+      <div class="save-row">
+        <input type="number" v-model.number="persistBands" min="1" max="1024" />
+        <button @click="createPersistent">Create (enabled)</button>
+        <button @click="releasePersistent">Release</button>
+      </div>
+      <p>Status: <strong :style="{ color: persistent.active ? '#6ee7a8' : '#f06a6a' }">{{ persistent.active ? 'ACTIVE' : 'none' }}</strong><span v-if="persistent.active"> @ {{ persistent.bands }} bands</span></p>
+
+      <h3>Device / Memory</h3>
+      <pre>{{ deviceText }}</pre>
+    </section>
   </div>
   <script src="app.js"></script>
 </body>

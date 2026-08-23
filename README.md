@@ -6,13 +6,15 @@ The project is currently being developed for a resource-constrained TCL Android 
 
 ## Status
 
-Early proof-of-concept.
+SweetSpot is a working tool for tuning a TV's sound from another device, not a proof-of-concept.
 
-The core feasibility test has succeeded:
+The core capability is already confirmed on the target hardware:
 
 - Android global audio session `0` is accessible
 - SweetSpot obtains control of the TV's built-in equalizer
 - changing EQ values produces an audible system-wide effect during normal TV playback
+
+All tuning is performed remotely through a browser on a phone or laptop; the TV itself only shows status, a local URL, and a QR code.
 
 ## Architecture
 

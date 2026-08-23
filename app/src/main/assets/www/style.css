@@ -144,6 +144,38 @@ input[type="text"]:focus {
   margin: 4px 0;
 }
 
+.probe-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+.probe-table th,
+.probe-table td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid #26262e;
+}
+
+.probe-table th {
+  color: #9aa0a6;
+  font-weight: 600;
+}
+
+input[type="number"] {
+  appearance: none;
+  border: 1px solid #3a3a44;
+  background: #0e0e12;
+  color: #e8e8ea;
+  font-size: 15px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  margin: 4px 6px 4px 0;
+  width: 110px;
+}
+
 #state {
   font-size: 12px;
   line-height: 1.45;

@@ -22,6 +22,16 @@ createApp({
     const editing = ref(false);
     const profileName = ref('');
 
+    const probe = reactive({ running: false, available: false, highest: -1, recommended: -1, results: [] });
+    const persistent = reactive({ active: false, bands: 0 });
+    const device = reactive({
+      pssTotalKb: 0, privateDirtyKb: 0, sharedDirtyKb: 0,
+      javaHeapTotal: 0, javaHeapFree: 0, nativeHeapAllocated: 0,
+      cpuPercent: 0, persistentProbeActive: false, persistentProbeBands: 0
+    });
+    const persistBands = ref(128);
+    const deviceText = computed(() => JSON.stringify(device, null, 2));
+
     const stateText = computed(() => JSON.stringify(state, null, 2));
 
     async function getState() {
@@ -135,18 +145,88 @@ createApp({
       getState();
     }
 
+    async function runProbe() {
+      await fetch('/api/probe', { method: 'POST' });
+      pollProbe();
+    }
+    async function pollProbe() {
+      try {
+        const r = await fetch('/api/probe/status');
+        const s = await r.json();
+        probe.running = s.running;
+        probe.available = s.available;
+        probe.highest = s.highest;
+        probe.recommended = s.recommended;
+        probe.results = s.results || [];
+        if (s.running) setTimeout(pollProbe, 1000);
+      } catch (e) { /* offline */ }
+    }
+    async function refreshProbeStatus() {
+      try {
+        const r = await fetch('/api/probe/status');
+        const s = await r.json();
+        probe.running = s.running;
+        probe.available = s.available;
+        probe.highest = s.highest;
+        probe.recommended = s.recommended;
+        probe.results = s.results || [];
+      } catch (e) { /* offline */ }
+    }
+    async function createPersistent() {
+      await fetch('/api/probe/persist', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bands: persistBands.value })
+      });
+      refreshPersistent();
+    }
+    async function releasePersistent() {
+      await fetch('/api/probe/release', { method: 'POST' });
+      refreshPersistent();
+    }
+    async function refreshPersistent() {
+      try {
+        const r = await fetch('/api/probe/persistent');
+        const s = await r.json();
+        persistent.active = s.active;
+        persistent.bands = s.bands;
+      } catch (e) { /* offline */ }
+    }
+    async function refreshDevice() {
+      try {
+        const r = await fetch('/api/deviceinfo');
+        const s = await r.json();
+        device.pssTotalKb = s.pssTotalKb;
+        device.privateDirtyKb = s.privateDirtyKb;
+        device.sharedDirtyKb = s.sharedDirtyKb;
+        device.javaHeapTotal = s.javaHeapTotal;
+        device.javaHeapFree = s.javaHeapFree;
+        device.nativeHeapAllocated = s.nativeHeapAllocated;
+        device.cpuPercent = s.cpuPercent;
+        device.persistentProbeActive = s.persistentProbeActive;
+        device.persistentProbeBands = s.persistentProbeBands;
+      } catch (e) { /* offline */ }
+    }
+
     let timer = null;
+    let deviceTimer = null;
     onMounted(() => {
       getState();
-      timer = setInterval(getState, 1000);
+      refreshProbeStatus();
+      refreshPersistent();
+      refreshDevice();
+      timer = setInterval(() => { getState(); refreshProbeStatus(); refreshPersistent(); }, 1000);
+      deviceTimer = setInterval(refreshDevice, 2000);
     });
-    onUnmounted(() => clearInterval(timer));
+    onUnmounted(() => { clearInterval(timer); clearInterval(deviceTimer); });
 
     return {
       state, statusText, statusColor, stateText, profileName,
       centerHz, onInput, onChange, applyBands,
       applyPreset, enable, bypass, showUi, hideUi,
-      saveProfile, loadProfile, deleteProfile
+      saveProfile, loadProfile, deleteProfile,
+      probe, persistent, deviceText, persistBands,
+      runProbe, createPersistent, releasePersistent
     };
   }
 }).mount('#app');

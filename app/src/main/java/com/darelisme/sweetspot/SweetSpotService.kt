@@ -6,9 +6,11 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.media.audiofx.DynamicsProcessing
 import android.os.IBinder
 import android.util.Log
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Long-lived owner of the audio DSP objects and the control web server.
@@ -22,7 +24,7 @@ import java.util.concurrent.Executors
  * The service itself is not exported; external callers (e.g. ADB during
  * development) go through [SweetSpotCommandReceiver].
  */
-class SweetSpotService : Service() {
+class SweetSpotService : Service(), ServiceActions {
 
     companion object {
         private const val TAG = "SweetSpot"
@@ -31,8 +33,11 @@ class SweetSpotService : Service() {
         const val ACTION_PRESET = "com.darelisme.sweetspot.PRESET"
         const val ACTION_BYPASS = "com.darelisme.sweetspot.BYPASS"
         const val ACTION_PROBE = "com.darelisme.sweetspot.PROBE_DYNAMICS"
+        const val ACTION_PROBE_PERSIST = "com.darelisme.sweetspot.PROBE_PERSIST"
+        const val ACTION_PROBE_RELEASE = "com.darelisme.sweetspot.PROBE_RELEASE"
         const val EXTRA_PRESET = "preset"
         const val EXTRA_SHOW_UI = "showUi"
+        const val EXTRA_PROBE_BANDS = "probeBands"
 
         private const val CHANNEL_ID = "sweetspot"
         private const val NOTIFICATION_ID = 1
@@ -46,6 +51,15 @@ class SweetSpotService : Service() {
     // Serializes probe runs so a burst of broadcasts cannot overlap probes.
     private val probeExecutor = Executors.newSingleThreadExecutor()
 
+    // Long-lived DynamicsProcessing instance for memory/CPU/reliability checks.
+    // Null unless a persistent probe is currently active.
+    private var persistentDp: DynamicsProcessing? = null
+
+    // Last capacity-probe results, surfaced to the web UI.
+    private var lastProbeResults: List<DynamicsProcessingProbe.ProbeResult>? = null
+    private val probeRunning = AtomicBoolean(false)
+    private var persistentBands: Int = 0
+
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "Service onCreate")
@@ -53,7 +67,7 @@ class SweetSpotService : Service() {
         createNotificationChannel()
         engine = EqualizerEngine(profileStore).also { it.initialize() }
         overlay = OverlayController(this)
-        webServer = WebServer(this, engine!!, overlay).also { it.start() }
+        webServer = WebServer(this, engine!!, overlay, this).also { it.start() }
         startForeground(NOTIFICATION_ID, buildNotification())
         Log.i(TAG, "Service started in foreground (engine + web server + overlay)")
     }
@@ -65,7 +79,12 @@ class SweetSpotService : Service() {
                 engine?.applyPreset(preset)
             }
             ACTION_BYPASS -> engine?.setEnabled(false)
-            ACTION_PROBE -> runDynamicsProcessingProbe()
+            ACTION_PROBE -> runProbe()
+            ACTION_PROBE_PERSIST -> {
+                val bands = intent.getIntExtra(EXTRA_PROBE_BANDS, 128)
+                runPersistentProbe(bands)
+            }
+            ACTION_PROBE_RELEASE -> releasePersistentProbe()
             ACTION_START -> {
                 // Already initialized in onCreate; ensure still alive.
                 if (engine == null) engine = EqualizerEngine(profileStore).also { it.initialize() }
@@ -83,15 +102,18 @@ class SweetSpotService : Service() {
     /**
      * Runs the temporary DynamicsProcessing band-capacity probe off the main
      * thread. This is strictly diagnostic and never touches the production
-     * [EqualizerEngine] or any saved profiles.
+     * [EqualizerEngine] or any saved profiles. Results are captured for the web UI.
      */
-    private fun runDynamicsProcessingProbe() {
-        Log.i(TAG, "DynamicsProcessing probe requested via broadcast")
+    override fun runProbe() {
+        Log.i(TAG, "DynamicsProcessing probe requested")
         probeExecutor.submit {
             try {
-                DynamicsProcessingProbe().run()
+                probeRunning.set(true)
+                lastProbeResults = DynamicsProcessingProbe().run()
             } catch (e: Throwable) {
                 Log.e(TAG, "Probe execution error", e)
+            } finally {
+                probeRunning.set(false)
             }
         }
     }
@@ -105,9 +127,63 @@ class SweetSpotService : Service() {
         overlay = null
         engine?.release()
         engine = null
+        // Release any long-lived probe instance still held.
+        DynamicsProcessingProbe().releaseInstance(persistentDp)
+        persistentDp = null
         probeExecutor.shutdownNow()
         super.onDestroy()
     }
+
+    /**
+     * Creates a long-lived, enabled [DynamicsProcessing] instance for [bands]
+     * bands on session 0 and keeps it alive (does NOT release it). This lets
+     * the developer measure memory/CPU and run reliability checks with a real
+     * enabled effect in place. Release it with [ACTION_PROBE_RELEASE] or the
+     * web endpoint.
+     */
+    override fun runPersistentProbe(bands: Int) {
+        Log.i(TAG, "Persistent DynamicsProcessing probe requested: $bands bands")
+        probeExecutor.submit {
+            try {
+                // Replace any existing persistent instance first.
+                persistentDp?.let {
+                    DynamicsProcessingProbe().releaseInstance(it)
+                    Log.i(TAG, "Released previous persistent DynamicsProcessing instance")
+                }
+                val dp = DynamicsProcessingProbe().createEnabled(bands)
+                persistentDp = dp
+                persistentBands = bands
+                Log.i(TAG, "=== Persistent DynamicsProcessing ACTIVE ===")
+                Log.i(TAG, "Bands: $bands | Session: 0 (global output mix) | Enabled: ${dp.enabled}")
+                Log.i(TAG, "Instance is intentionally left ENABLED for memory/CPU/reliability checks.")
+                Log.i(TAG, "Release via web (/api/probe/release) or broadcast PROBE_RELEASE.")
+            } catch (e: Throwable) {
+                Log.e(TAG, "Persistent probe failed for $bands bands", e)
+            }
+        }
+    }
+
+    /** Releases the long-lived DynamicsProcessing instance, if any. */
+    override fun releasePersistentProbe() {
+        probeExecutor.submit {
+            try {
+                persistentDp?.let {
+                    DynamicsProcessingProbe().releaseInstance(it)
+                    Log.i(TAG, "Persistent DynamicsProcessing instance released")
+                } ?: Log.i(TAG, "No persistent DynamicsProcessing instance to release")
+                persistentDp = null
+                persistentBands = 0
+            } catch (e: Throwable) {
+                Log.e(TAG, "Failed to release persistent instance", e)
+            }
+        }
+    }
+
+    // --- ServiceActions (web-facing) ---
+    override fun getLastProbeResults(): List<DynamicsProcessingProbe.ProbeResult>? = lastProbeResults
+    override fun isProbeRunning(): Boolean = probeRunning.get()
+    override fun isPersistentProbeActive(): Boolean = persistentDp != null
+    override fun getPersistentProbeBands(): Int = persistentBands
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(

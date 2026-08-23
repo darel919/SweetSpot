@@ -1,8 +1,12 @@
 package com.darelisme.sweetspot
 
 import android.content.Context
+import android.os.Debug
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
 import java.io.BufferedReader
+import java.io.File
 import java.io.InputStreamReader
 import java.io.OutputStream
 import java.net.InetAddress
@@ -12,6 +16,8 @@ import java.net.SocketException
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * Minimal, dependency-free embedded HTTP server for LAN control.
@@ -25,10 +31,27 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * One request per connection, `Connection: close` (no keep-alive parsing needed).
  */
+
+/**
+ * Hooks the web server uses to trigger service-level diagnostics
+ * (DynamicsProcessing capacity probe + persistent instance). Implemented by
+ * [SweetSpotService]; keeps [WebServer] decoupled from the concrete service.
+ */
+interface ServiceActions {
+    fun runProbe()
+    fun runPersistentProbe(bands: Int)
+    fun releasePersistentProbe()
+    fun getLastProbeResults(): List<DynamicsProcessingProbe.ProbeResult>?
+    fun isProbeRunning(): Boolean
+    fun isPersistentProbeActive(): Boolean
+    fun getPersistentProbeBands(): Int
+}
+
 class WebServer(
     private val context: Context,
     private val engine: AudioEngine,
     private val overlay: OverlayController? = null,
+    private val serviceActions: ServiceActions? = null,
     private val port: Int = Config.WEB_PORT
 ) {
     companion object {
@@ -203,6 +226,32 @@ class WebServer(
                 sendJson(client, stateJson())
             }
 
+            // --- DynamicsProcessing diagnostics (web-driven, no adb needed) ---
+            method == "POST" && path == "/api/probe" -> {
+                serviceActions?.runProbe()
+                sendJson(client, """{"status":"started"}""")
+            }
+
+            method == "GET" && path == "/api/probe/status" ->
+                sendJson(client, probeStatusJson())
+
+            method == "POST" && path == "/api/probe/persist" -> {
+                val bands = parseIntField(body, "bands") ?: 128
+                serviceActions?.runPersistentProbe(bands)
+                sendJson(client, """{"status":"persistent_started","bands":$bands}""")
+            }
+
+            method == "POST" && path == "/api/probe/release" -> {
+                serviceActions?.releasePersistentProbe()
+                sendJson(client, """{"status":"released"}""")
+            }
+
+            method == "GET" && path == "/api/probe/persistent" ->
+                sendJson(client, persistentStatusJson())
+
+            method == "GET" && path == "/api/deviceinfo" ->
+                sendJson(client, deviceInfoJson())
+
             else -> sendError(client, 404, "Not Found")
         }
     }
@@ -242,6 +291,90 @@ class WebServer(
   "presets": [$presetsJson],
   "profiles": [$profilesJson]
 }"""
+    }
+
+    private fun probeStatusJson(): String {
+        val running = serviceActions?.isProbeRunning() ?: false
+        val results = serviceActions?.getLastProbeResults()
+        val arr = JSONArray()
+        var highest = -1
+        results?.forEach { r ->
+            val pass = r.constructed && r.actualBands == r.requested
+            if (pass) highest = maxOf(highest, r.requested)
+            arr.put(JSONObject().apply {
+                put("requested", r.requested)
+                put("constructed", r.constructed)
+                put("hasControl", r.hasControl)
+                put("enabled", r.enabled)
+                put("actualBands", r.actualBands)
+                put("pass", pass)
+                put("exception", r.exception ?: JSONObject.NULL)
+            })
+        }
+        return JSONObject().apply {
+            put("running", running)
+            put("available", results != null)
+            put("results", arr)
+            put("highest", highest)
+            put("recommended", highest)
+        }.toString()
+    }
+
+    private fun persistentStatusJson(): String {
+        val active = serviceActions?.isPersistentProbeActive() ?: false
+        val bands = serviceActions?.getPersistentProbeBands() ?: 0
+        return JSONObject().apply {
+            put("active", active)
+            put("bands", bands)
+        }.toString()
+    }
+
+    private fun deviceInfoJson(): String {
+        val rt = Runtime.getRuntime()
+        val memInfo = Debug.MemoryInfo()
+        Debug.getMemoryInfo(memInfo)
+        val cpu = cpuUsagePercent()
+        return JSONObject().apply {
+            put("javaHeapMax", rt.maxMemory())
+            put("javaHeapTotal", rt.totalMemory())
+            put("javaHeapFree", rt.freeMemory())
+            put("nativeHeapAllocated", Debug.getNativeHeapAllocatedSize())
+            put("nativeHeapSize", Debug.getNativeHeapSize())
+            put("pssTotalKb", memInfo.totalPss)
+            put("privateDirtyKb", memInfo.totalPrivateDirty)
+            put("sharedDirtyKb", memInfo.totalSharedDirty)
+            put("cpuPercent", cpu)
+            put("persistentProbeActive", serviceActions?.isPersistentProbeActive() ?: false)
+            put("persistentProbeBands", serviceActions?.getPersistentProbeBands() ?: 0)
+        }.toString()
+    }
+
+    /** Samples /proc/self/stat over ~400ms to estimate this process's CPU %. */
+    private fun cpuUsagePercent(): Double {
+        val t0 = procCpuTicks()
+        val start = System.nanoTime()
+        try { Thread.sleep(400) } catch (_: InterruptedException) {}
+        val t1 = procCpuTicks()
+        val end = System.nanoTime()
+        val ticks = (t1 - t0).toDouble()
+        val clk = try {
+            Os.sysconf(OsConstants._SC_CLK_TCK).toDouble()
+        } catch (_: Throwable) { 100.0 }
+        val cpuSecs = ticks / clk
+        val wallSecs = (end - start) / 1e9
+        if (wallSecs <= 0) return 0.0
+        return (cpuSecs / wallSecs) * 100.0
+    }
+
+    private fun procCpuTicks(): Long {
+        return try {
+            val stat = File("/proc/self/stat").readText()
+            val idx = stat.lastIndexOf(')')
+            val parts = stat.substring(idx + 1).trim().split("\\s+".toRegex())
+            val utime = parts.getOrNull(13)?.toLongOrNull() ?: 0L
+            val stime = parts.getOrNull(14)?.toLongOrNull() ?: 0L
+            utime + stime
+        } catch (_: Throwable) { 0L }
     }
 
     private fun sendJson(client: Socket, json: String) {

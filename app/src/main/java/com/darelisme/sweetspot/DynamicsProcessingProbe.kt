@@ -37,6 +37,9 @@ class DynamicsProcessingProbe {
         private val CANDIDATE_BANDS = intArrayOf(10, 20, 32, 64)
         // Only probed if 64 passes cleanly.
         private val EXTRA_BANDS = intArrayOf(96, 128)
+        // Ceiling ladder: only probed if 128 passes cleanly. Stops at first
+        // failure so we report the highest reliable count efficiently.
+        private val CEILING_BANDS = intArrayOf(192, 256, 384, 512, 768, 1024)
     }
 
     data class ProbeResult(
@@ -48,8 +51,8 @@ class DynamicsProcessingProbe {
         val exception: String? = null
     )
 
-    /** Runs the full probe sequence and logs a summary. */
-    fun run() {
+    /** Runs the full probe sequence, logs a summary, and returns the results. */
+    fun run(): List<ProbeResult> {
         Log.i(TAG, "=== DynamicsProcessing Probe ===")
         Log.i(TAG, "Target session: $SESSION_ID (global output mix)")
         val results = ArrayList<ProbeResult>()
@@ -69,7 +72,26 @@ class DynamicsProcessingProbe {
             Log.i(TAG, "64 bands did not pass cleanly — skipping extended counts")
         }
 
+        // Only probe the ceiling ladder if 128 passed cleanly.
+        val oneTwentyEight = results.find { it.requested == 128 }
+        if (oneTwentyEight != null && oneTwentyEight.constructed && oneTwentyEight.actualBands == oneTwentyEight.requested) {
+            Log.i(TAG, "128 bands passed — probing ceiling ladder (192, 256, 384, 512, 768, 1024)")
+            for (n in CEILING_BANDS) {
+                val r = testBandCount(n)
+                results.add(r)
+                // Band-count capacity is monotonic: stop at the first failure
+                // to report the highest reliable count without wasting time.
+                if (!(r.constructed && r.actualBands == r.requested)) {
+                    Log.i(TAG, "Ceiling reached: $n bands failed — stopping ladder")
+                    break
+                }
+            }
+        } else {
+            Log.i(TAG, "128 bands did not pass cleanly — skipping ceiling ladder")
+        }
+
         logSummary(results)
+        return results
     }
 
     /**
@@ -134,6 +156,35 @@ class DynamicsProcessingProbe {
             } catch (e: Throwable) {
                 Log.w(TAG, "Release failed for $n bands: ${e.message}")
             }
+        }
+    }
+
+    /**
+     * Builds, constructs, and enables a [DynamicsProcessing] instance for [n]
+     * bands on the global output mix (session 0), WITHOUT releasing it.
+     *
+     * Used by the persistent-instance variant so memory/CPU/reliability can be
+     * measured with a long-lived enabled effect. The caller owns the instance
+     * and MUST release it (see [releaseInstance]) when finished.
+     */
+    fun createEnabled(n: Int): DynamicsProcessing {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            throw UnsupportedOperationException(
+                "DynamicsProcessing requires API 28+ (device is ${Build.VERSION.SDK_INT})"
+            )
+        }
+        val config = buildConfig(n)
+        val dp = DynamicsProcessing(PRIORITY, SESSION_ID, config)
+        dp.setEnabled(true)
+        return dp
+    }
+
+    /** Releases a previously created instance (safe to call once). */
+    fun releaseInstance(dp: DynamicsProcessing?) {
+        try {
+            dp?.release()
+        } catch (_: Throwable) {
+            // already released or invalid — ignore
         }
     }
 

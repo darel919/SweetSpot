@@ -45,6 +45,16 @@ interface ServiceActions {
     fun isProbeRunning(): Boolean
     fun isPersistentProbeActive(): Boolean
     fun getPersistentProbeBands(): Int
+    fun applyPersistentCurve(curve: String): Boolean
+    fun getPersistentProbeCurve(): String?
+    fun getPersistentProbeCurveSummary(): DynamicsProcessingProbe.CurveSummary?
+
+    // Calibration (128-band read-only base curve; wizard/API only).
+    fun getCalibrationBands(): FloatArray?
+    fun getCalibrationFrequenciesHz(): IntArray?
+    fun isCalibrationActive(): Boolean
+    fun setCalibrationBands(gains: FloatArray): Boolean
+    fun resetCalibration(): Boolean
 }
 
 class WebServer(
@@ -246,8 +256,36 @@ class WebServer(
                 sendJson(client, """{"status":"released"}""")
             }
 
+            method == "POST" && path == "/api/probe/apply-curve" -> {
+                val curve = parseStringField(body, "curve") ?: "hollow"
+                val ok = serviceActions?.applyPersistentCurve(curve) ?: false
+                val msg = if (ok) {
+                    "applied"
+                } else if (serviceActions?.isPersistentProbeActive() != true) {
+                    "no-instance"
+                } else {
+                    "unknown-curve"
+                }
+                sendJson(client, """{"status":"$msg","curve":"$curve"}""")
+            }
+
             method == "GET" && path == "/api/probe/persistent" ->
                 sendJson(client, persistentStatusJson())
+
+            // --- Calibration (read-only base curve; wizard/API only) ---
+            method == "GET" && path == "/api/eq/calibration" ->
+                sendJson(client, calibrationJson())
+
+            method == "POST" && path == "/api/eq/calibration" -> {
+                val gains = parseFloatArrayField(body, "gains")
+                val ok = gains != null && (serviceActions?.setCalibrationBands(gains) ?: false)
+                sendJson(client, if (ok) calibrationJson() else """{"error":"invalid","expected":128}""")
+            }
+
+            method == "POST" && path == "/api/eq/calibration/reset" -> {
+                serviceActions?.resetCalibration()
+                sendJson(client, calibrationJson())
+            }
 
             method == "GET" && path == "/api/deviceinfo" ->
                 sendJson(client, deviceInfoJson())
@@ -277,6 +315,12 @@ class WebServer(
         val presetsJson = presetMap.entries.sortedBy { it.key }
             .joinToString(",") { """{"id": ${it.key}, "name": "${it.value}"}""" }
         val profilesJson = engine.listProfiles().joinToString(",") { """"$it"""" }
+        val calBands = serviceActions?.getCalibrationBands()
+        val calFreqs = serviceActions?.getCalibrationFrequenciesHz()
+        val calActive = serviceActions?.isCalibrationActive() ?: false
+        val calJson = if (calBands != null && calFreqs != null) {
+            """{"active":$calActive,"bands":[${calBands.joinToString(",")}],"frequenciesHz":[${calFreqs.joinToString(",")}]}"""
+        } else "null"
         return """{
   "enabled": ${engine.isEnabled()},
   "hasControl": ${engine.hasControl()},
@@ -289,7 +333,8 @@ class WebServer(
   "bandLevelRange": [${range[0]}, ${range[1]}],
   "overlayVisible": ${overlay?.isShown() ?: false},
   "presets": [$presetsJson],
-  "profiles": [$profilesJson]
+  "profiles": [$profilesJson],
+  "calibration": $calJson
 }"""
     }
 
@@ -323,9 +368,19 @@ class WebServer(
     private fun persistentStatusJson(): String {
         val active = serviceActions?.isPersistentProbeActive() ?: false
         val bands = serviceActions?.getPersistentProbeBands() ?: 0
+        val curve = serviceActions?.getPersistentProbeCurve()
+        val sum = serviceActions?.getPersistentProbeCurveSummary()
         return JSONObject().apply {
             put("active", active)
             put("bands", bands)
+            put("curve", curve ?: JSONObject.NULL)
+            if (sum != null) {
+                put("curveSummary", JSONObject().apply {
+                    put("bandsTotal", sum.bandsTotal)
+                    put("bandsCut", sum.bandsCut)
+                    put("bandsFlat", sum.bandsFlat)
+                })
+            }
         }.toString()
     }
 
@@ -333,7 +388,21 @@ class WebServer(
         val rt = Runtime.getRuntime()
         val memInfo = Debug.MemoryInfo()
         Debug.getMemoryInfo(memInfo)
-        val cpu = cpuUsagePercent()
+        // Sample app + audioserver CPU in a single ~400ms window.
+        val appT0 = procCpuTicks()
+        val asPid = resolveAudioserverPid()
+        val asT0 = asPid?.let { procCpuTicksForPid(it) } ?: 0L
+        val start = System.nanoTime()
+        try { Thread.sleep(400) } catch (_: InterruptedException) {}
+        val appT1 = procCpuTicks()
+        val asT1 = asPid?.let { procCpuTicksForPid(it) } ?: 0L
+        val end = System.nanoTime()
+        val clk = try {
+            Os.sysconf(OsConstants._SC_CLK_TCK).toDouble()
+        } catch (_: Throwable) { 100.0 }
+        val wallSecs = (end - start) / 1e9
+        val appCpu = if (wallSecs > 0) ((appT1 - appT0).toDouble() / clk / wallSecs) * 100.0 else 0.0
+        val asCpu = if (wallSecs > 0 && asPid != null) ((asT1 - asT0).toDouble() / clk / wallSecs) * 100.0 else 0.0
         return JSONObject().apply {
             put("javaHeapMax", rt.maxMemory())
             put("javaHeapTotal", rt.totalMemory())
@@ -343,32 +412,51 @@ class WebServer(
             put("pssTotalKb", memInfo.totalPss)
             put("privateDirtyKb", memInfo.totalPrivateDirty)
             put("sharedDirtyKb", memInfo.totalSharedDirty)
-            put("cpuPercent", cpu)
+            put("cpuPercent", appCpu)
+            put("audioserverCpuPercent", asCpu)
+            put("audioserverPid", asPid ?: JSONObject.NULL)
             put("persistentProbeActive", serviceActions?.isPersistentProbeActive() ?: false)
             put("persistentProbeBands", serviceActions?.getPersistentProbeBands() ?: 0)
         }.toString()
     }
 
-    /** Samples /proc/self/stat over ~400ms to estimate this process's CPU %. */
-    private fun cpuUsagePercent(): Double {
-        val t0 = procCpuTicks()
-        val start = System.nanoTime()
-        try { Thread.sleep(400) } catch (_: InterruptedException) {}
-        val t1 = procCpuTicks()
-        val end = System.nanoTime()
-        val ticks = (t1 - t0).toDouble()
-        val clk = try {
-            Os.sysconf(OsConstants._SC_CLK_TCK).toDouble()
-        } catch (_: Throwable) { 100.0 }
-        val cpuSecs = ticks / clk
-        val wallSecs = (end - start) / 1e9
-        if (wallSecs <= 0) return 0.0
-        return (cpuSecs / wallSecs) * 100.0
+    @Volatile
+    private var cachedAudioserverPid: Int? = null
+
+    /** Finds a process PID by its comm (command name) via /proc/<pid>/stat. */
+    private fun findProcessPid(name: String): Int? {
+        return try {
+            val entries = File("/proc").list() ?: return null
+            for (entry in entries) {
+                val pid = entry.toIntOrNull() ?: continue
+                val statFile = File("/proc/$pid/stat")
+                if (!statFile.exists()) continue
+                val stat = statFile.readText()
+                val s = stat.indexOf('(')
+                val e = stat.lastIndexOf(')')
+                if (s >= 0 && e > s) {
+                    val comm = stat.substring(s + 1, e)
+                    if (comm == name) return pid
+                }
+            }
+            null
+        } catch (_: Throwable) { null }
     }
 
-    private fun procCpuTicks(): Long {
+    /** Resolves (and caches) the audioserver PID; re-resolves if it disappeared. */
+    private fun resolveAudioserverPid(): Int? {
+        val cached = cachedAudioserverPid
+        if (cached != null && File("/proc/$cached/stat").exists()) return cached
+        val pid = findProcessPid("audioserver") ?: findProcessPid("audioserver64")
+        cachedAudioserverPid = pid
+        return pid
+    }
+
+    private fun procCpuTicks(): Long = procCpuTicksForPid(android.os.Process.myPid())
+
+    private fun procCpuTicksForPid(pid: Int): Long {
         return try {
-            val stat = File("/proc/self/stat").readText()
+            val stat = File("/proc/$pid/stat").readText()
             val idx = stat.lastIndexOf(')')
             val parts = stat.substring(idx + 1).trim().split("\\s+".toRegex())
             val utime = parts.getOrNull(13)?.toLongOrNull() ?: 0L
@@ -391,6 +479,7 @@ class WebServer(
             "Content-Type: $contentType\r\n" +
             "Content-Length: ${data.size}\r\n" +
             "Connection: close\r\n" +
+            "Cache-Control: no-store\r\n" +
             "Access-Control-Allow-Origin: *\r\n" +
             "\r\n"
         out.write(header.toByteArray(StandardCharsets.UTF_8))
@@ -416,5 +505,24 @@ class WebServer(
         val regex = """"$key"\s*:\s*\[([-\d\s,]+)\]""".toRegex()
         val m = regex.find(json) ?: return null
         return m.groupValues[1].split(',').mapNotNull { it.trim().toIntOrNull() }.toIntArray()
+    }
+
+    private fun calibrationJson(): String {
+        val bands = serviceActions?.getCalibrationBands()
+        val freqs = serviceActions?.getCalibrationFrequenciesHz()
+        val active = serviceActions?.isCalibrationActive() ?: false
+        return if (bands != null && freqs != null) {
+            JSONObject().apply {
+                put("active", active)
+                put("bands", JSONArray().apply { bands.forEach { put(it) } })
+                put("frequenciesHz", JSONArray().apply { freqs.forEach { put(it) } })
+            }.toString()
+        } else """{"active":false,"bands":[],"frequenciesHz":[]}"""
+    }
+
+    private fun parseFloatArrayField(json: String, key: String): FloatArray? {
+        val regex = """"$key"\s*:\s*\[([-\d.eE\s,]+)\]""".toRegex()
+        val m = regex.find(json) ?: return null
+        return m.groupValues[1].split(',').mapNotNull { it.trim().toFloatOrNull() }.toFloatArray()
     }
 }

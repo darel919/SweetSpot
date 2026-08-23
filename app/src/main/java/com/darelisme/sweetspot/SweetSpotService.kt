@@ -59,13 +59,14 @@ class SweetSpotService : Service(), ServiceActions {
     private var lastProbeResults: List<DynamicsProcessingProbe.ProbeResult>? = null
     private val probeRunning = AtomicBoolean(false)
     private var persistentBands: Int = 0
+    private var persistentCurveName: String? = null
 
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "Service onCreate")
         profileStore = ProfileStore(this)
         createNotificationChannel()
-        engine = EqualizerEngine(profileStore).also { it.initialize() }
+        engine = DynamicsProcessingEq(profileStore).also { it.initialize() }
         overlay = OverlayController(this)
         webServer = WebServer(this, engine!!, overlay, this).also { it.start() }
         startForeground(NOTIFICATION_ID, buildNotification())
@@ -87,7 +88,7 @@ class SweetSpotService : Service(), ServiceActions {
             ACTION_PROBE_RELEASE -> releasePersistentProbe()
             ACTION_START -> {
                 // Already initialized in onCreate; ensure still alive.
-                if (engine == null) engine = EqualizerEngine(profileStore).also { it.initialize() }
+                if (engine == null) engine = DynamicsProcessingEq(profileStore).also { it.initialize() }
                 val showUi = intent.getBooleanExtra(EXTRA_SHOW_UI, true)
                 if (showUi) overlay?.show() else overlay?.hide()
             }
@@ -106,6 +107,7 @@ class SweetSpotService : Service(), ServiceActions {
      */
     override fun runProbe() {
         Log.i(TAG, "DynamicsProcessing probe requested")
+        suspendProduction()
         probeExecutor.submit {
             try {
                 probeRunning.set(true)
@@ -114,6 +116,7 @@ class SweetSpotService : Service(), ServiceActions {
                 Log.e(TAG, "Probe execution error", e)
             } finally {
                 probeRunning.set(false)
+                resumeProduction()
             }
         }
     }
@@ -143,6 +146,7 @@ class SweetSpotService : Service(), ServiceActions {
      */
     override fun runPersistentProbe(bands: Int) {
         Log.i(TAG, "Persistent DynamicsProcessing probe requested: $bands bands")
+        suspendProduction()
         probeExecutor.submit {
             try {
                 // Replace any existing persistent instance first.
@@ -150,13 +154,23 @@ class SweetSpotService : Service(), ServiceActions {
                     DynamicsProcessingProbe().releaseInstance(it)
                     Log.i(TAG, "Released previous persistent DynamicsProcessing instance")
                 }
-                val dp = DynamicsProcessingProbe().createEnabled(bands)
+                persistentCurveName = null
+                // Prefer stereo so both channels of the global mix are affected;
+                // fall back to mono if the 2-channel config is rejected.
+                var usedChannels = 2
+                val dp = try {
+                    DynamicsProcessingProbe().createEnabled(bands, 2)
+                } catch (e: Throwable) {
+                    Log.w(TAG, "2-channel persistent instance failed ($bands bands); falling back to 1 channel", e)
+                    usedChannels = 1
+                    DynamicsProcessingProbe().createEnabled(bands, 1)
+                }
                 persistentDp = dp
                 persistentBands = bands
                 Log.i(TAG, "=== Persistent DynamicsProcessing ACTIVE ===")
-                Log.i(TAG, "Bands: $bands | Session: 0 (global output mix) | Enabled: ${dp.enabled}")
+                Log.i(TAG, "Bands: $bands | Channels: $usedChannels | Session: 0 (global output mix) | Enabled: ${dp.enabled}")
                 Log.i(TAG, "Instance is intentionally left ENABLED for memory/CPU/reliability checks.")
-                Log.i(TAG, "Release via web (/api/probe/release) or broadcast PROBE_RELEASE.")
+                Log.i(TAG, "Apply a test curve via web (/api/probe/apply-curve) or release via /api/probe/release.")
             } catch (e: Throwable) {
                 Log.e(TAG, "Persistent probe failed for $bands bands", e)
             }
@@ -173,8 +187,11 @@ class SweetSpotService : Service(), ServiceActions {
                 } ?: Log.i(TAG, "No persistent DynamicsProcessing instance to release")
                 persistentDp = null
                 persistentBands = 0
+                persistentCurveName = null
             } catch (e: Throwable) {
                 Log.e(TAG, "Failed to release persistent instance", e)
+            } finally {
+                resumeProduction()
             }
         }
     }
@@ -184,6 +201,52 @@ class SweetSpotService : Service(), ServiceActions {
     override fun isProbeRunning(): Boolean = probeRunning.get()
     override fun isPersistentProbeActive(): Boolean = persistentDp != null
     override fun getPersistentProbeBands(): Int = persistentBands
+
+    override fun applyPersistentCurve(curve: String): Boolean {
+        val dp = persistentDp ?: return false
+        val n = persistentBands
+        return try {
+            when (curve) {
+                "hollow" -> DynamicsProcessingProbe().applyHollowCurve(dp, n)
+                "flat" -> DynamicsProcessingProbe().applyFlatCurve(dp, n)
+                else -> return false
+            }
+            persistentCurveName = curve
+            true
+        } catch (e: Throwable) {
+            Log.e(TAG, "applyPersistentCurve($curve) failed", e)
+            false
+        }
+    }
+
+    override fun getPersistentProbeCurve(): String? = persistentCurveName
+
+    override fun getPersistentProbeCurveSummary(): DynamicsProcessingProbe.CurveSummary? {
+        val dp = persistentDp ?: return null
+        return try {
+            DynamicsProcessingProbe().readCurveSummary(dp, persistentBands)
+        } catch (_: Throwable) { null }
+    }
+
+    // --- Calibration (read-only base curve; wizard/API only) ---
+
+    private fun dpEq() = engine as? DynamicsProcessingEq
+
+    override fun getCalibrationBands(): FloatArray? = dpEq()?.getCalibrationBands()
+    override fun getCalibrationFrequenciesHz(): IntArray? = dpEq()?.getCalibrationFrequenciesHz()
+    override fun isCalibrationActive(): Boolean = dpEq()?.isCalibrationActive() ?: false
+    override fun setCalibrationBands(gains: FloatArray): Boolean = dpEq()?.setCalibrationBands(gains) ?: false
+    override fun resetCalibration(): Boolean { dpEq()?.resetCalibration(); return true }
+
+    /** Release the production engine so a diagnostic DynamicsProcessing can own session 0. */
+    private fun suspendProduction() {
+        engine?.release()
+    }
+
+    /** Re-create and restore the production engine after diagnostics. */
+    private fun resumeProduction() {
+        engine?.initialize()
+    }
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(

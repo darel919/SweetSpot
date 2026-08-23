@@ -81,6 +81,20 @@ class ProfileStore(context: Context) {
         }
     }
 
+    // ---- calibration (128-band read-only base curve) ----
+
+    fun loadCalibration(): FloatArray? {
+        val s = prefs.getString(KEY_CALIBRATION, null)
+            ?.split(',')
+            ?.mapNotNull { it.toFloatOrNull() }
+            ?.toFloatArray()
+        return if (s != null && s.size == 128) s else null
+    }
+
+    fun saveCalibration(gains: FloatArray) {
+        prefs.edit().putString(KEY_CALIBRATION, gains.joinToString(",")).apply()
+    }
+
     private fun profileKey(name: String) = "p_$name"
 
     companion object {
@@ -92,6 +106,7 @@ class ProfileStore(context: Context) {
         private const val SUFFIX_ENABLED = "_e"
         private const val SUFFIX_PRESET = "_p"
         private const val SUFFIX_LEVELS = "_l"
+        private const val KEY_CALIBRATION = "calibration"
     }
 }
 

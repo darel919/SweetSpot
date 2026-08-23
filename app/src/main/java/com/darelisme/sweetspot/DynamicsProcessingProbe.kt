@@ -37,9 +37,9 @@ class DynamicsProcessingProbe {
         private val CANDIDATE_BANDS = intArrayOf(10, 20, 32, 64)
         // Only probed if 64 passes cleanly.
         private val EXTRA_BANDS = intArrayOf(96, 128)
-        // Ceiling ladder: only probed if 128 passes cleanly. Stops at first
-        // failure so we report the highest reliable count efficiently.
-        private val CEILING_BANDS = intArrayOf(192, 256, 384, 512, 768, 1024)
+        // 128 is the maximum band count we use — the calibration-resolution
+        // cap (derived from iPhone-mic calibration). No higher ladder is probed.
+        private val CEILING_BANDS = intArrayOf()
     }
 
     data class ProbeResult(
@@ -49,6 +49,12 @@ class DynamicsProcessingProbe {
         val enabled: Boolean,
         val actualBands: Int,
         val exception: String? = null
+    )
+
+    data class CurveSummary(
+        val bandsTotal: Int,
+        val bandsCut: Int,   // |gain| > 1 dB
+        val bandsFlat: Int   // |gain| <= 1 dB
     )
 
     /** Runs the full probe sequence, logs a summary, and returns the results. */
@@ -167,7 +173,7 @@ class DynamicsProcessingProbe {
      * measured with a long-lived enabled effect. The caller owns the instance
      * and MUST release it (see [releaseInstance]) when finished.
      */
-    fun createEnabled(n: Int): DynamicsProcessing {
+    fun createEnabled(n: Int, channels: Int = 1): DynamicsProcessing {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
             throw UnsupportedOperationException(
                 "DynamicsProcessing requires API 28+ (device is ${Build.VERSION.SDK_INT})"
@@ -188,6 +194,55 @@ class DynamicsProcessingProbe {
         }
     }
 
+    /**
+     * Applies a frequency-dependent gain curve to a live, enabled
+     * [DynamicsProcessing] instance (pre-EQ stage, all channels).
+     * [gainForFreq] maps a band's center frequency (Hz) to a gain in dB.
+     * Commits per-band via [DynamicsProcessing.setPreEqBandByChannelIndex].
+     */
+    fun applyCurve(dp: DynamicsProcessing, n: Int, gainForFreq: (Float) -> Float) {
+        for (ch in 0..1) {
+            for (i in 0 until n) {
+                try {
+                    val freq = F_MIN * (F_MAX / F_MIN).pow(i.toFloat() / (n - 1))
+                    val band = dp.getPreEqBandByChannelIndex(ch, i)
+                    band.setGain(gainForFreq(freq))
+                    dp.setPreEqBandByChannelIndex(ch, i, band)
+                } catch (_: Throwable) {
+                    // Channel not present (e.g. mono instance) — stop this channel.
+                    break
+                }
+            }
+        }
+    }
+
+    /** Hollow / recessed-mids test curve: cuts 300 Hz–3 kHz by 15 dB. */
+    fun applyHollowCurve(dp: DynamicsProcessing, n: Int) {
+        applyCurve(dp, n) { freq ->
+            when {
+                freq < 300f -> 0f
+                freq < 3000f -> -15f
+                else -> 0f
+            }
+        }
+    }
+
+    /** Resets all bands to 0 dB (flat) for A/B comparison. */
+    fun applyFlatCurve(dp: DynamicsProcessing, n: Int) {
+        applyCurve(dp, n) { 0f }
+    }
+
+    /** Reads back the live gain curve for verification. */
+    fun readCurveSummary(dp: DynamicsProcessing, n: Int): CurveSummary {
+        var cut = 0
+        var flat = 0
+        for (i in 0 until n) {
+            val g = try { dp.getPreEqBandByChannelIndex(0, i).gain } catch (_: Throwable) { 0f }
+            if (kotlin.math.abs(g) > 1f) cut++ else flat++
+        }
+        return CurveSummary(n, cut, flat)
+    }
+
     private fun readBackBandCount(dp: DynamicsProcessing, requested: Int): Int {
         // Primary: live effect state for channel 0.
         try {
@@ -203,9 +258,9 @@ class DynamicsProcessingProbe {
         }
     }
 
-    private fun buildConfig(n: Int): DynamicsProcessing.Config {
+    fun buildConfig(n: Int, channels: Int = 1): DynamicsProcessing.Config {
         val variant = DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION
-        val channelCount = 1
+        val channelCount = channels
         val builder = DynamicsProcessing.Config.Builder(
             variant,
             channelCount,

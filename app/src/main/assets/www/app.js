@@ -14,7 +14,8 @@ createApp({
       bandLevelRange: [-1500, 1500],
       overlayVisible: false,
       presets: [{ id: 1, name: 'Flat' }, { id: 2, name: 'Night' }],
-      profiles: []
+      profiles: [],
+      calibration: { active: false, bands: [], frequenciesHz: [] }
     });
 
     const statusText = ref('Connecting…');
@@ -24,12 +25,17 @@ createApp({
 
     const probe = reactive({ running: false, available: false, highest: -1, recommended: -1, results: [] });
     const persistent = reactive({ active: false, bands: 0 });
+    const curve = reactive({ name: null, summary: null });
     const device = reactive({
       pssTotalKb: 0, privateDirtyKb: 0, sharedDirtyKb: 0,
       javaHeapTotal: 0, javaHeapFree: 0, nativeHeapAllocated: 0,
-      cpuPercent: 0, persistentProbeActive: false, persistentProbeBands: 0
+      cpuPercent: 0, persistentProbeActive: false, persistentProbeBands: 0,
+      audioserverCpuPercent: 0, audioserverPid: null
     });
     const persistBands = ref(128);
+    const showCalWizard = ref(false);
+    const calJson = ref('');
+    const calStatus = ref('');
     const deviceText = computed(() => JSON.stringify(device, null, 2));
 
     const stateText = computed(() => JSON.stringify(state, null, 2));
@@ -53,6 +59,7 @@ createApp({
           state.presets = s.presets;
           state.profiles = s.profiles;
         }
+        state.calibration = s.calibration || { active: false, bands: [], frequenciesHz: [] };
         statusText.value = s.enabled ? 'Audio tuning active' : 'Bypassed';
         statusColor.value = s.enabled ? '#6ee7a8' : '#f0a868';
       } catch (e) {
@@ -172,11 +179,12 @@ createApp({
         probe.results = s.results || [];
       } catch (e) { /* offline */ }
     }
-    async function createPersistent() {
+    async function createPersistent(bands) {
+      const b = bands || persistBands.value;
       await fetch('/api/probe/persist', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ bands: persistBands.value })
+        body: JSON.stringify({ bands: b })
       });
       refreshPersistent();
     }
@@ -190,7 +198,63 @@ createApp({
         const s = await r.json();
         persistent.active = s.active;
         persistent.bands = s.bands;
+        curve.name = s.curve || null;
+        curve.summary = s.curveSummary || null;
       } catch (e) { /* offline */ }
+    }
+    async function applyCurve(c) {
+      if (!persistent.active) {
+        // No persistent instance yet — create one at the chosen band count, then apply.
+        await createPersistent();
+        for (let i = 0; i < 20; i++) {
+          if (persistent.active) break;
+          await new Promise(r => setTimeout(r, 500));
+          await refreshPersistent();
+        }
+      }
+      await fetch('/api/probe/apply-curve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ curve: c })
+      });
+      refreshPersistent();
+    }
+    // One-click A/B: switch to band count [n] (releasing a different one first)
+    // and apply the hollow curve so the audible effect can be compared directly.
+    async function quickAudible(n) {
+      if (persistent.active && persistent.bands !== n) {
+        await releasePersistent();
+        for (let i = 0; i < 10; i++) {
+          if (!persistent.active) break;
+          await new Promise(r => setTimeout(r, 300));
+          await refreshPersistent();
+        }
+      }
+      persistBands.value = n;
+      await applyCurve('hollow');
+    }
+    function openCalibrationWizard() { showCalWizard.value = true; calStatus.value = ''; }
+    function calibHeight(g) {
+      const clamped = Math.max(-15, Math.min(15, g));
+      return Math.round(20 + (clamped + 15) * 2); // 20..80 px
+    }
+    function applyCalibrationCurve() {
+      let arr;
+      try { arr = JSON.parse(calJson.value); } catch (e) { calStatus.value = 'Invalid JSON'; return; }
+      if (!Array.isArray(arr) || arr.length !== 128) { calStatus.value = 'Need exactly 128 numbers'; return; }
+      fetch('/api/eq/calibration', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ gains: arr }) })
+        .then(r => r.json()).then(d => { calStatus.value = d.error ? ('Failed: ' + d.error) : 'Applied'; getState(); })
+        .catch(() => { calStatus.value = 'Request failed'; });
+    }
+    function loadTestCalibration() {
+      const freqs = state.calibration.frequenciesHz;
+      const gains = freqs.map(hz => (hz >= 300 && hz <= 3000) ? -15 : 0);
+      fetch('/api/eq/calibration', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ gains }) })
+        .then(r => r.json()).then(() => { calStatus.value = 'Test curve applied'; getState(); });
+    }
+    function resetCalibration() {
+      fetch('/api/eq/calibration/reset', { method: 'POST' })
+        .then(() => { calStatus.value = 'Reset to flat'; getState(); });
     }
     async function refreshDevice() {
       try {
@@ -205,6 +269,8 @@ createApp({
         device.cpuPercent = s.cpuPercent;
         device.persistentProbeActive = s.persistentProbeActive;
         device.persistentProbeBands = s.persistentProbeBands;
+        device.audioserverCpuPercent = s.audioserverCpuPercent;
+        device.audioserverPid = s.audioserverPid;
       } catch (e) { /* offline */ }
     }
 
@@ -225,8 +291,10 @@ createApp({
       centerHz, onInput, onChange, applyBands,
       applyPreset, enable, bypass, showUi, hideUi,
       saveProfile, loadProfile, deleteProfile,
-      probe, persistent, deviceText, persistBands,
-      runProbe, createPersistent, releasePersistent
+      probe, persistent, deviceText, persistBands, curve, device,
+      runProbe, createPersistent, releasePersistent, applyCurve, quickAudible,
+      showCalWizard, calJson, calStatus,
+      openCalibrationWizard, calibHeight, applyCalibrationCurve, loadTestCalibration, resetCalibration
     };
   }
 }).mount('#app');

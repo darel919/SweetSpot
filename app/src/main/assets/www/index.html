@@ -50,12 +50,27 @@
     <section>
       <h2>Bands (dB)</h2>
       <p class="profile">Profile: <span>{{ state.presetName }}</span></p>
-      <div class="band" v-for="(lvl, i) in state.bands" :key="i">
-        <span>{{ centerHz(i) }} Hz</span>
-        <input type="range" :min="state.bandLevelRange[0]" :max="state.bandLevelRange[1]" step="100"
-               :value="lvl" @input="onInput(i, $event)" @change="onChange" />
-        <span class="bandval">{{ (lvl / 100).toFixed(1) }} dB</span>
+      <div class="band-scroll">
+        <div class="band" v-for="(lvl, i) in state.bands" :key="i">
+          <span>{{ centerHz(i) }} Hz</span>
+          <input type="range" :min="state.bandLevelRange[0]" :max="state.bandLevelRange[1]" step="100"
+                 :value="lvl" @input="onInput(i, $event)" @change="onChange" />
+          <span class="bandval">{{ (lvl / 100).toFixed(1) }} dB</span>
+        </div>
       </div>
+    </section>
+
+    <section>
+      <h2>System Calibration <span class="tag">read-only</span></h2>
+      <p class="hint">Base curve set only by the Calibrate wizard (iPhone-mic measurement).</p>
+      <div class="calib-bars">
+        <div v-for="(g, i) in state.calibration.bands" :key="i"
+             class="calib-bar"
+             :class="g < -0.5 ? 'cut' : (g > 0.5 ? 'boost' : 'flat')"
+             :style="{ height: calibHeight(g) + 'px' }"
+             :title="state.calibration.frequenciesHz[i] + ' Hz · ' + g.toFixed(1) + ' dB'"></div>
+      </div>
+      <button @click="openCalibrationWizard()">Calibrate…</button>
     </section>
 
     <section>
@@ -87,15 +102,47 @@
       <h3>Persistent instance</h3>
       <p class="muted">Long-lived enabled effect for memory / CPU / reliability checks.</p>
       <div class="save-row">
-        <input type="number" v-model.number="persistBands" min="1" max="1024" />
+        <input type="number" v-model.number="persistBands" min="1" max="128" />
         <button @click="createPersistent">Create (enabled)</button>
         <button @click="releasePersistent">Release</button>
       </div>
       <p>Status: <strong :style="{ color: persistent.active ? '#6ee7a8' : '#f06a6a' }">{{ persistent.active ? 'ACTIVE' : 'none' }}</strong><span v-if="persistent.active"> @ {{ persistent.bands }} bands</span></p>
 
+      <h3>Test curve (audible proof)</h3>
+      <p class="muted">Applies a dramatic EQ to prove the instance is on the live path. Auto-creates a 1024-band instance if none exists.</p>
+      <div class="save-row">
+        <button @click="applyCurve('hollow')">Hollow −15 dB mids</button>
+        <button @click="applyCurve('flat')">Reset (flat)</button>
+      </div>
+      <p>Curve: <strong>{{ curve.name || 'none' }}</strong><span v-if="curve.summary"> · {{ curve.summary.bandsCut }} bands cut, {{ curve.summary.bandsFlat }} flat</span></p>
+
+      <h3>Quick A/B (hollow @ count)</h3>
+      <p class="muted">Switch band count and apply the hollow curve in one click. Listen, then compare.</p>
+      <div class="save-row">
+        <button @click="quickAudible(32)">Test 32</button>
+        <button @click="quickAudible(64)">Test 64</button>
+        <button @click="quickAudible(128)">Test 128</button>
+      </div>
+
       <h3>Device / Memory</h3>
+      <p>App CPU: <strong>{{ device.cpuPercent.toFixed(1) }}%</strong> &nbsp;·&nbsp; Audioserver CPU: <strong>{{ device.audioserverPid != null ? device.audioserverCpuPercent.toFixed(1) + '%' : 'n/a (SELinux-blocked)' }}</strong></p>
       <pre>{{ deviceText }}</pre>
     </section>
+
+    <div class="modal-mask" v-if="showCalWizard" @click.self="showCalWizard=false">
+      <div class="modal">
+        <h3>Calibration Wizard (stub)</h3>
+        <p>Paste a JSON array of 128 dB values (20 Hz–20 kHz, log-spaced) from the iPhone measurement, or load a test curve.</p>
+        <textarea v-model="calJson" rows="5" placeholder="[0, -1.2, 3.0, ... 128 numbers]"></textarea>
+        <div class="modal-actions">
+          <button @click="applyCalibrationCurve()">Apply curve</button>
+          <button @click="loadTestCalibration()">Load test (hollow)</button>
+          <button @click="resetCalibration()">Reset to flat</button>
+          <button @click="showCalWizard=false">Close</button>
+        </div>
+        <p class="status" v-if="calStatus">{{ calStatus }}</p>
+      </div>
+    </div>
   </div>
   <script src="app.js"></script>
 </body>

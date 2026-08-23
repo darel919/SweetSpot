@@ -1,22 +1,34 @@
 package com.example.sweetspot
 
+import android.app.Activity
+import android.graphics.Color
 import android.os.Bundle
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.ui.Modifier
-import com.example.sweetspot.theme.SweetSpotTheme
+import android.view.Gravity
+import android.widget.TextView
 
-class MainActivity : ComponentActivity() {
-  override fun onCreate(savedInstanceState: Bundle?) {
-    super.onCreate(savedInstanceState)
+class MainActivity : Activity() {
 
-    enableEdgeToEdge()
-    setContent {
-      SweetSpotTheme { Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { MainNavigation() } }
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        val status = TextView(this).apply {
+            text = """
+                SweetSpot
+
+                Audio tuning service
+
+                Initializing...
+            """.trimIndent()
+
+            textSize = 28f
+            gravity = Gravity.CENTER
+
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.BLACK)
+
+            setPadding(48, 48, 48, 48)
+        }
+
+        setContentView(status)
     }
-  }
 }

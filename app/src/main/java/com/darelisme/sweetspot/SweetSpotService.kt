@@ -90,7 +90,13 @@ class SweetSpotService : Service(), ServiceActions {
             client.listener = object : MailboxClient.Listener {
                 override fun onDeviceOnline(online: Boolean) {
                     overlay?.updateRelayState(
-                        if (online) OverlayController.RELAY_CONNECTED else OverlayController.RELAY_CONNECTING
+                        if (online) OverlayController.RELAY_WAITING else OverlayController.RELAY_CONNECTING
+                    )
+                }
+
+                override fun onClientPresence(present: Boolean) {
+                    overlay?.updateRelayState(
+                        if (present) OverlayController.RELAY_CONNECTED else OverlayController.RELAY_WAITING
                     )
                 }
             }

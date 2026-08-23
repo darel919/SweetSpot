@@ -32,6 +32,9 @@ class MailboxClient(
 
     interface Listener {
         fun onDeviceOnline(online: Boolean)
+
+        /** True while a dashboard is actively posting to the room. */
+        fun onClientPresence(present: Boolean)
     }
 
     @Volatile
@@ -57,6 +60,7 @@ class MailboxClient(
 
     private fun pollLoop() {
         var wasOnline = false
+        var wasClientPresent = false
         while (running.get()) {
             val room = roomProvider()
             try {
@@ -71,9 +75,17 @@ class MailboxClient(
                 client.newCall(req).execute().use { res ->
                     if (!res.isSuccessful) throw IllegalStateException("HTTP ${res.code}")
                     val body = res.body?.string() ?: "{}"
-                    val commands = JSONObject(body).optJSONArray("commands") ?: JSONArray()
+                    val json = JSONObject(body)
+                    val commands = json.optJSONArray("commands") ?: JSONArray()
                     for (i in 0 until commands.length()) {
                         handleCommand(commands.getJSONObject(i))
+                    }
+                    // The DO stamps clientSeenAt on every /client POST, so this
+                    // reflects real dashboard activity, not just our own polls.
+                    val clientPresent = json.optBoolean("clientOnline", false)
+                    if (clientPresent != wasClientPresent) {
+                        wasClientPresent = clientPresent
+                        listener?.onClientPresence(clientPresent)
                     }
                 }
 

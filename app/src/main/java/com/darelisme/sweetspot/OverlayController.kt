@@ -5,6 +5,7 @@ import android.graphics.PixelFormat
 import android.graphics.drawable.BitmapDrawable
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
@@ -35,6 +36,11 @@ class OverlayController(private val context: Context) {
         private const val TAG = "SweetSpotOverlay"
         private const val QR_SIZE_PX = 320
 
+        // Overlay auto-dismiss: shortly after a dashboard connects, or when
+        // nobody scans/connects within this window.
+        private const val DISMISS_AFTER_CONNECT_MS = 5_000L
+        private const val INACTIVITY_DISMISS_MS = 30_000L
+
         // Mailbox presence states, mirrored from MailboxClient.
         const val RELAY_DISCONNECTED = "disconnected"
         const val RELAY_CONNECTING = "connecting"
@@ -58,6 +64,10 @@ class OverlayController(private val context: Context) {
     @Volatile
     private var relayState: String = RELAY_DISCONNECTED
 
+    // Main-thread-only timers for the two auto-dismiss rules.
+    private var shownAtMs: Long = 0
+    private var connectedAtMs: Long = 0
+
     fun show() {
         mainHandler.post { showInternal() }
     }
@@ -80,7 +90,38 @@ class OverlayController(private val context: Context) {
     fun updateRelayState(state: String) {
         mainHandler.post {
             relayState = state
+            if (state == RELAY_CONNECTED && shown && connectedAtMs == 0L) {
+                // Real dashboard presence: dismiss shortly after.
+                connectedAtMs = SystemClock.elapsedRealtime()
+                scheduleConnectDismiss()
+            }
             if (shown) refreshContent()
+        }
+    }
+
+    private val dismissRunnable = Runnable { hideInternal() }
+
+    private fun scheduleInactivityDismiss() {
+        mainHandler.removeCallbacks(dismissRunnable)
+        val idleFor = SystemClock.elapsedRealtime() - shownAtMs
+        val remaining = INACTIVITY_DISMISS_MS - idleFor
+        if (remaining <= 0) {
+            Log.i(TAG, "Overlay auto-hidden after inactivity")
+            hideInternal()
+        } else {
+            mainHandler.postDelayed(dismissRunnable, remaining)
+        }
+    }
+
+    private fun scheduleConnectDismiss() {
+        mainHandler.removeCallbacks(dismissRunnable)
+        val connectedFor = SystemClock.elapsedRealtime() - connectedAtMs
+        val remaining = DISMISS_AFTER_CONNECT_MS - connectedFor
+        if (remaining <= 0) {
+            Log.i(TAG, "Overlay auto-hidden after dashboard connect")
+            hideInternal()
+        } else {
+            mainHandler.postDelayed(dismissRunnable, remaining)
         }
     }
 
@@ -109,6 +150,9 @@ class OverlayController(private val context: Context) {
             windowManager.addView(view, params)
             overlayView = view
             shown = true
+            shownAtMs = SystemClock.elapsedRealtime()
+            connectedAtMs = 0
+            scheduleInactivityDismiss()
             Log.i(TAG, "Overlay shown")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to add overlay view", e)
@@ -116,6 +160,7 @@ class OverlayController(private val context: Context) {
     }
 
     private fun hideInternal() {
+        mainHandler.removeCallbacks(dismissRunnable)
         if (!shown) return
         overlayView?.let {
             try {

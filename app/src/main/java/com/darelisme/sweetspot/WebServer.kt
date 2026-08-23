@@ -1,6 +1,5 @@
 package com.darelisme.sweetspot
 
-import android.content.Context
 import android.os.Debug
 import android.system.Os
 import android.system.OsConstants
@@ -20,14 +19,22 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Minimal, dependency-free embedded HTTP server for LAN control.
+ * Minimal dependency-free local HTTP API server for SweetSpot device control.
+ *
+ * Responsibilities:
+ *  - expose device/DSP state
+ *  - accept control commands
+ *  - expose calibration/profile operations
+ *  - expose development diagnostics
  *
  * Design goals (per project constraints):
  *  - no external server framework
  *  - tiny fixed thread pool (low RAM, few threads)
- *  - binds to all interfaces so phones on the LAN can reach it
- *  - serves static assets from [Context.getAssets] and a small JSON REST API
+ *  - binds to all interfaces so clients on the LAN can reach it
  *  - talks to the [AudioEngine] abstraction only, never to Equalizer directly
+ *
+ * It does not serve the SweetSpot browser dashboard. The dashboard is hosted
+ * separately by sweetspot-web.
  *
  * One request per connection, `Connection: close` (no keep-alive parsing needed).
  */
@@ -49,7 +56,7 @@ interface ServiceActions {
     fun getPersistentProbeCurve(): String?
     fun getPersistentProbeCurveSummary(): DynamicsProcessingProbe.CurveSummary?
 
-    // Calibration (128-band read-only base curve; wizard/API only).
+    // Calibration (64-band read-only base curve; wizard/API only).
     fun getCalibrationBands(): FloatArray?
     fun getCalibrationFrequenciesHz(): IntArray?
     fun isCalibrationActive(): Boolean
@@ -58,7 +65,6 @@ interface ServiceActions {
 }
 
 class WebServer(
-    private val context: Context,
     private val engine: AudioEngine,
     private val overlay: OverlayController? = null,
     private val serviceActions: ServiceActions? = null,
@@ -66,7 +72,6 @@ class WebServer(
 ) {
     companion object {
         private const val TAG = "SweetSpotWeb"
-        private const val WWW_ROOT = "www"
     }
 
     @Volatile
@@ -169,14 +174,11 @@ class WebServer(
 
     private fun route(client: Socket, method: String, path: String, body: String) {
         when {
-            method == "GET" && (path == "/" || path == "/index.html") ->
-                serveAsset(client, "$WWW_ROOT/index.html", "text/html; charset=utf-8")
+            method == "GET" && path == "/" ->
+                sendJson(client, """{"service":"SweetSpot","type":"api","status":"ok"}""")
 
-            method == "GET" && path == "/style.css" ->
-                serveAsset(client, "$WWW_ROOT/style.css", "text/css; charset=utf-8")
-
-            method == "GET" && path == "/app.js" ->
-                serveAsset(client, "$WWW_ROOT/app.js", "application/javascript; charset=utf-8")
+            method == "GET" && path == "/api/health" ->
+                sendJson(client, """{"ok":true,"service":"SweetSpot","apiVersion":1}""")
 
             method == "GET" && path == "/api/state" ->
                 sendJson(client, stateJson())
@@ -291,15 +293,6 @@ class WebServer(
                 sendJson(client, deviceInfoJson())
 
             else -> sendError(client, 404, "Not Found")
-        }
-    }
-
-    private fun serveAsset(client: Socket, assetPath: String, contentType: String) {
-        try {
-            val data = context.assets.open(assetPath).use { it.readBytes() }
-            sendResponse(client, 200, contentType, data)
-        } catch (e: Exception) {
-            sendError(client, 404, "Not Found")
         }
     }
 

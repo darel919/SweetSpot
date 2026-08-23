@@ -6,7 +6,7 @@ The project is currently being developed for a resource-constrained TCL Android 
 
 ## Status
 
-SweetSpot is a working tool for tuning a TV's sound from another device, not a proof-of-concept.
+SweetSpot is a working tool for tuning a TV's sound, not a proof-of-concept.
 
 The core capability is already confirmed on the target hardware:
 
@@ -14,31 +14,30 @@ The core capability is already confirmed on the target hardware:
 - SweetSpot obtains control of the TV's built-in equalizer
 - changing EQ values produces an audible system-wide effect during normal TV playback
 
-All tuning is performed remotely through a browser on a phone or laptop; the TV itself only shows status, a local URL, and a QR code.
-
 ## Architecture
 
 SweetSpot is intentionally designed without Flutter or Compose.
 
-Current direction:
+Android is the DSP/device backend. The browser frontend lives in the separate [sweetspot-web](https://github.com/darel919/sweetspot-web) project (hosted at https://sweetspot.darelisme.my.id), which owns all dashboard UI, EQ controls, profiles UI, diagnostics, and the calibration wizard.
 
 ```text
-MainActivity
+Android TV SweetSpot
     |
     v
 SweetSpotService
     |
     +-- AudioEngine
     |     |
-    |     +-- global Equalizer(session 0)
+    |     +-- global audio session 0 DSP (DynamicsProcessing)
+    |     +-- 64-band calibration state
+    |     +-- 24-band user EQ
+    |     +-- profiles
     |
-    +-- settings
-    +-- future HTTP server
+    +-- local HTTP API server (API/debugging interface only)
+    +-- native TV status/pairing overlay
 ```
 
-Eventually, the TV application should only display its status, local URL, and QR code.
-
-All tuning will be performed through a browser.
+Normal user control comes through the hosted dashboard at https://sweetspot.darelisme.my.id. The TV's local HTTP server exposes a JSON API for device control and debugging; it does not host any browser UI. A relay-based device agent is planned so the hosted dashboard can reach the TV without direct LAN access.
 
 ## Design Constraints
 
@@ -51,7 +50,7 @@ SweetSpot should remain:
 - usable on 32-bit ARM Android TV hardware
 - independent of a large TV-side UI
 
-Avoid adding large frameworks unless necessary.
+Avoid adding large frameworks unless necessary. Do not bundle or serve a web dashboard from the APK.
 
 ## Build
 

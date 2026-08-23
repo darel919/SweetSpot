@@ -68,7 +68,7 @@ class SweetSpotService : Service(), ServiceActions {
         createNotificationChannel()
         engine = DynamicsProcessingEq(profileStore).also { it.initialize() }
         overlay = OverlayController(this)
-        webServer = WebServer(this, engine!!, overlay, this).also { it.start() }
+        webServer = WebServer(engine!!, overlay, this).also { it.start() }
         startForeground(NOTIFICATION_ID, buildNotification())
         Log.i(TAG, "Service started in foreground (engine + web server + overlay)")
     }

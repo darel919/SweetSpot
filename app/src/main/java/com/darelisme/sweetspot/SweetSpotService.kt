@@ -74,6 +74,9 @@ class SweetSpotService : Service(), ServiceActions {
         Log.i(TAG, "Service onCreate")
         profileStore = ProfileStore(this)
         createNotificationChannel()
+        // Promote to foreground before slow init; the system enforces a short
+        // window between startForegroundService() and startForeground().
+        startForeground(NOTIFICATION_ID, buildNotification())
         engine = DynamicsProcessingEq(profileStore).also { it.initialize() }
         overlay = OverlayController(this).also {
             it.updatePairInfo(pairCodes.current())
@@ -107,7 +110,6 @@ class SweetSpotService : Service(), ServiceActions {
             }
             client.start()
         }
-        startForeground(NOTIFICATION_ID, buildNotification())
         Log.i(TAG, "Service started in foreground (engine + web server + overlay + relay)")
     }
 

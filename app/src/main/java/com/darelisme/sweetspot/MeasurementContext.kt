@@ -37,7 +37,13 @@ data class MeasurementContext(
         else -> "Hold the iPhone at the instructed position."
     }
 
-    fun readyStatus(): String = "${label()}\n${instruction()}\nKeep the same bottom-mic orientation, then continue on the phone."
+    fun requiresRemoteContinue(): Boolean = positionIndex > 0 && takeIndex == 0
+
+    fun readyStatus(): String = "${label()}\n${instruction()}\n" + if (!requiresRemoteContinue()) {
+        "Keep the same bottom-mic orientation while the TV starts the measurement."
+    } else {
+        "Keep the same bottom-mic orientation, then press Continue on the TV."
+    }
 
     fun toJson(): JSONObject = JSONObject()
         .put("positionId", positionId)

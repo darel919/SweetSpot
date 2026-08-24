@@ -45,4 +45,5 @@ kotlin {
 dependencies {
     implementation(libs.okhttp)
     implementation(libs.zxing.core)
+    testImplementation(libs.junit)
 }

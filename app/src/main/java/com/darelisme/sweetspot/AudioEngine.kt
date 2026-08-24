@@ -26,7 +26,18 @@ interface AudioEngine {
     fun loadProfile(name: String)
     /** Delete a named profile. */
     fun deleteProfile(name: String)
+
+    fun beginMeasurementBypass(): MeasurementAudioState
+    fun endMeasurementBypass(state: MeasurementAudioState)
 }
+
+data class MeasurementAudioState(
+    val enabled: Boolean,
+    val activePreset: Int,
+    val userBandLevelsMillibels: IntArray,
+    val calibrationGainsDb: FloatArray,
+    val calibrationActive: Boolean
+)
 
 data class EngineCapabilities(
     val bandCount: Int,

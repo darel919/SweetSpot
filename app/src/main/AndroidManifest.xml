@@ -39,6 +39,14 @@
 
         </activity>
 
+        <activity
+            android:name=".CalibrationActivity"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:screenOrientation="landscape"
+            android:theme="@android:style/Theme.Material.NoActionBar" />
+
         <service
             android:name=".SweetSpotService"
             android:exported="false"

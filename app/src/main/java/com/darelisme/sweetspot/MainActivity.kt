@@ -30,6 +30,7 @@ class MainActivity : Activity() {
             val intent = Intent(this, SweetSpotService::class.java).apply {
                 action = SweetSpotService.ACTION_START
                 putExtra(SweetSpotService.EXTRA_SHOW_UI, true)
+                putExtra(EXTRA_START_REASON, SweetSpotStartReason.USER_LAUNCH.name)
             }
             startForegroundService(intent)
             Log.i(TAG, "Requested SweetSpotService start")

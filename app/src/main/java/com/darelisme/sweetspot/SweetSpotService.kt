@@ -7,11 +7,15 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.media.audiofx.DynamicsProcessing
+import android.media.audiofx.Virtualizer
 import android.os.IBinder
 import android.os.Debug
+import android.os.Handler
+import android.os.Looper
 import android.system.Os
 import android.system.OsConstants
 import android.util.Log
+import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -41,9 +45,13 @@ class SweetSpotService : Service(), ServiceActions {
         const val ACTION_PROBE = "com.darelisme.sweetspot.PROBE_DYNAMICS"
         const val ACTION_PROBE_PERSIST = "com.darelisme.sweetspot.PROBE_PERSIST"
         const val ACTION_PROBE_RELEASE = "com.darelisme.sweetspot.PROBE_RELEASE"
+        const val ACTION_CALIBRATION_UI_READY = "com.darelisme.sweetspot.CALIBRATION_UI_READY"
+        const val ACTION_CALIBRATION_UI_CLOSED = "com.darelisme.sweetspot.CALIBRATION_UI_CLOSED"
+        const val ACTION_CALIBRATION_CANCEL = "com.darelisme.sweetspot.CALIBRATION_CANCEL"
         const val EXTRA_PRESET = "preset"
         const val EXTRA_SHOW_UI = "showUi"
         const val EXTRA_PROBE_BANDS = "probeBands"
+        const val EXTRA_SESSION_ID = "sessionId"
 
         private const val CHANNEL_ID = "sweetspot"
         private const val NOTIFICATION_ID = 1
@@ -53,6 +61,9 @@ class SweetSpotService : Service(), ServiceActions {
     private var webServer: WebServer? = null
     private var overlay: OverlayController? = null
     private var relay: MailboxClient? = null
+    private var measurementController: MeasurementController? = null
+    private var runtimeStarted = false
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val pairCodes = PairCodeManager()
     private lateinit var profileStore: ProfileStore
 
@@ -69,6 +80,10 @@ class SweetSpotService : Service(), ServiceActions {
     private var persistentBands: Int = 0
     private var persistentCurveName: String? = null
 
+    // Persistent global-mix Virtualizer for spatial-widening A/B tests.
+    // Strength fixed at max until the listening test proves the feature.
+    private var persistentVirtualizer: Virtualizer? = null
+
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "Service onCreate")
@@ -77,47 +92,108 @@ class SweetSpotService : Service(), ServiceActions {
         // Promote to foreground before slow init; the system enforces a short
         // window between startForegroundService() and startForeground().
         startForeground(NOTIFICATION_ID, buildNotification())
-        engine = DynamicsProcessingEq(profileStore).also { it.initialize() }
-        overlay = OverlayController(this).also {
-            it.updatePairInfo(pairCodes.current())
-            it.show()
-        }
-        webServer = WebServer(engine!!, overlay, this).also {
-            it.pairCodeProvider = { pairCodes.current() }
-            it.pairCodeRotateProvider = {
-                pairCodes.rotate().also { code -> overlay?.updatePairInfo(code) }
-            }
-            it.start()
-        }
-        relay = MailboxClient(
-            roomProvider = { pairCodes.current() },
-            snapshotProvider = { stateSnapshotJson() },
-            effectsDiagnosticsProvider = { runEffectDiagnosticsBlocking() },
-            commandHandler = mailboxCommandHandler()
-        ).also { client ->
-            client.listener = object : MailboxClient.Listener {
-                override fun onDeviceOnline(online: Boolean) {
-                    overlay?.updateRelayState(
-                        if (online) OverlayController.RELAY_WAITING else OverlayController.RELAY_CONNECTING
-                    )
-                }
+        Log.i(TAG, "Foreground service shell ready")
+    }
 
-                override fun onClientPresence(present: Boolean) {
-                    overlay?.updateRelayState(
-                        if (present) OverlayController.RELAY_CONNECTED else OverlayController.RELAY_WAITING
-                    )
+    @Synchronized
+    private fun ensureRuntimeStarted() {
+        if (runtimeStarted) return
+
+        var createdEngine: AudioEngine? = null
+        var createdOverlay: OverlayController? = null
+        var createdWebServer: WebServer? = null
+        var createdRelay: MailboxClient? = null
+        var createdMeasurementController: MeasurementController? = null
+        try {
+            createdEngine = DynamicsProcessingEq(profileStore).also { it.initialize() }
+            createdOverlay = OverlayController(this).also {
+                it.updatePairInfo(pairCodes.current())
+            }
+            createdWebServer = WebServer(
+                createdEngine,
+                createdOverlay,
+                this,
+                eqAppliedNotifier = ::showEqAppliedToast
+            ).also {
+                it.pairCodeProvider = { pairCodes.current() }
+                it.pairCodeRotateProvider = {
+                    pairCodes.rotate().also { code -> overlay?.updatePairInfo(code) }
                 }
             }
-            client.start()
+            createdRelay = MailboxClient(
+                roomProvider = { pairCodes.current() },
+                snapshotProvider = { stateSnapshotJson() },
+                effectsDiagnosticsProvider = { runEffectDiagnosticsBlocking() },
+                commandHandler = mailboxCommandHandler()
+            ).also { client ->
+                client.listener = object : MailboxClient.Listener {
+                    override fun onDeviceOnline(online: Boolean) {
+                        overlay?.updateRelayState(
+                            if (online) OverlayController.RELAY_WAITING else OverlayController.RELAY_CONNECTING
+                        )
+                    }
+
+                    override fun onClientPresence(present: Boolean) {
+                        overlay?.updateRelayState(
+                            if (present) OverlayController.RELAY_CONNECTED else OverlayController.RELAY_WAITING
+                        )
+                    }
+                }
+            }
+            createdMeasurementController = MeasurementController(this, createdEngine)
+
+            engine = createdEngine
+            overlay = createdOverlay
+            webServer = createdWebServer
+            relay = createdRelay
+            measurementController = createdMeasurementController
+            runtimeStarted = true
+
+            createdWebServer.start()
+            createdRelay.start()
+            Log.i(TAG, "Service runtime started (engine + web server + overlay + relay)")
+        } catch (error: Throwable) {
+            measurementController = null
+            relay = null
+            webServer = null
+            overlay = null
+            engine = null
+            runtimeStarted = false
+            try { createdMeasurementController?.shutdown() } catch (_: Throwable) {}
+            try { createdRelay?.stop() } catch (_: Throwable) {}
+            try { createdWebServer?.stop() } catch (_: Throwable) {}
+            try { createdOverlay?.hide() } catch (_: Throwable) {}
+            try { createdEngine?.release() } catch (_: Throwable) {}
+            throw error
         }
-        Log.i(TAG, "Service started in foreground (engine + web server + overlay + relay)")
+    }
+
+    private fun startReason(intent: Intent?): SweetSpotStartReason = when {
+        intent == null -> SweetSpotStartReason.STICKY_RESTART
+        intent.getStringExtra(EXTRA_START_REASON) == SweetSpotStartReason.USER_LAUNCH.name ->
+            SweetSpotStartReason.USER_LAUNCH
+        intent.getStringExtra(EXTRA_START_REASON) == SweetSpotStartReason.BOOT_COMPLETED.name ->
+            SweetSpotStartReason.BOOT_COMPLETED
+        else -> SweetSpotStartReason.EXPLICIT_COMMAND
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val decision = SweetSpotStartupPolicy.decide(
+            enabled = profileStore.isEnabled(),
+            reason = startReason(intent),
+            requestedShowOverlay = intent?.getBooleanExtra(EXTRA_SHOW_UI, false) ?: false
+        )
+        if (!decision.shouldStart) {
+            Log.i(TAG, "Skipping automatic start because SweetSpot is disabled")
+            stopSelfResult(startId)
+            return START_STICKY
+        }
+
+        ensureRuntimeStarted()
         when (intent?.action) {
             ACTION_PRESET -> {
                 val preset = intent.getIntExtra(EXTRA_PRESET, 1)
-                engine?.applyPreset(preset)
+                applyPresetWithFeedback(preset)
             }
             ACTION_BYPASS -> engine?.setEnabled(false)
             ACTION_PROBE -> runProbe()
@@ -126,12 +202,16 @@ class SweetSpotService : Service(), ServiceActions {
                 runPersistentProbe(bands)
             }
             ACTION_PROBE_RELEASE -> releasePersistentProbe()
+            ACTION_CALIBRATION_UI_READY ->
+                measurementController?.activityReady(intent.getStringExtra(EXTRA_SESSION_ID).orEmpty())
+            ACTION_CALIBRATION_UI_CLOSED ->
+                measurementController?.activityClosed(intent.getStringExtra(EXTRA_SESSION_ID).orEmpty())
+            ACTION_CALIBRATION_CANCEL ->
+                measurementController?.cancelFromActivity(intent.getStringExtra(EXTRA_SESSION_ID).orEmpty())
             ACTION_START -> {
-                // Already initialized in onCreate; ensure still alive.
-                if (engine == null) engine = DynamicsProcessingEq(profileStore).also { it.initialize() }
-                val showUi = intent.getBooleanExtra(EXTRA_SHOW_UI, true)
-                if (showUi) overlay?.show() else overlay?.hide()
+                if (decision.showOverlay) overlay?.show() else overlay?.hide()
             }
+            null -> overlay?.hide()
             else -> Log.d(TAG, "onStartCommand: no/unknown action (intent=$intent)")
         }
         // Restart if the system kills the service.
@@ -163,6 +243,9 @@ class SweetSpotService : Service(), ServiceActions {
 
     override fun onDestroy() {
         Log.i(TAG, "Service onDestroy — hiding overlay, stopping web server, releasing engine, closing relay")
+        runtimeStarted = false
+        measurementController?.shutdown()
+        measurementController = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         relay?.stop()
         relay = null
@@ -175,6 +258,8 @@ class SweetSpotService : Service(), ServiceActions {
         // Release any long-lived probe instance still held.
         DynamicsProcessingProbe().releaseInstance(persistentDp)
         persistentDp = null
+        try { persistentVirtualizer?.release() } catch (_: Throwable) {}
+        persistentVirtualizer = null
         probeExecutor.shutdownNow()
         super.onDestroy()
     }
@@ -261,9 +346,9 @@ class SweetSpotService : Service(), ServiceActions {
                         engine?.setBandLevel(i, (arr.optDouble(i, Double.NaN) * 100).toInt())
                     }
                 }
-                "engine.applyPreset" -> engine?.applyPreset(payload.optInt("preset", -1))
+                "engine.applyPreset" -> applyPresetWithFeedback(payload.optInt("preset", -1))
                 "profile.save" -> payload.optString("name").takeIf { it.isNotBlank() }?.let { engine?.saveCurrentProfile(it) }
-                "profile.load" -> payload.optString("name").takeIf { it.isNotBlank() }?.let { engine?.loadProfile(it) }
+                "profile.load" -> payload.optString("name").takeIf { it.isNotBlank() }?.let { loadProfileWithFeedback(it) }
                 "profile.delete" -> payload.optString("name").takeIf { it.isNotBlank() }?.let { engine?.deleteProfile(it) }
                 "calibration.apply" -> {
                     val arr = payload.optJSONArray("bandsDb")
@@ -274,6 +359,55 @@ class SweetSpotService : Service(), ServiceActions {
                     return
                 }
                 "calibration.reset" -> resetCalibration()
+                "calibrationSession.begin" -> {
+                    measurementController?.begin(
+                        payload.optString("sessionId"),
+                        payload.optString("channel", "both"),
+                        null,
+                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
+                    )
+                    return
+                }
+                "calibrationSession.end" -> {
+                    measurementController?.end(
+                        payload.optString("sessionId"),
+                        null,
+                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
+                    )
+                    return
+                }
+                "calibrationSession.abort" -> {
+                    measurementController?.cancel(
+                        payload.optString("sessionId"),
+                        null,
+                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
+                    )
+                    return
+                }
+                "measurement.prepare" -> {
+                    measurementController?.prepare(
+                        payload.optString("sessionId"),
+                        null,
+                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
+                    )
+                    return
+                }
+                "measurement.playSweep" -> {
+                    measurementController?.playSweep(
+                        payload.optString("sessionId"),
+                        null,
+                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
+                    )
+                    return
+                }
+                "measurement.abort" -> {
+                    measurementController?.cancel(
+                        payload.optString("sessionId"),
+                        null,
+                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
+                    )
+                    return
+                }
                 "probe.run" -> {
                     val bands = payload.optInt("bands", 128)
                     suspendProduction()
@@ -297,6 +431,8 @@ class SweetSpotService : Service(), ServiceActions {
                 }
                 "probe.persistent.start" -> runPersistentProbe(payload.optInt("bands", 64))
                 "probe.persistent.release" -> releasePersistentProbe()
+                "virtualizer.on" -> setVirtualizer(true)
+                "virtualizer.off" -> setVirtualizer(false)
                 "probe.curve.apply" -> {
                     val curve = payload.optString("curve", "hollow")
                     applyPersistentCurve(curve)
@@ -312,6 +448,7 @@ class SweetSpotService : Service(), ServiceActions {
             }
             replyTo("state.snapshot", stateSnapshotJson())
         }
+
 
         private fun postProbeStatus(replyTo: (String, JSONObject) -> Unit) {
             val results = lastProbeResults.orEmpty()
@@ -499,6 +636,46 @@ class SweetSpotService : Service(), ServiceActions {
         engine?.initialize()
     }
 
+    private fun applyPresetWithFeedback(preset: Int) {
+        val engine = engine ?: return
+        val eqName = engine.getCapabilities().presets[preset] ?: return
+        engine.applyPreset(preset)
+        showEqAppliedToast(eqName)
+    }
+
+    private fun loadProfileWithFeedback(name: String) {
+        val engine = engine ?: return
+        if (name !in engine.listProfiles()) return
+        engine.loadProfile(name)
+        showEqAppliedToast(name)
+    }
+
+    private fun showEqAppliedToast(eqName: String) {
+        mainHandler.post {
+            Toast.makeText(this, "Sweetspot applied $eqName EQ.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * Creates (once) and enables or disables the persistent session-0
+     * Virtualizer at max strength. Called from the mailbox poll thread.
+     */
+    private fun setVirtualizer(on: Boolean) {
+        try {
+            val existing = persistentVirtualizer
+            val v = if (existing != null) existing else {
+                val created = Virtualizer(1000, 0)
+                if (created.strengthSupported) created.setStrength(1000)
+                persistentVirtualizer = created
+                created
+            }
+            v.enabled = on
+            Log.i(TAG, "Persistent Virtualizer $on (control=${v.hasControl()}, enabled=${v.enabled}, strength=${v.roundedStrength})")
+        } catch (e: Throwable) {
+            Log.e(TAG, "Virtualizer set($on) failed", e)
+        }
+    }
+
     /**
      * Canonical state snapshot for the hosted dashboard (protocol v1).
      * Mirrors shared/types/protocol.ts StateSnapshot in sweetspot-web.
@@ -559,6 +736,9 @@ class SweetSpotService : Service(), ServiceActions {
         ).apply {
             description = "Persistent audio tuning service"
             setShowBadge(false)
+            setSound(null, null)
+            enableVibration(false)
+            enableLights(false)
         }
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(channel)
@@ -569,6 +749,7 @@ class SweetSpotService : Service(), ServiceActions {
             .setContentTitle("SweetSpot")
             .setContentText("Audio tuning active")
             .setSmallIcon(R.drawable.ic_notification)
+            .setOnlyAlertOnce(true)
             .setOngoing(true)
             .build()
     }

@@ -8,6 +8,7 @@ import android.media.audiofx.Equalizer
 import android.media.audiofx.LoudnessEnhancer
 import android.media.audiofx.Virtualizer
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 
 /**
@@ -30,19 +31,27 @@ class AudioEffectDiagnostics {
         private const val SESSION_ID = 0
         private const val PRIORITY = 1000
 
-        private val KNOWN_TYPES: Map<String, String> = mapOf(
-            AudioEffect.EFFECT_TYPE_AEC.toString() to "AEC",
-            AudioEffect.EFFECT_TYPE_AGC.toString() to "AGC",
-            AudioEffect.EFFECT_TYPE_BASS_BOOST.toString() to "BassBoost",
-            AudioEffect.EFFECT_TYPE_DYNAMICS_PROCESSING.toString() to "DynamicsProcessing",
-            AudioEffect.EFFECT_TYPE_ENV_REVERB.toString() to "EnvironmentalReverb",
-            AudioEffect.EFFECT_TYPE_EQUALIZER.toString() to "Equalizer",
-            AudioEffect.EFFECT_TYPE_HAPTIC_GENERATOR.toString() to "HapticGenerator",
-            AudioEffect.EFFECT_TYPE_LOUDNESS_ENHANCER.toString() to "LoudnessEnhancer",
-            AudioEffect.EFFECT_TYPE_NS.toString() to "NoiseSuppressor",
-            AudioEffect.EFFECT_TYPE_PRESET_REVERB.toString() to "PresetReverb",
-            AudioEffect.EFFECT_TYPE_VIRTUALIZER.toString() to "Virtualizer"
-        )
+        // AOSP multichannel downmix effect type; present here as a vendor
+        // "Insert" implementation. The impl UUID is discovered at runtime.
+        private const val DOWNMIX_TYPE_UUID = "381e49cc-a858-4aa2-87f6-e8388e7601b2"
+
+        // Built per-access because EFFECT_TYPE_HAPTIC_GENERATOR exists only
+        // on API 31+; referencing it in a static init crashes older devices.
+        private fun knownTypes(): Map<String, String> = buildMap {
+            put(AudioEffect.EFFECT_TYPE_AEC.toString(), "AEC")
+            put(AudioEffect.EFFECT_TYPE_AGC.toString(), "AGC")
+            put(AudioEffect.EFFECT_TYPE_BASS_BOOST.toString(), "BassBoost")
+            put(AudioEffect.EFFECT_TYPE_DYNAMICS_PROCESSING.toString(), "DynamicsProcessing")
+            put(AudioEffect.EFFECT_TYPE_ENV_REVERB.toString(), "EnvironmentalReverb")
+            put(AudioEffect.EFFECT_TYPE_EQUALIZER.toString(), "Equalizer")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                put(AudioEffect.EFFECT_TYPE_HAPTIC_GENERATOR.toString(), "HapticGenerator")
+            }
+            put(AudioEffect.EFFECT_TYPE_LOUDNESS_ENHANCER.toString(), "LoudnessEnhancer")
+            put(AudioEffect.EFFECT_TYPE_NS.toString(), "NoiseSuppressor")
+            put(AudioEffect.EFFECT_TYPE_PRESET_REVERB.toString(), "PresetReverb")
+            put(AudioEffect.EFFECT_TYPE_VIRTUALIZER.toString(), "Virtualizer")
+        }
 
         /** Canonical JSON payload shared by the LAN API and the mailbox relay reply. */
         fun payloadJson(
@@ -104,13 +113,14 @@ class AudioEffectDiagnostics {
         }
         return entries.map { d ->
             val typeStr = d.type.toString()
+            val known = knownTypes()
             EffectInventoryEntry(
                 name = d.name,
-                typeName = KNOWN_TYPES[typeStr] ?: "Unknown($typeStr)",
+                typeName = known[typeStr] ?: "Unknown($typeStr)",
                 typeUuid = typeStr,
                 implUuid = d.uuid.toString(),
                 connectMode = d.connectMode,
-                isVendor = !KNOWN_TYPES.containsKey(typeStr)
+                isVendor = !known.containsKey(typeStr)
             )
         }.also { list ->
             Log.i(TAG, "=== Effect inventory (${list.size} entries) ===")
@@ -158,7 +168,14 @@ class AudioEffectDiagnostics {
                 } catch (_: Throwable) {
                     params += ",canVirtualizeStereo=error"
                 }
+                if (v.strengthSupported) v.setStrength(1000)
+                val enableResult = v.setEnabled(true)
+                SystemClock.sleep(2000)
+                params += ",strengthSet=${v.roundedStrength},enableResult=$enableResult," +
+                    "enabledAfter=${v.enabled}"
                 SessionProbe("Virtualizer", true, v.hasControl(), v.enabled, params)
+            } catch (e: Throwable) {
+                SessionProbe("Virtualizer", false, false, false, "", "${e.javaClass.simpleName}: ${e.message}")
             } finally {
                 try { v?.release() } catch (_: Throwable) {}
             }
@@ -181,8 +198,46 @@ class AudioEffectDiagnostics {
                 try { le?.release() } catch (_: Throwable) {}
             }
         },
-        dynamicsProcessingProbe()
+        dynamicsProcessingProbe(),
+        downmixProbe()
     )
+
+    /**
+     * Instantiates the platform downmix implementation on session 0 via the
+     * base AudioEffect constructor. Read-only: no parameter writes. The
+     * downmixer is the only cross-channel effect this device reports, so
+     * control of it decides whether any matrixing route exists here.
+     */
+    private fun downmixProbe(): SessionProbe {
+        var fx: AudioEffect? = null
+        return try {
+            val desc = AudioEffect.queryEffects().firstOrNull {
+                it.type.toString().equals(DOWNMIX_TYPE_UUID, ignoreCase = true)
+            } ?: return SessionProbe(
+                "Downmix", false, false, false, "",
+                "no implementation of type $DOWNMIX_TYPE_UUID in queryEffects()"
+            )
+            fx = AudioEffect::class.java
+                .getConstructor(
+                    java.util.UUID::class.java,
+                    java.util.UUID::class.java,
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType
+                )
+                .newInstance(desc.type, desc.uuid, PRIORITY, SESSION_ID)
+            val enableResult = fx.setEnabled(true)
+            SystemClock.sleep(2000)
+            SessionProbe(
+                "Downmix", true, fx.hasControl(), fx.enabled,
+                "impl=${desc.uuid},connectMode=${desc.connectMode},name=${desc.name}," +
+                    "enableResult=$enableResult,enabledAfter=${fx.enabled}"
+            )
+        } catch (e: Throwable) {
+            SessionProbe("Downmix", false, false, false, "", "${e.javaClass.simpleName}: ${e.message}")
+        } finally {
+            try { fx?.release() } catch (_: Throwable) {}
+        }
+    }
 
     private inline fun probe(effectType: String, block: () -> SessionProbe): SessionProbe =
         try {

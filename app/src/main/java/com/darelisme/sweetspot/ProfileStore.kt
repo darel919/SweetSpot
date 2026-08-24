@@ -19,8 +19,10 @@ class ProfileStore(context: Context) {
 
     // ---- last active (auto-restore) ----
 
+    fun isEnabled(): Boolean = prefs.getBoolean(KEY_ENABLED, DEFAULT_ENABLED)
+
     fun load(): SavedProfile {
-        val enabled = prefs.getBoolean(KEY_ENABLED, true)
+        val enabled = isEnabled()
         val preset = prefs.getInt(KEY_PRESET, 1)
         val levels = prefs.getString(KEY_LEVELS, null)
             ?.split(',')
@@ -30,12 +32,12 @@ class ProfileStore(context: Context) {
     }
 
     fun save(enabled: Boolean, preset: Int, levels: IntArray?) {
-        prefs.edit().apply {
+        val editor = prefs.edit().apply {
             putBoolean(KEY_ENABLED, enabled)
             putInt(KEY_PRESET, preset)
             putString(KEY_LEVELS, levels?.joinToString(","))
-            apply()
         }
+        if (isEnabled() != enabled) editor.commit() else editor.apply()
     }
 
     // ---- named profiles ----
@@ -99,6 +101,7 @@ class ProfileStore(context: Context) {
 
     companion object {
         private const val PREFS_NAME = "sweetspot"
+        private const val DEFAULT_ENABLED = true
         private const val KEY_ENABLED = "enabled"
         private const val KEY_PRESET = "preset"
         private const val KEY_LEVELS = "levels"

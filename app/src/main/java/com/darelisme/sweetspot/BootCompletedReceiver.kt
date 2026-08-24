@@ -13,13 +13,19 @@ class BootCompletedReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
         if (context == null) return
         if (intent?.action != Intent.ACTION_BOOT_COMPLETED) return
-        Log.i(TAG, "Boot completed — starting SweetSpotService (UI hidden)")
+        val appContext = context.applicationContext
+        if (!ProfileStore(appContext).isEnabled()) {
+            Log.i(TAG, "Boot completed — SweetSpot is disabled; leaving service stopped")
+            return
+        }
+        Log.i(TAG, "Boot completed — starting SweetSpotService silently")
         try {
-            val serviceIntent = Intent(context, SweetSpotService::class.java).apply {
+            val serviceIntent = Intent(appContext, SweetSpotService::class.java).apply {
                 action = SweetSpotService.ACTION_START
                 putExtra(SweetSpotService.EXTRA_SHOW_UI, false)
+                putExtra(EXTRA_START_REASON, SweetSpotStartReason.BOOT_COMPLETED.name)
             }
-            context.startForegroundService(serviceIntent)
+            appContext.startForegroundService(serviceIntent)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start service on boot", e)
         }

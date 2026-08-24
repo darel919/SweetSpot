@@ -57,6 +57,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     private var userGains = FloatArray(USER_BANDS)        // dB
     private var calibration = FloatArray(INTERNAL_BANDS)  // dB, read-only base
     private var calibrationActive = false
+    private var measurementBypassState: MeasurementAudioState? = null
 
     @Synchronized
     override fun initialize() {
@@ -77,6 +78,10 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
 
     @Synchronized
     override fun release() {
+        measurementBypassState?.let { state ->
+            measurementBypassState = null
+            restoreMeasurementState(state)
+        }
         try { dp?.release() } catch (_: Exception) {}
         dp = null
         Log.i(TAG, "Engine released")
@@ -84,6 +89,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
 
     @Synchronized
     override fun setEnabled(enabled: Boolean) {
+        if (measurementBypassState != null) return
         this.enabled = enabled
         dp?.enabled = enabled
         save()
@@ -97,6 +103,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
 
     @Synchronized
     override fun setBandLevel(index: Int, millibels: Int) {
+        if (measurementBypassState != null) return
         if (index < 0 || index >= USER_BANDS) return
         userGains[index] = millibels / 100f
         activePreset = 0
@@ -110,6 +117,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
 
     @Synchronized
     override fun applyPreset(preset: Int) {
+        if (measurementBypassState != null) return
         when (preset) {
             PRESET_FLAT -> userGains = FloatArray(USER_BANDS)
             PRESET_NIGHT -> {
@@ -139,6 +147,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
 
     @Synchronized
     override fun saveCurrentProfile(name: String) {
+        if (measurementBypassState != null) return
         val levels = IntArray(USER_BANDS) { (userGains[it] * 100).roundToInt() }
         profileStore.saveNamed(name, isEnabled(), activePreset, levels)
         save()
@@ -149,6 +158,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
 
     @Synchronized
     override fun loadProfile(name: String) {
+        if (measurementBypassState != null) return
         val p = profileStore.loadNamed(name) ?: return
         if (p.levels != null && p.levels.size == USER_BANDS) {
             for (i in p.levels.indices) userGains[i] = p.levels[i] / 100f
@@ -181,6 +191,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
 
     @Synchronized
     fun setCalibrationBands(gains: FloatArray): Boolean {
+        if (measurementBypassState != null) return false
         if (gains.size != INTERNAL_BANDS) return false
         for (i in 0 until INTERNAL_BANDS) calibration[i] = gains[i]
         calibrationActive = true
@@ -191,10 +202,43 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
 
     @Synchronized
     fun resetCalibration() {
+        if (measurementBypassState != null) return
         calibration = FloatArray(INTERNAL_BANDS)
         calibrationActive = false
         applyAll()
         profileStore.saveCalibration(calibration)
+    }
+
+    @Synchronized
+    override fun beginMeasurementBypass(): MeasurementAudioState {
+        val existing = measurementBypassState
+        if (existing != null) return existing.copy(
+            userBandLevelsMillibels = existing.userBandLevelsMillibels.copyOf(),
+            calibrationGainsDb = existing.calibrationGainsDb.copyOf()
+        )
+
+        val state = MeasurementAudioState(
+            enabled = enabled,
+            activePreset = activePreset,
+            userBandLevelsMillibels = getBandLevels(),
+            calibrationGainsDb = calibration.copyOf(),
+            calibrationActive = calibrationActive
+        )
+        measurementBypassState = state
+        enabled = true
+        dp?.enabled = true
+        applyAll()
+        return state.copy(
+            userBandLevelsMillibels = state.userBandLevelsMillibels.copyOf(),
+            calibrationGainsDb = state.calibrationGainsDb.copyOf()
+        )
+    }
+
+    @Synchronized
+    override fun endMeasurementBypass(state: MeasurementAudioState) {
+        val active = measurementBypassState ?: return
+        measurementBypassState = null
+        restoreMeasurementState(active)
     }
 
     // --- internals ---
@@ -205,12 +249,30 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         val nCh = d.channelCount
         for (ch in 0 until nCh) {
             for (i in 0 until INTERNAL_BANDS) {
-                val eff = calibration[i] + userGains[userBandForInternal[i]]
+                val eff = if (measurementBypassState != null) {
+                    0f
+                } else {
+                    calibration[i] + userGains[userBandForInternal[i]]
+                }
                 val band = d.getPreEqBandByChannelIndex(ch, i)
                 band.setGain(eff)
                 d.setPreEqBandByChannelIndex(ch, i, band)
             }
         }
+    }
+
+    private fun restoreMeasurementState(state: MeasurementAudioState) {
+        if (state.userBandLevelsMillibels.size == USER_BANDS) {
+            userGains = FloatArray(USER_BANDS) { i -> state.userBandLevelsMillibels[i] / 100f }
+        }
+        if (state.calibrationGainsDb.size == INTERNAL_BANDS) {
+            calibration = state.calibrationGainsDb.copyOf()
+        }
+        activePreset = state.activePreset
+        calibrationActive = state.calibrationActive
+        enabled = state.enabled
+        applyAll()
+        dp?.enabled = state.enabled
     }
 
     private fun restore() {

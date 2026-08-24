@@ -39,6 +39,7 @@ class SweetSpotCommandReceiver : BroadcastReceiver() {
 
         val serviceIntent = Intent(context, SweetSpotService::class.java).apply {
             this.action = action
+            putExtra(EXTRA_START_REASON, SweetSpotStartReason.EXPLICIT_COMMAND.name)
             if (intent.hasExtra(SweetSpotService.EXTRA_PRESET)) {
                 putExtra(
                     SweetSpotService.EXTRA_PRESET,

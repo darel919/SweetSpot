@@ -73,7 +73,8 @@ class WebServer(
     private val engine: AudioEngine,
     private val overlay: OverlayController? = null,
     private val serviceActions: ServiceActions? = null,
-    private val port: Int = Config.WEB_PORT
+    private val port: Int = Config.WEB_PORT,
+    private val eqAppliedNotifier: ((String) -> Unit)? = null
 ) {
     /** Providers wired by [SweetSpotService]; nullable for legacy construction. */
     var pairCodeProvider: (() -> String)? = null
@@ -196,7 +197,9 @@ class WebServer(
 
             method == "POST" && path == "/api/preset" -> {
                 val preset = parseIntField(body, "preset") ?: 1
+                val eqName = engine.getCapabilities().presets[preset]
                 engine.applyPreset(preset)
+                eqName?.let { eqAppliedNotifier?.invoke(it) }
                 sendJson(client, stateJson())
             }
 
@@ -208,7 +211,10 @@ class WebServer(
 
             method == "POST" && path == "/api/loadprofile" -> {
                 val name = parseStringField(body, "name")
-                if (!name.isNullOrBlank()) engine.loadProfile(name)
+                if (!name.isNullOrBlank() && name in engine.listProfiles()) {
+                    engine.loadProfile(name)
+                    eqAppliedNotifier?.invoke(name)
+                }
                 sendJson(client, stateJson())
             }
 

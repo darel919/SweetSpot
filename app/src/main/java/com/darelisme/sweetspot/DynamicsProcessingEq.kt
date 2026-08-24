@@ -24,15 +24,34 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     companion object {
         const val INTERNAL_BANDS = 64
         const val USER_BANDS = 24
+        const val MAX_CALIBRATION_GAIN_DB = 12f
         private const val SESSION_ID = 0
         private const val PRIORITY = 1000
         const val F_MIN = 20
         const val F_MAX = 20000
         private const val TAG = "DynamicsProcessingEq"
+        private const val HEADROOM_PROBE_GAIN_DB = -3f
+        private const val INPUT_GAIN_MIN_DB = -60f
+        private const val DSP_READBACK_TOLERANCE_DB = 0.25f
         private const val PRESET_FLAT = 1
         private const val PRESET_NIGHT = 2
         private const val NIGHT_CUT_DB = -6f
         private const val NIGHT_CUT_BANDS = 3
+
+        fun isValidCalibrationArray(gains: FloatArray): Boolean =
+            gains.size == INTERNAL_BANDS && gains.all { isValidCalibrationGain(it) }
+
+        fun isValidCalibrationGain(gain: Float): Boolean =
+            gain.isFinite() && gain >= -MAX_CALIBRATION_GAIN_DB && gain <= MAX_CALIBRATION_GAIN_DB
+
+        fun effectiveCalibrationGain(
+            calibrationGainDb: Float,
+            userGainDb: Float,
+            headroomVerified: Boolean,
+        ): Float {
+            val requested = calibrationGainDb + userGainDb
+            return if (headroomVerified) requested else min(0f, requested)
+        }
     }
 
     /** Upper cutoff of each real DynamicsProcessing band, not a PEQ center. */
@@ -63,10 +82,23 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     private var calibration = FloatArray(INTERNAL_BANDS)  // dB, read-only base
     private var calibrationLeft: FloatArray? = null
     private var calibrationRight: FloatArray? = null
+    private var effectiveCalibration = FloatArray(INTERNAL_BANDS)
+    private var effectiveCalibrationLeft: FloatArray? = null
+    private var effectiveCalibrationRight: FloatArray? = null
     private var calibrationActive = false
     private var inputGainDb = 0f
     private var headroomVerified = false
+    private var lastCalibrationApplySucceeded = true
+    private var lastCalibrationApplyError: String? = null
     private var measurementBypassState: MeasurementAudioState? = null
+    private var calibrationValidationState: MeasurementAudioState? = null
+
+    private data class RequestedCalibrationState(
+        val common: FloatArray,
+        val left: FloatArray?,
+        val right: FloatArray?,
+        val active: Boolean,
+    )
 
     @Synchronized
     override fun initialize() {
@@ -81,24 +113,34 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         d.enabled = true
         dp = d
         restore()
-        applyAll()
+        headroomVerified = verifyHeadroomSupport(d)
+        applyAll(trackCalibrationStatus = true)
         Log.i(TAG, "Engine initialized: internalBands=$INTERNAL_BANDS userBands=$USER_BANDS channels=${d.channelCount}")
     }
 
     @Synchronized
     override fun release() {
+        calibrationValidationState?.let { state ->
+            calibrationValidationState = null
+            restoreMeasurementState(state)
+        }
         measurementBypassState?.let { state ->
             measurementBypassState = null
             restoreMeasurementState(state)
         }
         try { dp?.release() } catch (_: Exception) {}
         dp = null
+        headroomVerified = false
+        inputGainDb = 0f
+        effectiveCalibration = FloatArray(INTERNAL_BANDS)
+        effectiveCalibrationLeft = null
+        effectiveCalibrationRight = null
         Log.i(TAG, "Engine released")
     }
 
     @Synchronized
     override fun setEnabled(enabled: Boolean) {
-        if (measurementBypassState != null) return
+        if (isAudioStateOverrideActive()) return
         this.enabled = enabled
         dp?.enabled = enabled
         save()
@@ -112,7 +154,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
 
     @Synchronized
     override fun setBandLevel(index: Int, millibels: Int) {
-        if (measurementBypassState != null) return
+        if (isAudioStateOverrideActive()) return
         if (index < 0 || index >= USER_BANDS) return
         userGains[index] = millibels / 100f
         activePreset = 0
@@ -126,7 +168,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
 
     @Synchronized
     override fun applyPreset(preset: Int) {
-        if (measurementBypassState != null) return
+        if (isAudioStateOverrideActive()) return
         when (preset) {
             PRESET_FLAT -> userGains = FloatArray(USER_BANDS)
             PRESET_NIGHT -> {
@@ -189,7 +231,13 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     // --- Calibration (read-only base curve; wizard/API only) ---
 
     @Synchronized
-    fun getCalibrationBands(): FloatArray = calibration.copyOf()
+    fun getCalibrationBands(): FloatArray = getEffectiveCalibrationBands()
+
+    @Synchronized
+    fun getRequestedCalibrationBands(): FloatArray = calibration.copyOf()
+
+    @Synchronized
+    fun getEffectiveCalibrationBands(): FloatArray = effectiveCalibration.copyOf()
 
     @Synchronized
     fun getCalibrationFrequenciesHz(): IntArray =
@@ -197,10 +245,20 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
 
     @Synchronized
     fun getCalibrationBandsForChannel(channel: Int): FloatArray? = when (channel) {
+        0 -> effectiveCalibrationLeft?.copyOf()
+        1 -> effectiveCalibrationRight?.copyOf()
+        else -> null
+    }
+
+    @Synchronized
+    fun getRequestedCalibrationBandsForChannel(channel: Int): FloatArray? = when (channel) {
         0 -> calibrationLeft?.copyOf()
         1 -> calibrationRight?.copyOf()
         else -> null
     }
+
+    @Synchronized
+    fun getEffectiveCalibrationBandsForChannel(channel: Int): FloatArray? = getCalibrationBandsForChannel(channel)
 
     @Synchronized
     fun supportsIndependentCalibration(): Boolean = (dp?.channelCount ?: 0) >= 2
@@ -218,48 +276,78 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     fun isCalibrationActive(): Boolean = calibrationActive
 
     @Synchronized
+    fun wasLastCalibrationApplySuccessful(): Boolean = lastCalibrationApplySucceeded
+
+    @Synchronized
+    fun getLastCalibrationApplyError(): String? = lastCalibrationApplyError
+
+    @Synchronized
     fun setCalibrationBands(gains: FloatArray): Boolean {
-        if (measurementBypassState != null) return false
-        if (gains.size != INTERNAL_BANDS) return false
-        if (gains.any { !it.isFinite() }) return false
-        for (i in 0 until INTERNAL_BANDS) calibration[i] = gains[i]
+        if (isAudioStateOverrideActive()) return false
+        if (!isValidCalibrationArray(gains)) {
+            recordCalibrationFailure("Calibration must contain $INTERNAL_BANDS finite gains within ±${MAX_CALIBRATION_GAIN_DB} dB")
+            return false
+        }
+        if (!headroomVerified && gains.any { it > 0f }) {
+            recordCalibrationFailure("Positive calibration gains require verified input headroom")
+            return false
+        }
+        val previous = requestedCalibrationState()
+        calibration = gains.copyOf()
         calibrationLeft = null
         calibrationRight = null
         calibrationActive = true
-        applyAll()
+        if (!applyAll(trackCalibrationStatus = true)) {
+            return rollbackCalibration(previous)
+        }
         profileStore.saveCalibration(calibration)
         return true
     }
 
     @Synchronized
     fun setCalibrationBandsByChannel(left: FloatArray, right: FloatArray): Boolean {
-        if (measurementBypassState != null) return false
+        if (isAudioStateOverrideActive()) return false
         if (!supportsIndependentCalibration()) return false
-        if (left.size != INTERNAL_BANDS || right.size != INTERNAL_BANDS) return false
-        if (left.any { !it.isFinite() } || right.any { !it.isFinite() }) return false
-        calibrationLeft = left.copyOf()
-        calibrationRight = right.copyOf()
-        calibration = FloatArray(INTERNAL_BANDS) { (left[it] + right[it]) / 2f }
+        if (!isValidCalibrationArray(left) || !isValidCalibrationArray(right)) {
+            recordCalibrationFailure("Each channel must contain $INTERNAL_BANDS finite gains within ±${MAX_CALIBRATION_GAIN_DB} dB")
+            return false
+        }
+        if (!headroomVerified && (left.any { it > 0f } || right.any { it > 0f })) {
+            recordCalibrationFailure("Positive calibration gains require verified input headroom")
+            return false
+        }
+        val previous = requestedCalibrationState()
+        val leftCopy = left.copyOf()
+        val rightCopy = right.copyOf()
+        calibrationLeft = leftCopy
+        calibrationRight = rightCopy
+        calibration = FloatArray(INTERNAL_BANDS) { (leftCopy[it] + rightCopy[it]) / 2f }
         calibrationActive = true
-        applyAll()
-        profileStore.saveCalibrationChannels(left, right)
+        if (!applyAll(trackCalibrationStatus = true)) {
+            return rollbackCalibration(previous)
+        }
+        profileStore.saveCalibrationChannels(leftCopy, rightCopy)
         return true
     }
 
     @Synchronized
     fun resetCalibration() {
-        if (measurementBypassState != null) return
+        if (isAudioStateOverrideActive()) return
         calibration = FloatArray(INTERNAL_BANDS)
         calibrationLeft = null
         calibrationRight = null
         calibrationActive = false
-        applyAll()
-        profileStore.saveCalibration(calibration)
+        if (!applyAll(trackCalibrationStatus = true)) {
+            Log.w(TAG, "Calibration reset could not be fully verified")
+        }
+        if (!profileStore.clearCalibration()) {
+            Log.w(TAG, "Calibration reset could not clear persisted calibration")
+        }
     }
 
     @Synchronized
     override fun beginMeasurementBypass(): MeasurementAudioState {
-        val existing = measurementBypassState
+        val existing = measurementBypassState ?: calibrationValidationState
         if (existing != null) return existing.copy(
             userBandLevelsMillibels = existing.userBandLevelsMillibels.copyOf(),
             calibrationGainsDb = existing.calibrationGainsDb.copyOf(),
@@ -289,45 +377,115 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     }
 
     @Synchronized
-    override fun endMeasurementBypass(state: MeasurementAudioState) {
-        val active = measurementBypassState ?: return
+    override fun endMeasurementBypass(state: MeasurementAudioState): Boolean {
+        val active = measurementBypassState ?: return false
         measurementBypassState = null
-        restoreMeasurementState(active)
+        return restoreMeasurementState(active)
+    }
+
+    @Synchronized
+    override fun beginCalibrationValidation(): MeasurementAudioState {
+        val existing = calibrationValidationState ?: measurementBypassState
+        if (existing != null) return existing.copy(
+            userBandLevelsMillibels = existing.userBandLevelsMillibels.copyOf(),
+            calibrationGainsDb = existing.calibrationGainsDb.copyOf(),
+            calibrationLeftGainsDb = existing.calibrationLeftGainsDb?.copyOf(),
+            calibrationRightGainsDb = existing.calibrationRightGainsDb?.copyOf(),
+        )
+
+        val state = MeasurementAudioState(
+            enabled = enabled,
+            activePreset = activePreset,
+            userBandLevelsMillibels = getBandLevels(),
+            calibrationGainsDb = calibration.copyOf(),
+            calibrationActive = calibrationActive,
+            calibrationLeftGainsDb = calibrationLeft?.copyOf(),
+            calibrationRightGainsDb = calibrationRight?.copyOf(),
+            inputGainDb = inputGainDb,
+            headroomVerified = headroomVerified,
+        )
+        calibrationValidationState = state
+        enabled = true
+        dp?.enabled = true
+        applyAll()
+        return state.copy(
+            userBandLevelsMillibels = state.userBandLevelsMillibels.copyOf(),
+            calibrationGainsDb = state.calibrationGainsDb.copyOf(),
+            calibrationLeftGainsDb = state.calibrationLeftGainsDb?.copyOf(),
+            calibrationRightGainsDb = state.calibrationRightGainsDb?.copyOf(),
+        )
+    }
+
+    @Synchronized
+    override fun endCalibrationValidation(state: MeasurementAudioState): Boolean {
+        val active = calibrationValidationState ?: return false
+        calibrationValidationState = null
+        return restoreMeasurementState(active)
     }
 
     // --- internals ---
 
     @Synchronized
-    private fun applyAll() {
-        val d = dp ?: return
+    private fun applyAll(trackCalibrationStatus: Boolean = false): Boolean {
+        val d = dp ?: return recordApplyFailure(trackCalibrationStatus, "DynamicsProcessing is not initialized")
         val nCh = d.channelCount
-        if (measurementBypassState != null) {
-            setInputGain(d, 0f)
-        } else {
-            setInputGain(d, requiredInputGainDb())
+        val requestedInputGain = if (measurementBypassState != null) 0f else requiredInputGainDb()
+        if (!setInputGain(d, requestedInputGain)) {
+            return recordApplyFailure(trackCalibrationStatus, "Input gain readback did not match the requested value")
         }
-        for (ch in 0 until nCh) {
-            val channelCalibration = when (ch) {
-                0 -> calibrationLeft ?: calibration
-                1 -> calibrationRight ?: calibration
-                else -> calibration
-            }
-            for (i in 0 until INTERNAL_BANDS) {
-                val eff = if (measurementBypassState != null) {
-                    0f
-                } else {
-                    val requested = channelCalibration[i] + userGains[userBandForInternal[i]]
-                    if (headroomVerified) requested else min(0f, requested)
+
+        return try {
+            val appliedCalibrationByChannel = Array(nCh) { FloatArray(INTERNAL_BANDS) }
+            for (ch in 0 until nCh) {
+                val channelCalibration = when (ch) {
+                    0 -> calibrationLeft ?: calibration
+                    1 -> calibrationRight ?: calibration
+                    else -> calibration
                 }
-                val band = d.getPreEqBandByChannelIndex(ch, i)
-                band.setGain(eff)
-                d.setPreEqBandByChannelIndex(ch, i, band)
+                for (i in 0 until INTERNAL_BANDS) {
+                    val userGain = userGains[userBandForInternal[i]]
+                    val effectiveGain = when {
+                        measurementBypassState != null -> 0f
+                        calibrationValidationState != null -> effectiveCalibrationGain(channelCalibration[i], 0f, headroomVerified)
+                        else -> effectiveCalibrationGain(channelCalibration[i], userGain, headroomVerified)
+                    }
+                    val band = d.getPreEqBandByChannelIndex(ch, i)
+                    band.setGain(effectiveGain)
+                    d.setPreEqBandByChannelIndex(ch, i, band)
+                    val actualGain = d.getPreEqBandByChannelIndex(ch, i).gain
+                    if (!actualGain.isFinite() || abs(actualGain - effectiveGain) > DSP_READBACK_TOLERANCE_DB) {
+                        throw IllegalStateException(
+                            "Pre-EQ band readback mismatch at channel $ch band $i: " +
+                                "requested=$effectiveGain actual=$actualGain"
+                        )
+                    }
+                    appliedCalibrationByChannel[ch][i] = if (measurementBypassState != null) {
+                        0f
+                    } else {
+                        actualGain - if (calibrationValidationState != null) 0f else userGain
+                    }
+                }
             }
+            updateEffectiveCalibration(appliedCalibrationByChannel)
+            if (trackCalibrationStatus) {
+                lastCalibrationApplySucceeded = true
+                lastCalibrationApplyError = null
+            }
+            true
+        } catch (error: Throwable) {
+            if (trackCalibrationStatus) {
+                lastCalibrationApplySucceeded = false
+                lastCalibrationApplyError = error.message ?: error.javaClass.simpleName
+            }
+            captureEffectiveCalibration(d)
+            Log.w(TAG, "DynamicsProcessing calibration application failed", error)
+            false
         }
     }
 
     @Synchronized
     private fun requiredInputGainDb(): Float {
+        if (!headroomVerified) return 0f
         var maximum = 0f
         val channelCount = dp?.channelCount ?: 0
         for (ch in 0 until maxOf(1, channelCount)) {
@@ -337,30 +495,140 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
                 else -> calibration
             }
             for (i in 0 until INTERNAL_BANDS) {
-                maximum = max(maximum, channelCalibration[i] + userGains[userBandForInternal[i]])
+                val userGain = if (calibrationValidationState == null) userGains[userBandForInternal[i]] else 0f
+                maximum = max(maximum, channelCalibration[i] + userGain)
             }
         }
         return if (maximum > 0f) -(maximum + 0.5f) else 0f
     }
 
-    private fun setInputGain(d: DynamicsProcessing, requestedDb: Float) {
-        val bounded = requestedDb.coerceIn(-60f, 0f)
+    private fun setInputGain(d: DynamicsProcessing, requestedDb: Float): Boolean {
+        val bounded = requestedDb.coerceIn(INPUT_GAIN_MIN_DB, 0f)
         try {
             d.setInputGainAllChannelsTo(bounded)
-            val count = d.channelCount
-            val verified = count > 0 && (0 until count).all { channel ->
-                abs(d.getInputGainByChannelIndex(channel) - bounded) <= 0.25f
+            val actual = readInputGains(d)
+            val verified = actual != null && actual.all { gain ->
+                abs(gain - bounded) <= DSP_READBACK_TOLERANCE_DB
             }
-            inputGainDb = if (verified) bounded else 0f
-            headroomVerified = verified
+            inputGainDb = actual?.firstOrNull() ?: 0f
+            return verified
         } catch (error: Throwable) {
             inputGainDb = 0f
-            headroomVerified = false
-            Log.w(TAG, "Input headroom gain is not controllable on this device", error)
+            Log.w(TAG, "Input gain application failed", error)
+            return false
         }
     }
 
-    private fun restoreMeasurementState(state: MeasurementAudioState) {
+    private fun verifyHeadroomSupport(d: DynamicsProcessing): Boolean {
+        val negativeVerified = try {
+            d.setInputGainAllChannelsTo(HEADROOM_PROBE_GAIN_DB)
+            readInputGains(d)?.all { gain ->
+                abs(gain - HEADROOM_PROBE_GAIN_DB) <= DSP_READBACK_TOLERANCE_DB
+            } == true
+        } catch (error: Throwable) {
+            Log.w(TAG, "Negative input-gain headroom probe failed", error)
+            false
+        }
+        val restored = try {
+            d.setInputGainAllChannelsTo(0f)
+            readInputGains(d)?.all { gain -> abs(gain) <= DSP_READBACK_TOLERANCE_DB } == true
+        } catch (error: Throwable) {
+            Log.w(TAG, "Input-gain headroom probe could not restore 0 dB", error)
+            false
+        }
+        inputGainDb = 0f
+        return negativeVerified && restored
+    }
+
+    private fun readInputGains(d: DynamicsProcessing): FloatArray? = try {
+        if (d.channelCount <= 0) {
+            null
+        } else {
+            FloatArray(d.channelCount) { channel ->
+                d.getInputGainByChannelIndex(channel).also { gain ->
+                    if (!gain.isFinite()) throw IllegalStateException("Non-finite input-gain readback")
+                }
+            }
+        }
+    } catch (_: Throwable) {
+        null
+    }
+
+    private fun updateEffectiveCalibration(appliedByChannel: Array<FloatArray>) {
+        if (measurementBypassState != null || appliedByChannel.isEmpty()) {
+            effectiveCalibration = FloatArray(INTERNAL_BANDS)
+            effectiveCalibrationLeft = null
+            effectiveCalibrationRight = null
+            return
+        }
+        effectiveCalibration = FloatArray(INTERNAL_BANDS) { band ->
+            appliedByChannel.map { it[band] }.average().toFloat()
+        }
+        if (calibrationLeft != null && calibrationRight != null && appliedByChannel.size >= 2) {
+            effectiveCalibrationLeft = appliedByChannel[0].copyOf()
+            effectiveCalibrationRight = appliedByChannel[1].copyOf()
+        } else {
+            effectiveCalibrationLeft = null
+            effectiveCalibrationRight = null
+        }
+    }
+
+    private fun captureEffectiveCalibration(d: DynamicsProcessing) {
+        if (measurementBypassState != null || calibrationValidationState != null) return
+        try {
+            val actualByChannel = Array(d.channelCount) { channel ->
+                FloatArray(INTERNAL_BANDS) { band ->
+                    val actualGain = d.getPreEqBandByChannelIndex(channel, band).gain
+                    if (!actualGain.isFinite()) throw IllegalStateException("Non-finite pre-EQ readback")
+                    actualGain - userGains[userBandForInternal[band]]
+                }
+            }
+            updateEffectiveCalibration(actualByChannel)
+        } catch (error: Throwable) {
+            Log.w(TAG, "Could not capture effective calibration after DSP failure", error)
+        }
+    }
+
+    private fun requestedCalibrationState() = RequestedCalibrationState(
+        common = calibration.copyOf(),
+        left = calibrationLeft?.copyOf(),
+        right = calibrationRight?.copyOf(),
+        active = calibrationActive,
+    )
+
+    private fun rollbackCalibration(previous: RequestedCalibrationState): Boolean {
+        val failure = lastCalibrationApplyError ?: "Calibration application failed"
+        calibration = previous.common.copyOf()
+        calibrationLeft = previous.left?.copyOf()
+        calibrationRight = previous.right?.copyOf()
+        calibrationActive = previous.active
+        val restored = applyAll(trackCalibrationStatus = true)
+        lastCalibrationApplySucceeded = false
+        lastCalibrationApplyError = if (restored) {
+            failure
+        } else {
+            "$failure; rollback could not be verified"
+        }
+        return false
+    }
+
+    private fun recordCalibrationFailure(message: String): Boolean {
+        lastCalibrationApplySucceeded = false
+        lastCalibrationApplyError = message
+        Log.w(TAG, message)
+        return false
+    }
+
+    private fun recordApplyFailure(trackCalibrationStatus: Boolean, message: String): Boolean {
+        if (trackCalibrationStatus) {
+            lastCalibrationApplySucceeded = false
+            lastCalibrationApplyError = message
+        }
+        Log.w(TAG, message)
+        return false
+    }
+
+    private fun restoreMeasurementState(state: MeasurementAudioState): Boolean {
         if (state.userBandLevelsMillibels.size == USER_BANDS) {
             userGains = FloatArray(USER_BANDS) { i -> state.userBandLevelsMillibels[i] / 100f }
         }
@@ -372,12 +640,9 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         activePreset = state.activePreset
         calibrationActive = state.calibrationActive
         enabled = state.enabled
-        applyAll()
-        // The input gain is derived from the restored layers. Keep the saved
-        // diagnostic value as well so a bypass round-trip is exact.
-        inputGainDb = state.inputGainDb
-        headroomVerified = state.headroomVerified
+        val restored = applyAll()
         dp?.enabled = state.enabled
+        return restored
     }
 
     private fun restore() {
@@ -386,20 +651,38 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
             for (i in saved.levels.indices) userGains[i] = saved.levels[i] / 100f
             activePreset = 0
         } else {
-            applyPreset(saved.preset)
+            when (saved.preset) {
+                PRESET_FLAT -> {
+                    userGains = FloatArray(USER_BANDS)
+                    activePreset = PRESET_FLAT
+                }
+                PRESET_NIGHT -> {
+                    userGains = FloatArray(USER_BANDS)
+                    for (i in 0 until minOf(NIGHT_CUT_BANDS, USER_BANDS)) userGains[i] = NIGHT_CUT_DB
+                    activePreset = PRESET_NIGHT
+                }
+                else -> {
+                    userGains = FloatArray(USER_BANDS)
+                    activePreset = PRESET_FLAT
+                }
+            }
         }
         enabled = saved.enabled
         dp?.enabled = saved.enabled
         val cal = profileStore.loadCalibration()
         val channels = profileStore.loadCalibrationChannels()
-        if (channels != null && channels.first.size == INTERNAL_BANDS && channels.second.size == INTERNAL_BANDS) {
+        if (channels != null && isValidCalibrationArray(channels.first) && isValidCalibrationArray(channels.second)) {
             calibrationLeft = channels.first.copyOf()
             calibrationRight = channels.second.copyOf()
             calibration = FloatArray(INTERNAL_BANDS) { (channels.first[it] + channels.second[it]) / 2f }
             calibrationActive = true
-        } else if (cal != null && cal.size == INTERNAL_BANDS) {
+        } else if (channels != null) {
+            profileStore.clearCalibration()
+        } else if (cal != null && isValidCalibrationArray(cal)) {
             for (i in 0 until INTERNAL_BANDS) calibration[i] = cal[i]
             calibrationActive = true
+        } else if (cal != null) {
+            profileStore.clearCalibration()
         }
     }
 
@@ -407,4 +690,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         val levels = IntArray(USER_BANDS) { (userGains[it] * 100).roundToInt() }
         profileStore.save(isEnabled(), activePreset, levels)
     }
+
+    private fun isAudioStateOverrideActive(): Boolean =
+        measurementBypassState != null || calibrationValidationState != null
 }

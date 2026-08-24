@@ -85,13 +85,7 @@ class ProfileStore(context: Context) {
 
     // ---- calibration (64-band read-only base curve) ----
 
-    fun loadCalibration(): FloatArray? {
-        val s = prefs.getString(KEY_CALIBRATION, null)
-            ?.split(',')
-            ?.mapNotNull { it.toFloatOrNull() }
-            ?.toFloatArray()
-        return if (s != null && s.size == 64) s else null
-    }
+    fun loadCalibration(): FloatArray? = loadCalibrationArray(KEY_CALIBRATION)
 
     fun saveCalibration(gains: FloatArray) {
         prefs.edit()
@@ -115,12 +109,18 @@ class ProfileStore(context: Context) {
             .apply()
     }
 
+    fun clearCalibration(): Boolean = prefs.edit()
+            .remove(KEY_CALIBRATION)
+            .remove(KEY_CALIBRATION_LEFT)
+            .remove(KEY_CALIBRATION_RIGHT)
+            .commit()
+
     private fun loadCalibrationArray(key: String): FloatArray? {
         val values = prefs.getString(key, null)
             ?.split(',')
-            ?.mapNotNull { it.toFloatOrNull() }
+            ?.map { it.toFloatOrNull() ?: return null }
             ?.toFloatArray()
-        return if (values != null && values.size == 64) values else null
+        return if (values != null && values.size == 64 && values.all { it.isFinite() }) values else null
     }
 
     private fun profileKey(name: String) = "p_$name"

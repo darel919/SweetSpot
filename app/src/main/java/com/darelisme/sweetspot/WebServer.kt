@@ -65,8 +65,14 @@ interface ServiceActions {
 
     // Calibration (64-band read-only base curve; wizard/API only).
     fun getCalibrationBands(): FloatArray?
+    fun getRequestedCalibrationBands(): FloatArray?
+    fun getEffectiveCalibrationBands(): FloatArray?
+    fun getRequestedCalibrationBandsForChannel(channel: Int): FloatArray?
+    fun getEffectiveCalibrationBandsForChannel(channel: Int): FloatArray?
     fun getCalibrationFrequenciesHz(): IntArray?
     fun isCalibrationActive(): Boolean
+    fun wasLastCalibrationApplySuccessful(): Boolean
+    fun getLastCalibrationApplyError(): String?
     fun setCalibrationBands(gains: FloatArray): Boolean
     fun resetCalibration(): Boolean
 }
@@ -597,13 +603,19 @@ class WebServer(
 
     private fun calibrationJson(): String {
         val bands = serviceActions?.getCalibrationBands()
+        val requestedBands = serviceActions?.getRequestedCalibrationBands()
+        val effectiveBands = serviceActions?.getEffectiveCalibrationBands()
         val freqs = serviceActions?.getCalibrationFrequenciesHz()
         val active = serviceActions?.isCalibrationActive() ?: false
         return if (bands != null && freqs != null) {
             JSONObject().apply {
                 put("active", active)
                 put("bands", JSONArray().apply { bands.forEach { put(it) } })
+                put("requestedBands", JSONArray().apply { (requestedBands ?: bands).forEach { put(it) } })
+                put("effectiveBands", JSONArray().apply { (effectiveBands ?: bands).forEach { put(it) } })
                 put("frequenciesHz", JSONArray().apply { freqs.forEach { put(it) } })
+                put("applicationVerified", serviceActions?.wasLastCalibrationApplySuccessful() ?: false)
+                serviceActions?.getLastCalibrationApplyError()?.let { put("applicationError", it) }
             }.toString()
         } else """{"active":false,"bands":[],"frequenciesHz":[]}"""
     }

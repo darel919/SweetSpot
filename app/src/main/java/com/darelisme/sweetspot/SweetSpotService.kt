@@ -22,6 +22,19 @@ import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
+internal fun parseStrictCalibrationArray(value: JSONArray?): FloatArray? {
+    if (value == null || value.length() != DynamicsProcessingEq.INTERNAL_BANDS) return null
+    return try {
+        FloatArray(DynamicsProcessingEq.INTERNAL_BANDS) { index ->
+            val parsed = value.getDouble(index)
+            require(parsed.isFinite())
+            parsed.toFloat().also { require(it.isFinite()) }
+        }
+    } catch (_: Throwable) {
+        null
+    }
+}
+
 /**
  * Long-lived owner of the audio DSP objects and the control web server.
  *
@@ -355,14 +368,14 @@ class SweetSpotService : Service(), ServiceActions {
                     val arr = payload.optJSONArray("bandsDb")
                     val leftArr = payload.optJSONArray("leftBandsDb")
                     val rightArr = payload.optJSONArray("rightBandsDb")
-                    val ok = if (leftArr != null && rightArr != null) {
-                        setCalibrationBandsByChannel(
-                            FloatArray(leftArr.length()) { leftArr.optDouble(it, 0.0).toFloat() },
-                            FloatArray(rightArr.length()) { rightArr.optDouble(it, 0.0).toFloat() }
-                        )
-                    } else if (arr != null) {
-                        setCalibrationBands(FloatArray(arr.length()) { arr.optDouble(it, 0.0).toFloat() })
-                    } else false
+                    val left = parseStrictCalibrationArray(leftArr)
+                    val right = parseStrictCalibrationArray(rightArr)
+                    val common = parseStrictCalibrationArray(arr)
+                    val ok = if (leftArr != null || rightArr != null) {
+                        left != null && right != null && setCalibrationBandsByChannel(left, right)
+                    } else {
+                        common != null && setCalibrationBands(common)
+                    }
                     replyTo("state.snapshot", stateSnapshotJson().put("ok", ok))
                     return
                 }
@@ -697,8 +710,14 @@ class SweetSpotService : Service(), ServiceActions {
     private fun dpEq() = engine as? DynamicsProcessingEq
 
     override fun getCalibrationBands(): FloatArray? = dpEq()?.getCalibrationBands()
+    override fun getRequestedCalibrationBands(): FloatArray? = dpEq()?.getRequestedCalibrationBands()
+    override fun getEffectiveCalibrationBands(): FloatArray? = dpEq()?.getEffectiveCalibrationBands()
+    override fun getRequestedCalibrationBandsForChannel(channel: Int): FloatArray? = dpEq()?.getRequestedCalibrationBandsForChannel(channel)
+    override fun getEffectiveCalibrationBandsForChannel(channel: Int): FloatArray? = dpEq()?.getEffectiveCalibrationBandsForChannel(channel)
     override fun getCalibrationFrequenciesHz(): IntArray? = dpEq()?.getCalibrationFrequenciesHz()
     override fun isCalibrationActive(): Boolean = dpEq()?.isCalibrationActive() ?: false
+    override fun wasLastCalibrationApplySuccessful(): Boolean = dpEq()?.wasLastCalibrationApplySuccessful() ?: false
+    override fun getLastCalibrationApplyError(): String? = dpEq()?.getLastCalibrationApplyError()
     override fun setCalibrationBands(gains: FloatArray): Boolean = dpEq()?.setCalibrationBands(gains) ?: false
     private fun setCalibrationBandsByChannel(left: FloatArray, right: FloatArray): Boolean =
         dpEq()?.setCalibrationBandsByChannel(left, right) ?: false
@@ -761,10 +780,13 @@ class SweetSpotService : Service(), ServiceActions {
     private fun stateSnapshotJson(): JSONObject {
         val engine = engine ?: DynamicsProcessingEq(profileStore)
         val caps = engine.getCapabilities()
-        val calBands = dpEq()?.getCalibrationBands() ?: FloatArray(0)
+        val calBands = dpEq()?.getEffectiveCalibrationBands() ?: FloatArray(0)
+        val requestedCalBands = dpEq()?.getRequestedCalibrationBands() ?: FloatArray(0)
         val calFreqs = dpEq()?.getCalibrationFrequenciesHz() ?: IntArray(0)
-        val calLeft = dpEq()?.getCalibrationBandsForChannel(0)
-        val calRight = dpEq()?.getCalibrationBandsForChannel(1)
+        val calLeft = dpEq()?.getEffectiveCalibrationBandsForChannel(0)
+        val calRight = dpEq()?.getEffectiveCalibrationBandsForChannel(1)
+        val requestedCalLeft = dpEq()?.getRequestedCalibrationBandsForChannel(0)
+        val requestedCalRight = dpEq()?.getRequestedCalibrationBandsForChannel(1)
         val independentCalibration = dpEq()?.supportsIndependentCalibration() ?: false
         val channelCount = (dpEq()?.getChannelCount() ?: 1).coerceAtLeast(1)
         val headroomDb = dpEq()?.getInputGainDb() ?: 0f
@@ -792,15 +814,23 @@ class SweetSpotService : Service(), ServiceActions {
                 put("active", serviceActionsIsCalibrationActive())
                 put("bandsDb", JSONArray(calBands.toList()))
                 put("frequenciesHz", JSONArray(calFreqs.toList()))
+                put("requestedBandsDb", JSONArray(requestedCalBands.toList()))
+                put("effectiveBandsDb", JSONArray(calBands.toList()))
                 if (independentCalibration && calLeft != null && calRight != null) {
                     put("leftBandsDb", JSONArray(calLeft.toList()))
                     put("rightBandsDb", JSONArray(calRight.toList()))
+                    put("requestedLeftBandsDb", JSONArray(requestedCalLeft?.toList() ?: emptyList<Float>()))
+                    put("requestedRightBandsDb", JSONArray(requestedCalRight?.toList() ?: emptyList<Float>()))
+                    put("effectiveLeftBandsDb", JSONArray(calLeft.toList()))
+                    put("effectiveRightBandsDb", JSONArray(calRight.toList()))
                     put("independent", true)
                 } else {
                     put("independent", false)
                 }
                 put("headroomDb", headroomDb)
                 put("headroomVerified", headroomVerified)
+                put("applicationVerified", dpEq()?.wasLastCalibrationApplySuccessful() ?: false)
+                dpEq()?.getLastCalibrationApplyError()?.let { put("applicationError", it) }
             })
             put("profiles", JSONArray(engine.listProfiles().map { name ->
                 JSONObject().put("id", name).put("name", name)

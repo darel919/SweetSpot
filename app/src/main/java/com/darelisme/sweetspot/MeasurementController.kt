@@ -284,8 +284,10 @@ class MeasurementController(
                 return@submit
             }
             try {
-                if (session.phase == "measurement") {
-                    bypassState = engine.beginMeasurementBypass()
+                bypassState = if (session.phase == "validation") {
+                    engine.beginCalibrationValidation()
+                } else {
+                    engine.beginMeasurementBypass()
                 }
                 val sweep = prepareSweep(session.channel)
                 state = SessionState.Ready(session, sweep, session.channel, null)
@@ -868,14 +870,25 @@ class MeasurementController(
     private fun finishSession(session: Session, error: Pair<String, String>?) {
         if (activeSession !== session) return
         state = SessionState.Finishing(session)
+        var finalError = error
         watchdog?.cancel(false)
         watchdog = null
         stopAudioTrack()
         bypassState?.let { saved ->
             try {
-                engine.endMeasurementBypass(saved)
+                val restored = if (session.phase == "validation") {
+                    engine.endCalibrationValidation(saved)
+                } else {
+                    engine.endMeasurementBypass(saved)
+                }
+                if (!restored && finalError == null) {
+                    finalError = "dsp_restore_failed" to "The TV could not verify restoration of its previous audio state"
+                }
             } catch (restoreError: Throwable) {
                 Log.e(TAG, "Failed to restore measurement DSP state", restoreError)
+                if (finalError == null) {
+                    finalError = "dsp_restore_failed" to "The TV could not restore its previous audio state"
+                }
             }
             bypassState = null
         }
@@ -889,11 +902,11 @@ class MeasurementController(
         CalibrationActivity.finishForSession(session.id)
         activeSession = null
         state = SessionState.Idle
-        error?.let { (code, message) ->
+        finalError?.let { (code, message) ->
             session.emit("measurement.error", JSONObjectPayload.error(session.id, code, message), session.replyTo)
         }
         session.emit("calibrationSession.ended", JSONObjectPayload.session(session), session.replyTo)
-        Log.i(TAG, "Calibration session ended: ${session.id}, error=${error?.first}")
+        Log.i(TAG, "Calibration session ended: ${session.id}, error=${finalError?.first}")
     }
 
     private fun stopAudioTrack() {
@@ -1006,6 +1019,10 @@ class MeasurementController(
                 .put("durationMs", sweep.durationMs)
                 .put("preRollMs", sweep.preRollMs)
                 .put("postRollMs", sweep.postRollMs)
+                .put("syncMarkerStartHz", sweep.syncMarkerStartHz)
+                .put("syncMarkerEndHz", sweep.syncMarkerEndHz)
+                .put("syncMarkerDurationMs", sweep.syncMarkerDurationMs)
+                .put("syncMarkerGapMs", sweep.syncMarkerGapMs)
                 .put("levelDbfs", sweep.levelDbfs)
                 .put("fadeInMs", sweep.fadeInMs)
                 .put("fadeOutMs", sweep.fadeOutMs)

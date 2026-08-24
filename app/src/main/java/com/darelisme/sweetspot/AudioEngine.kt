@@ -28,7 +28,11 @@ interface AudioEngine {
     fun deleteProfile(name: String)
 
     fun beginMeasurementBypass(): MeasurementAudioState
-    fun endMeasurementBypass(state: MeasurementAudioState)
+    fun endMeasurementBypass(state: MeasurementAudioState): Boolean
+
+    /** Temporarily flattens user EQ while keeping the calibration layer active. */
+    fun beginCalibrationValidation(): MeasurementAudioState
+    fun endCalibrationValidation(state: MeasurementAudioState): Boolean
 }
 
 data class MeasurementAudioState(

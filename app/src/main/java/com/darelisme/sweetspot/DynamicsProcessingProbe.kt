@@ -33,12 +33,15 @@ class DynamicsProcessingProbe {
         private const val F_MIN = 20f
         private const val F_MAX = 20000f
 
-        // Primary candidate band counts required by the milestone.
+        /** Diagnostic curves may cut deeply, but positive probe gain is bounded. */
+        const val MIN_PROBE_GAIN_DB = -18f
+        const val MAX_PROBE_GAIN_DB = 6f
+
+        /** Candidate band counts required by the milestone. */
         private val CANDIDATE_BANDS = intArrayOf(10, 20, 32, 64)
-        // Only probed if 64 passes cleanly.
+        /** Additional candidates are enabled only after the 64-band check passes. */
         private val EXTRA_BANDS = intArrayOf()
-        // 64 is the maximum band count we use — the calibration-resolution
-        // cap (derived from iPhone-mic calibration). No higher ladder is probed.
+        /** The calibration-resolution cap. No higher ladder is currently probed. */
         private val CEILING_BANDS = intArrayOf()
     }
 
@@ -53,11 +56,15 @@ class DynamicsProcessingProbe {
 
     data class CurveSummary(
         val bandsTotal: Int,
-        val bandsCut: Int,   // |gain| > 1 dB
-        val bandsFlat: Int   // |gain| <= 1 dB
+        val bandsCut: Int,
+        val bandsFlat: Int
     )
 
-    /** Runs the full probe sequence, logs a summary, and returns the results. */
+    /**
+     * Runs the full probe sequence, logs a summary, and returns the results.
+     * The 64-band result gates the extra candidates, the 128-band result gates
+     * the ceiling ladder, and capacity is treated as monotonic on that ladder.
+     */
     fun run(): List<ProbeResult> {
         Log.i(TAG, "=== DynamicsProcessing Probe ===")
         Log.i(TAG, "Target session: $SESSION_ID (global output mix)")
@@ -66,7 +73,6 @@ class DynamicsProcessingProbe {
         for (n in CANDIDATE_BANDS) {
             results.add(testBandCount(n))
         }
-        // Only push further if the highest required candidate (64) passed cleanly.
         val sixtyFour = results.find { it.requested == 64 }
         if (sixtyFour != null && sixtyFour.constructed && sixtyFour.actualBands == sixtyFour.requested) {
             Log.i(TAG, "64 bands passed — probing extended counts (96, 128)")
@@ -77,15 +83,12 @@ class DynamicsProcessingProbe {
             Log.i(TAG, "64 bands did not pass cleanly — skipping extended counts")
         }
 
-        // Only probe the ceiling ladder if 128 passed cleanly.
         val oneTwentyEight = results.find { it.requested == 128 }
         if (oneTwentyEight != null && oneTwentyEight.constructed && oneTwentyEight.actualBands == oneTwentyEight.requested) {
             Log.i(TAG, "128 bands passed — probing ceiling ladder (192, 256, 384, 512, 768, 1024)")
             for (n in CEILING_BANDS) {
                 val r = testBandCount(n)
                 results.add(r)
-                // Band-count capacity is monotonic: stop at the first failure
-                // to report the highest reliable count without wasting time.
                 if (!(r.constructed && r.actualBands == r.requested)) {
                     Log.i(TAG, "Ceiling reached: $n bands failed — stopping ladder")
                     break
@@ -105,7 +108,9 @@ class DynamicsProcessingProbe {
 
     /**
      * Probes a single band count. Always releases the effect in finally.
-     * Never throws — failures are captured in the returned [ProbeResult].
+     * Never throws; failures are captured in the returned [ProbeResult]. The
+     * effect targets global output session 0, which may produce an AOSP
+     * deprecation warning.
      */
     fun testBandCount(n: Int): ProbeResult {
         Log.i(TAG, "--- Testing requested bands: $n ---")
@@ -118,8 +123,6 @@ class DynamicsProcessingProbe {
             }
 
             val config = buildConfig(n)
-            // 3-arg constructor: attaches to the global output mix (session 0).
-            // AOSP logs a deprecation warning for session 0 but still constructs.
             dp = DynamicsProcessing(PRIORITY, SESSION_ID, config)
 
             val constructed = true
@@ -182,46 +185,87 @@ class DynamicsProcessingProbe {
                 "DynamicsProcessing requires API 28+ (device is ${Build.VERSION.SDK_INT})"
             )
         }
-        val config = buildConfig(n)
+        val config = buildConfig(n, channels)
         val dp = DynamicsProcessing(PRIORITY, SESSION_ID, config)
         dp.setEnabled(true)
+        if (dp.channelCount != channels) {
+            dp.release()
+            throw IllegalStateException("DynamicsProcessing created ${dp.channelCount} channels, requested $channels")
+        }
         return dp
     }
 
-    /** Releases a previously created instance (safe to call once). */
+    /** Releases a previously created instance; already-invalid instances are ignored. */
     fun releaseInstance(dp: DynamicsProcessing?) {
         try {
             dp?.release()
-        } catch (_: Throwable) {
-            // already released or invalid — ignore
-        }
+        } catch (_: Throwable) {}
     }
 
     /**
      * Applies a frequency-dependent gain curve to a live, enabled
      * [DynamicsProcessing] instance (pre-EQ stage, all channels).
      * [gainForFreq] maps a band's center frequency (Hz) to a gain in dB.
-     * Commits per-band via [DynamicsProcessing.setPreEqBandByChannelIndex].
+     * Commits per-band via [DynamicsProcessing.setPreEqBandByChannelIndex]. A
+     * missing channel ends processing for that channel, which supports mono
+     * instances.
      */
-    fun applyCurve(dp: DynamicsProcessing, n: Int, gainForFreq: (Float) -> Float) {
-        for (ch in 0..1) {
+    fun applyCurve(dp: DynamicsProcessing, n: Int, gainForFreq: (Float) -> Float): Boolean {
+        if (n <= 0) return false
+        val common = FloatArray(n) { index ->
+            val freq = F_MIN * (F_MAX / F_MIN).pow((index + 1).toFloat() / n)
+            gainForFreq(freq)
+        }
+        return applyChannelCurves(dp, n, common)
+    }
+
+    /**
+     * Applies common or independent diagnostic curves and verifies every live
+     * band readback. Channel 0 is left and channel 1 is right. Independent
+     * curves are rejected on a mono effect instead of being silently folded
+     * into a common curve, because that would make a routing experiment lie.
+     */
+    fun applyChannelCurves(
+        dp: DynamicsProcessing,
+        n: Int,
+        common: FloatArray,
+        left: FloatArray? = null,
+        right: FloatArray? = null,
+    ): Boolean {
+        if (dp.channelCount <= 0 || n <= 0 || common.size != n) return false
+        if ((left == null) != (right == null)) return false
+        if (left != null && (left.size != n || right?.size != n || dp.channelCount < 2)) return false
+
+        for (ch in 0 until dp.channelCount) {
+            val curve = when {
+                ch == 0 && left != null -> left
+                ch == 1 && right != null -> right
+                else -> common
+            }
             for (i in 0 until n) {
+                val requested = curve[i]
+                if (!requested.isFinite() || requested < MIN_PROBE_GAIN_DB || requested > MAX_PROBE_GAIN_DB) return false
                 try {
-                    val freq = F_MIN * (F_MAX / F_MIN).pow((i + 1).toFloat() / n)
                     val band = dp.getPreEqBandByChannelIndex(ch, i)
-                    band.setGain(gainForFreq(freq))
+                    band.setGain(requested)
                     dp.setPreEqBandByChannelIndex(ch, i, band)
-                } catch (_: Throwable) {
-                    // Channel not present (e.g. mono instance) — stop this channel.
-                    break
+                    val actual = dp.getPreEqBandByChannelIndex(ch, i).gain
+                    if (!actual.isFinite() || kotlin.math.abs(actual - requested) > 0.25f) {
+                        Log.w(TAG, "Probe readback mismatch channel=$ch band=$i requested=$requested actual=$actual")
+                        return false
+                    }
+                } catch (error: Throwable) {
+                    Log.w(TAG, "Probe band write failed channel=$ch band=$i", error)
+                    return false
                 }
             }
         }
+        return true
     }
 
     /** Hollow / recessed-mids test curve: cuts 300 Hz–3 kHz by 15 dB. */
-    fun applyHollowCurve(dp: DynamicsProcessing, n: Int) {
-        applyCurve(dp, n) { freq ->
+    fun applyHollowCurve(dp: DynamicsProcessing, n: Int): Boolean {
+        return applyCurve(dp, n) { freq ->
             when {
                 freq < 300f -> 0f
                 freq < 3000f -> -15f
@@ -231,27 +275,26 @@ class DynamicsProcessingProbe {
     }
 
     /** Resets all bands to 0 dB (flat) for A/B comparison. */
-    fun applyFlatCurve(dp: DynamicsProcessing, n: Int) {
-        applyCurve(dp, n) { 0f }
+    fun applyFlatCurve(dp: DynamicsProcessing, n: Int): Boolean {
+        return applyCurve(dp, n) { 0f }
     }
 
     /** Reads back the live gain curve for verification. */
-    fun readCurveSummary(dp: DynamicsProcessing, n: Int): CurveSummary {
+    fun readCurveSummary(dp: DynamicsProcessing, n: Int, channel: Int = 0): CurveSummary {
         var cut = 0
         var flat = 0
         for (i in 0 until n) {
-            val g = try { dp.getPreEqBandByChannelIndex(0, i).gain } catch (_: Throwable) { 0f }
+            val g = try { dp.getPreEqBandByChannelIndex(channel, i).gain } catch (_: Throwable) { 0f }
             if (kotlin.math.abs(g) > 1f) cut++ else flat++
         }
         return CurveSummary(n, cut, flat)
     }
 
+    /** Reads live band state first, then falls back to the resolved configuration. */
     private fun readBackBandCount(dp: DynamicsProcessing, requested: Int): Int {
-        // Primary: live effect state for channel 0.
         try {
             return dp.getPreEqByChannelIndex(0).bandCount
         } catch (_: Throwable) {
-            // Fallback: configured band count from the resolved Config.
             try {
                 return dp.getConfig().preEqBandCount
             } catch (_: Throwable) {
@@ -261,27 +304,25 @@ class DynamicsProcessingProbe {
         }
     }
 
+    /** Builds a pre-EQ-only configuration with flat initial gains. */
     fun buildConfig(n: Int, channels: Int = 1): DynamicsProcessing.Config {
         val variant = DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION
         val channelCount = channels
         val builder = DynamicsProcessing.Config.Builder(
             variant,
             channelCount,
-            true,   // preEqInUse
-            n,      // preEqBandCount
-            false,  // mbcInUse
-            0,      // mbcBandCount
-            false,  // postEqInUse
-            0,      // postEqBandCount
-            false   // limiterInUse
+            true,
+            n,
+            false,
+            0,
+            false,
+            0,
+            false
         )
 
-        // Logarithmic frequency spacing: f(i) = fMin * (fMax / fMin)^(i / (N-1))
-        // Both Eq booleans are true (inUse + enabled); order is irrelevant here.
         val eq = DynamicsProcessing.Eq(true, true, n)
         for (i in 0 until n) {
             val freq = F_MIN * (F_MAX / F_MIN).pow((i + 1).toFloat() / n)
-            // All gains at 0 dB during the capability probe (engine test, not sound change).
             eq.setBand(i, DynamicsProcessing.EqBand(true, freq, 0f))
         }
         builder.setPreEqAllChannelsTo(eq)

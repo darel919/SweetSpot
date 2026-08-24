@@ -31,12 +31,13 @@ class AudioEffectDiagnostics {
         private const val SESSION_ID = 0
         private const val PRIORITY = 1000
 
-        // AOSP multichannel downmix effect type; present here as a vendor
-        // "Insert" implementation. The impl UUID is discovered at runtime.
+        /** AOSP multichannel downmix type exposed by the vendor as an insert effect. */
         private const val DOWNMIX_TYPE_UUID = "381e49cc-a858-4aa2-87f6-e8388e7601b2"
 
-        // Built per-access because EFFECT_TYPE_HAPTIC_GENERATOR exists only
-        // on API 31+; referencing it in a static init crashes older devices.
+        /**
+         * Builds the type map lazily because the haptic effect type exists only
+         * on API 31+ and a static reference crashes older devices.
+         */
         private fun knownTypes(): Map<String, String> = buildMap {
             put(AudioEffect.EFFECT_TYPE_AEC.toString(), "AEC")
             put(AudioEffect.EFFECT_TYPE_AGC.toString(), "AGC")
@@ -269,7 +270,6 @@ class AudioEffectDiagnostics {
             } catch (_: Throwable) {
                 params += ",limiter=unsupported"
             }
-            // Per-channel independence: set ch0 band 0 gain, confirm ch1 unchanged.
             var independent = "unknown"
             try {
                 val before1 = d.getPreEqBandByChannelIndex(1, 0).gain

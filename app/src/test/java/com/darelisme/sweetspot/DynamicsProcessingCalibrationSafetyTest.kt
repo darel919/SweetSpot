@@ -2,6 +2,7 @@ package com.darelisme.sweetspot
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -50,5 +51,77 @@ class DynamicsProcessingCalibrationSafetyTest {
             DynamicsProcessingEq.effectiveCalibrationGain(2f, 2f, headroomVerified = true),
             0f
         )
+    }
+
+    @Test
+    fun validationMetricsAreRequiredForPassedOrWorseAndMissingMetricsBecomeInconclusive() {
+        val result = DynamicsProcessingEq.normalizeValidationResult(
+            requestedStatus = CalibrationValidationStatus.PASSED,
+            beforeDb = null,
+            afterDb = null,
+            reason = null,
+        )
+
+        assertEquals(CalibrationValidationStatus.INCONCLUSIVE, result.status)
+        assertNull(result.beforeDb)
+        assertNull(result.afterDb)
+        assertEquals("Validation metrics were unavailable", result.reason)
+    }
+
+    @Test
+    fun validationStatusIsDerivedFromTheSharedWorseTolerance() {
+        val worse = DynamicsProcessingEq.normalizeValidationResult(
+            requestedStatus = CalibrationValidationStatus.PASSED,
+            beforeDb = 4f,
+            afterDb = 4f + DynamicsProcessingEq.VALIDATION_WORSE_TOLERANCE_DB + 0.01f,
+            reason = null,
+        )
+        val passed = DynamicsProcessingEq.normalizeValidationResult(
+            requestedStatus = CalibrationValidationStatus.WORSE,
+            beforeDb = 4f,
+            afterDb = 4f + DynamicsProcessingEq.VALIDATION_WORSE_TOLERANCE_DB,
+            reason = null,
+        )
+
+        assertEquals(CalibrationValidationStatus.WORSE, worse.status)
+        assertEquals(CalibrationValidationStatus.PASSED, passed.status)
+    }
+
+    @Test
+    fun uncharacterizedTransferFunctionsCannotAcceptCalibrationCandidates() {
+        assertFalse(DynamicsProcessingEq.BAND_TRANSFER_CHARACTERIZED)
+        assertTrue(
+            DynamicsProcessingEq.calibrationTransferCharacterizationError()
+                ?.contains("not been characterized") == true
+        )
+    }
+
+    private class FakePreferences : android.content.SharedPreferences {
+        private val values = linkedMapOf<String, Any?>()
+
+        override fun getAll(): MutableMap<String, *> = values.toMutableMap()
+        override fun getString(key: String, defValue: String?): String? = values[key] as? String ?: defValue
+        override fun getStringSet(key: String, defValues: MutableSet<String>?): MutableSet<String>? = defValues
+        override fun getInt(key: String, defValue: Int): Int = values[key] as? Int ?: defValue
+        override fun getLong(key: String, defValue: Long): Long = values[key] as? Long ?: defValue
+        override fun getFloat(key: String, defValue: Float): Float = values[key] as? Float ?: defValue
+        override fun getBoolean(key: String, defValue: Boolean): Boolean = values[key] as? Boolean ?: defValue
+        override fun contains(key: String): Boolean = values.containsKey(key)
+        override fun edit(): android.content.SharedPreferences.Editor = Editor()
+        override fun registerOnSharedPreferenceChangeListener(listener: android.content.SharedPreferences.OnSharedPreferenceChangeListener) = Unit
+        override fun unregisterOnSharedPreferenceChangeListener(listener: android.content.SharedPreferences.OnSharedPreferenceChangeListener) = Unit
+
+        private inner class Editor : android.content.SharedPreferences.Editor {
+            override fun putString(key: String, value: String?): android.content.SharedPreferences.Editor { values[key] = value; return this }
+            override fun putStringSet(key: String, value: MutableSet<String>?): android.content.SharedPreferences.Editor { values[key] = value; return this }
+            override fun putInt(key: String, value: Int): android.content.SharedPreferences.Editor { values[key] = value; return this }
+            override fun putLong(key: String, value: Long): android.content.SharedPreferences.Editor { values[key] = value; return this }
+            override fun putFloat(key: String, value: Float): android.content.SharedPreferences.Editor { values[key] = value; return this }
+            override fun putBoolean(key: String, value: Boolean): android.content.SharedPreferences.Editor { values[key] = value; return this }
+            override fun remove(key: String): android.content.SharedPreferences.Editor { values.remove(key); return this }
+            override fun clear(): android.content.SharedPreferences.Editor { values.clear(); return this }
+            override fun commit(): Boolean = true
+            override fun apply() = Unit
+        }
     }
 }

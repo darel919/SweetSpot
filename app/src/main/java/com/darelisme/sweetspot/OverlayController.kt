@@ -36,12 +36,9 @@ class OverlayController(private val context: Context) {
         private const val TAG = "SweetSpotOverlay"
         private const val QR_SIZE_PX = 320
 
-        // Overlay auto-dismiss: shortly after a dashboard connects, or when
-        // nobody scans/connects within this window.
         private const val DISMISS_AFTER_CONNECT_MS = 5_000L
         private const val INACTIVITY_DISMISS_MS = 30_000L
 
-        // Mailbox presence states, mirrored from MailboxClient.
         const val RELAY_DISCONNECTED = "disconnected"
         const val RELAY_CONNECTING = "connecting"
         const val RELAY_WAITING = "waiting"
@@ -57,14 +54,12 @@ class OverlayController(private val context: Context) {
     @Volatile
     private var shown = false
 
-    // Latest pair info to render; set before show() or while shown.
     @Volatile
     private var pairCode: String? = null
 
     @Volatile
     private var relayState: String = RELAY_DISCONNECTED
 
-    // Main-thread-only timers for the two auto-dismiss rules.
     private var shownAtMs: Long = 0
     private var connectedAtMs: Long = 0
 
@@ -91,7 +86,6 @@ class OverlayController(private val context: Context) {
         mainHandler.post {
             relayState = state
             if (state == RELAY_CONNECTED && shown && connectedAtMs == 0L) {
-                // Real dashboard presence: dismiss shortly after.
                 connectedAtMs = SystemClock.elapsedRealtime()
                 scheduleConnectDismiss()
             }
@@ -141,8 +135,7 @@ class OverlayController(private val context: Context) {
             (context.resources.displayMetrics.widthPixels * 0.34).toInt(),
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
         )
         params.gravity = Gravity.END or Gravity.CENTER_VERTICAL
@@ -221,9 +214,10 @@ class OverlayController(private val context: Context) {
         val code = pairCode
         if (code != null && relayState != RELAY_CONNECTED) {
             try {
+                val connectUrl = pairUrl(code)
                 val qr = ImageView(context).apply {
                     contentDescription = "Pairing QR code $code"
-                    background = BitmapDrawable(context.resources, QrCode.generate(pairUrl(code), QR_SIZE_PX))
+                    background = BitmapDrawable(context.resources, QrCode.generate(connectUrl, QR_SIZE_PX))
                     setPadding(16, 16, 16, 16)
                 }
                 container.addView(qr)
@@ -231,7 +225,7 @@ class OverlayController(private val context: Context) {
                 val urlHint = TextView(context).apply {
                     textSize = 15f
                     setTextColor(0xFFB8B8BC.toInt())
-                    text = Config.DASHBOARD_URL.removePrefix("https://") + "/connect/" + code
+                    text = connectUrl.removePrefix("https://")
                     setPadding(0, 20, 0, 4)
                 }
                 container.addView(urlHint)
@@ -258,12 +252,14 @@ class OverlayController(private val context: Context) {
             setPadding(24, 12, 24, 12)
             setBackgroundColor(0x55333333)
             isClickable = true
+            isFocusable = true
             setOnClickListener { hideInternal() }
         }
         container.addView(hideBtn)
+        container.post { hideBtn.requestFocus() }
         return container
     }
 
     private fun pairUrl(code: String): String =
-        "${Config.DASHBOARD_URL}/connect/${PairCodeManager.normalize(code)}"
+        PairCodeManager.connectUrl(code)
 }

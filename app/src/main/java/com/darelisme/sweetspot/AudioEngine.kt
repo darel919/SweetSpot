@@ -9,12 +9,12 @@ package com.darelisme.sweetspot
 interface AudioEngine {
     fun initialize()
     fun release()
-    fun setEnabled(enabled: Boolean)
+    fun setEnabled(enabled: Boolean): Boolean
     fun isEnabled(): Boolean
     fun hasControl(): Boolean
-    fun setBandLevel(index: Int, millibels: Int)
+    fun setBandLevel(index: Int, millibels: Int): Boolean
     fun getBandLevels(): IntArray
-    fun applyPreset(preset: Int)
+    fun applyPreset(preset: Int): Boolean
     fun getActivePreset(): Int
     fun getCapabilities(): EngineCapabilities
 
@@ -23,16 +23,21 @@ interface AudioEngine {
     /** Names of all saved profiles. */
     fun listProfiles(): List<String>
     /** Load a named profile and apply it to the engine. */
-    fun loadProfile(name: String)
+    fun loadProfile(name: String): Boolean
     /** Delete a named profile. */
     fun deleteProfile(name: String)
 
-    fun beginMeasurementBypass(): MeasurementAudioState
+    fun beginMeasurementBypass(): MeasurementAudioOverrideResult
     fun endMeasurementBypass(state: MeasurementAudioState): Boolean
 
     /** Temporarily flattens user EQ while keeping the calibration layer active. */
-    fun beginCalibrationValidation(): MeasurementAudioState
+    fun beginCalibrationValidation(candidateId: String? = null): MeasurementAudioOverrideResult
     fun endCalibrationValidation(state: MeasurementAudioState): Boolean
+}
+
+sealed interface MeasurementAudioOverrideResult {
+    data class Applied(val previousState: MeasurementAudioState) : MeasurementAudioOverrideResult
+    data class Failed(val error: String, val restored: Boolean) : MeasurementAudioOverrideResult
 }
 
 data class MeasurementAudioState(
@@ -53,8 +58,7 @@ data class EngineCapabilities(
     val centerFrequenciesHz: IntArray,
     val presets: Map<Int, String>
 ) {
-    // IntArray uses reference equality by default; provide value-based equals
-    // so capability comparisons behave as expected.
+    /** [IntArray] uses reference equality, so capability comparisons need value equality. */
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (javaClass != other?.javaClass) return false

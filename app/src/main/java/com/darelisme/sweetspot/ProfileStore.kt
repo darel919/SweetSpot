@@ -12,12 +12,17 @@ import android.content.SharedPreferences
  *  - "named profiles": an explicit, user-created collection the UI lists and
  *    lets the user choose from. Each is stored under a name.
  */
-class ProfileStore(context: Context) {
+class ProfileStore private constructor(
+    private val prefs: SharedPreferences,
+    @Suppress("UNUSED_PARAMETER") constructorMarker: Unit,
+) {
 
-    private val prefs: SharedPreferences =
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    constructor(context: Context) : this(
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE),
+        Unit,
+    )
 
-    // ---- last active (auto-restore) ----
+    internal constructor(prefs: SharedPreferences) : this(prefs, Unit)
 
     fun isEnabled(): Boolean = prefs.getBoolean(KEY_ENABLED, DEFAULT_ENABLED)
 
@@ -39,8 +44,6 @@ class ProfileStore(context: Context) {
         }
         if (isEnabled() != enabled) editor.commit() else editor.apply()
     }
-
-    // ---- named profiles ----
 
     fun saveNamed(name: String, enabled: Boolean, preset: Int, levels: IntArray?) {
         val key = profileKey(name)
@@ -83,16 +86,14 @@ class ProfileStore(context: Context) {
         }
     }
 
-    // ---- calibration (64-band read-only base curve) ----
-
     fun loadCalibration(): FloatArray? = loadCalibrationArray(KEY_CALIBRATION)
 
     fun saveCalibration(gains: FloatArray) {
-        prefs.edit()
-            .putString(KEY_CALIBRATION, gains.joinToString(","))
-            .remove(KEY_CALIBRATION_LEFT)
-            .remove(KEY_CALIBRATION_RIGHT)
-            .apply()
+        prefs.edit().also { editor ->
+            writeActiveCalibration(editor, CalibrationCurveState(gains, null, null, true))
+            clearTransaction(editor)
+            editor.apply()
+        }
     }
 
     fun loadCalibrationChannels(): Pair<FloatArray, FloatArray>? {
@@ -102,18 +103,185 @@ class ProfileStore(context: Context) {
     }
 
     fun saveCalibrationChannels(left: FloatArray, right: FloatArray) {
-        prefs.edit()
-            .remove(KEY_CALIBRATION)
-            .putString(KEY_CALIBRATION_LEFT, left.joinToString(","))
-            .putString(KEY_CALIBRATION_RIGHT, right.joinToString(","))
-            .apply()
+        prefs.edit().also { editor ->
+            writeActiveCalibration(editor, CalibrationCurveState(
+                common = FloatArray(64) { (left[it] + right[it]) / 2f },
+                left = left,
+                right = right,
+                active = true,
+            ))
+            clearTransaction(editor)
+            editor.apply()
+        }
     }
 
-    fun clearCalibration(): Boolean = prefs.edit()
-            .remove(KEY_CALIBRATION)
+    fun clearCalibration(): Boolean = prefs.edit().also { editor ->
+        clearActiveCalibration(editor)
+        clearTransaction(editor)
+    }.commit()
+
+    internal fun loadCalibrationTransaction(): CalibrationCandidateTransaction? {
+        val candidateId = prefs.getString(KEY_CANDIDATE_ID, null)
+            ?.takeIf { it.isNotBlank() && it.length <= 128 }
+            ?: return null
+        val previous = readStoredCurve(KEY_CANDIDATE_PREVIOUS) ?: return null
+        val candidate = readStoredCurve(KEY_CANDIDATE_VALUE) ?: return null
+        val status = when (prefs.getString(KEY_CANDIDATE_STATUS, null)) {
+            STATUS_APPLYING -> CalibrationValidationStatus.APPLYING
+            STATUS_ROLLING_BACK -> CalibrationValidationStatus.ROLLING_BACK
+            STATUS_PENDING_VALIDATION -> CalibrationValidationStatus.PENDING
+            STATUS_PASSED -> CalibrationValidationStatus.PASSED
+            STATUS_WORSE -> CalibrationValidationStatus.WORSE
+            STATUS_INCONCLUSIVE -> CalibrationValidationStatus.INCONCLUSIVE
+            STATUS_FAILED -> CalibrationValidationStatus.FAILED
+            else -> return null
+        }
+        val beforeRaw = prefs.getString(KEY_CANDIDATE_BEFORE_DB, null)
+        val afterRaw = prefs.getString(KEY_CANDIDATE_AFTER_DB, null)
+        val before = beforeRaw?.toFloatOrNull()?.takeIf { it.isFinite() }
+        val after = afterRaw?.toFloatOrNull()?.takeIf { it.isFinite() }
+        if ((beforeRaw != null && before == null) || (afterRaw != null && after == null)) return null
+        if (status == CalibrationValidationStatus.PASSED || status == CalibrationValidationStatus.WORSE) {
+            if (before == null || after == null) return null
+        }
+        return CalibrationCandidateTransaction(
+            candidateId = candidateId,
+            previous = previous,
+            candidate = candidate,
+            validationStatus = status,
+            beforeDb = before,
+            afterDb = after,
+            reason = prefs.getString(KEY_CANDIDATE_REASON, null),
+        )
+    }
+
+    internal fun saveCandidateApplying(transaction: CalibrationCandidateTransaction): Boolean =
+        prefs.edit().also { editor ->
+            writeTransaction(editor, transaction.copy(validationStatus = CalibrationValidationStatus.PENDING), STATUS_APPLYING)
+        }.commit()
+
+    internal fun saveCandidatePendingValidation(transaction: CalibrationCandidateTransaction): Boolean =
+        prefs.edit().also { editor ->
+            writeActiveCalibration(editor, transaction.candidate)
+            writeTransaction(editor, transaction, STATUS_PENDING_VALIDATION)
+        }.commit()
+
+    internal fun saveCandidateRollingBack(transaction: CalibrationCandidateTransaction): Boolean =
+        prefs.edit().also { editor ->
+            writeTransaction(editor, transaction, STATUS_ROLLING_BACK)
+        }.commit()
+
+    internal fun saveCandidateValidation(transaction: CalibrationCandidateTransaction): Boolean =
+        prefs.edit().also { editor ->
+            writeTransaction(editor, transaction, statusKey(transaction.validationStatus))
+        }.commit()
+
+    internal fun saveActiveCalibrationAndClearCandidate(curve: CalibrationCurveState): Boolean =
+        prefs.edit().also { editor ->
+            if (curve.active) writeActiveCalibration(editor, curve) else clearActiveCalibration(editor)
+            clearTransaction(editor)
+        }.commit()
+
+    internal fun saveActiveCalibrationPreservingCandidate(curve: CalibrationCurveState): Boolean =
+        prefs.edit().also { editor ->
+            if (curve.active) writeActiveCalibration(editor, curve) else clearActiveCalibration(editor)
+        }.commit()
+
+    internal fun clearActiveCalibrationOnly(): Boolean = prefs.edit().also { editor ->
+        clearActiveCalibration(editor)
+    }.commit()
+
+    internal fun hasCalibrationTransactionData(): Boolean = listOf(
+        KEY_CANDIDATE_ID,
+        KEY_CANDIDATE_STATUS,
+        KEY_CANDIDATE_BEFORE_DB,
+        KEY_CANDIDATE_AFTER_DB,
+        KEY_CANDIDATE_REASON,
+        KEY_CANDIDATE_PREVIOUS + COMMON_SUFFIX,
+        KEY_CANDIDATE_PREVIOUS + LEFT_SUFFIX,
+        KEY_CANDIDATE_PREVIOUS + RIGHT_SUFFIX,
+        KEY_CANDIDATE_PREVIOUS + ACTIVE_SUFFIX,
+        KEY_CANDIDATE_VALUE + COMMON_SUFFIX,
+        KEY_CANDIDATE_VALUE + LEFT_SUFFIX,
+        KEY_CANDIDATE_VALUE + RIGHT_SUFFIX,
+        KEY_CANDIDATE_VALUE + ACTIVE_SUFFIX,
+    ).any(prefs::contains)
+
+    internal fun clearCalibrationTransaction(): Boolean = prefs.edit().also { editor -> clearTransaction(editor) }.commit()
+
+    private fun writeActiveCalibration(editor: SharedPreferences.Editor, curve: CalibrationCurveState) {
+        if (!curve.active) {
+            clearActiveCalibration(editor)
+            return
+        }
+        if (curve.left != null && curve.right != null) {
+            editor.remove(KEY_CALIBRATION)
+                .putString(KEY_CALIBRATION_LEFT, curve.left.joinToString(","))
+                .putString(KEY_CALIBRATION_RIGHT, curve.right.joinToString(","))
+        } else {
+            editor.putString(KEY_CALIBRATION, curve.common.joinToString(","))
+                .remove(KEY_CALIBRATION_LEFT)
+                .remove(KEY_CALIBRATION_RIGHT)
+        }
+    }
+
+    private fun clearActiveCalibration(editor: SharedPreferences.Editor) {
+        editor.remove(KEY_CALIBRATION)
             .remove(KEY_CALIBRATION_LEFT)
             .remove(KEY_CALIBRATION_RIGHT)
-            .commit()
+    }
+
+    private fun writeTransaction(editor: SharedPreferences.Editor, transaction: CalibrationCandidateTransaction, status: String) {
+        editor.putString(KEY_CANDIDATE_ID, transaction.candidateId)
+            .putString(KEY_CANDIDATE_STATUS, status)
+            .putString(KEY_CANDIDATE_BEFORE_DB, transaction.beforeDb?.toString())
+            .putString(KEY_CANDIDATE_AFTER_DB, transaction.afterDb?.toString())
+            .putString(KEY_CANDIDATE_REASON, transaction.reason)
+        writeStoredCurve(editor, KEY_CANDIDATE_PREVIOUS, transaction.previous)
+        writeStoredCurve(editor, KEY_CANDIDATE_VALUE, transaction.candidate)
+    }
+
+    private fun writeStoredCurve(editor: SharedPreferences.Editor, prefix: String, curve: CalibrationCurveState) {
+        editor.putString(prefix + COMMON_SUFFIX, curve.common.joinToString(","))
+            .putString(prefix + LEFT_SUFFIX, curve.left?.joinToString(","))
+            .putString(prefix + RIGHT_SUFFIX, curve.right?.joinToString(","))
+            .putBoolean(prefix + ACTIVE_SUFFIX, curve.active)
+    }
+
+    private fun readStoredCurve(prefix: String): CalibrationCurveState? {
+        val common = loadCalibrationArray(prefix + COMMON_SUFFIX) ?: return null
+        val leftPresent = prefs.contains(prefix + LEFT_SUFFIX)
+        val rightPresent = prefs.contains(prefix + RIGHT_SUFFIX)
+        if (leftPresent != rightPresent) return null
+        val left = if (leftPresent) loadCalibrationArray(prefix + LEFT_SUFFIX) ?: return null else null
+        val right = if (rightPresent) loadCalibrationArray(prefix + RIGHT_SUFFIX) ?: return null else null
+        if ((left == null) != (right == null)) return null
+        return CalibrationCurveState(common, left, right, prefs.getBoolean(prefix + ACTIVE_SUFFIX, true))
+    }
+
+    private fun clearTransaction(editor: SharedPreferences.Editor) {
+        editor.remove(KEY_CANDIDATE_ID)
+            .remove(KEY_CANDIDATE_STATUS)
+            .remove(KEY_CANDIDATE_BEFORE_DB)
+            .remove(KEY_CANDIDATE_AFTER_DB)
+            .remove(KEY_CANDIDATE_REASON)
+        listOf(KEY_CANDIDATE_PREVIOUS, KEY_CANDIDATE_VALUE).forEach { prefix ->
+            editor.remove(prefix + COMMON_SUFFIX)
+                .remove(prefix + LEFT_SUFFIX)
+                .remove(prefix + RIGHT_SUFFIX)
+                .remove(prefix + ACTIVE_SUFFIX)
+        }
+    }
+
+    private fun statusKey(status: CalibrationValidationStatus): String = when (status) {
+        CalibrationValidationStatus.PENDING -> STATUS_PENDING_VALIDATION
+        CalibrationValidationStatus.APPLYING -> STATUS_APPLYING
+        CalibrationValidationStatus.ROLLING_BACK -> STATUS_ROLLING_BACK
+        CalibrationValidationStatus.PASSED -> STATUS_PASSED
+        CalibrationValidationStatus.WORSE -> STATUS_WORSE
+        CalibrationValidationStatus.INCONCLUSIVE -> STATUS_INCONCLUSIVE
+        CalibrationValidationStatus.FAILED -> STATUS_FAILED
+    }
 
     private fun loadCalibrationArray(key: String): FloatArray? {
         val values = prefs.getString(key, null)
@@ -138,6 +306,24 @@ class ProfileStore(context: Context) {
         private const val KEY_CALIBRATION = "calibration"
         private const val KEY_CALIBRATION_LEFT = "calibration_left"
         private const val KEY_CALIBRATION_RIGHT = "calibration_right"
+        private const val KEY_CANDIDATE_ID = "calibration_candidate_id"
+        private const val KEY_CANDIDATE_STATUS = "calibration_candidate_status"
+        private const val KEY_CANDIDATE_BEFORE_DB = "calibration_candidate_before_db"
+        private const val KEY_CANDIDATE_AFTER_DB = "calibration_candidate_after_db"
+        private const val KEY_CANDIDATE_REASON = "calibration_candidate_reason"
+        private const val KEY_CANDIDATE_PREVIOUS = "calibration_candidate_previous_"
+        private const val KEY_CANDIDATE_VALUE = "calibration_candidate_value_"
+        private const val COMMON_SUFFIX = "common"
+        private const val LEFT_SUFFIX = "left"
+        private const val RIGHT_SUFFIX = "right"
+        private const val ACTIVE_SUFFIX = "active"
+        private const val STATUS_APPLYING = "applying"
+        private const val STATUS_ROLLING_BACK = "rolling_back"
+        private const val STATUS_PENDING_VALIDATION = "pending_validation"
+        private const val STATUS_PASSED = "passed"
+        private const val STATUS_WORSE = "worse"
+        private const val STATUS_INCONCLUSIVE = "inconclusive"
+        private const val STATUS_FAILED = "failed"
     }
 }
 

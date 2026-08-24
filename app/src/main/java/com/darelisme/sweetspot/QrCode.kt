@@ -18,7 +18,7 @@ object QrCode {
             mapOf(EncodeHintType.MARGIN to 1)
         )
         val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.RGB_565)
-        val dark = Color.WHITE // inverted: light modules on dark panel
+        val dark = Color.WHITE
         val light = Color.TRANSPARENT
         for (x in 0 until sizePx) {
             for (y in 0 until sizePx) {

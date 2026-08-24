@@ -14,9 +14,6 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // The persistent floating overlay is owned and shown by SweetSpotService,
-        // so the Activity has no UI of its own — it just ensures the service is
-        // running, then gets out of the way.
         startSweetSpotService()
         finish()
     }

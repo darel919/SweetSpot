@@ -13,13 +13,16 @@ import java.security.SecureRandom
 class PairCodeManager {
 
     companion object {
-        // No 0/O or 1/I/L to keep the code readable from a TV across a room.
+        /** Excludes visually ambiguous characters for reliable TV reading. */
         private const val ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
         const val LENGTH = 8
         const val TTL_MS = 10L * 60 * 1000
 
         /** Strips dashes, uppercases: the exact normalization the web app applies. */
         fun normalize(code: String): String = code.replace("-", "").trim().uppercase()
+
+        internal fun connectUrl(code: String): String =
+            "${Config.DASHBOARD_URL}/connect/${normalize(code)}"
     }
 
     private val random = SecureRandom()

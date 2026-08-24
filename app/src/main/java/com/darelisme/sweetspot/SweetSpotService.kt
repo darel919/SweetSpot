@@ -6,7 +6,6 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.media.audiofx.DynamicsProcessing
 import android.media.audiofx.Virtualizer
 import android.os.IBinder
 import android.os.Debug
@@ -21,6 +20,8 @@ import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.roundToInt
+import kotlin.math.pow
 
 internal fun parseStrictCalibrationArray(value: JSONArray?): FloatArray? {
     if (value == null || value.length() != DynamicsProcessingEq.INTERNAL_BANDS) return null
@@ -29,6 +30,23 @@ internal fun parseStrictCalibrationArray(value: JSONArray?): FloatArray? {
             val parsed = value.getDouble(index)
             require(parsed.isFinite())
             parsed.toFloat().also { require(it.isFinite()) }
+        }
+    } catch (_: Throwable) {
+        null
+    }
+}
+
+internal fun parseStrictProbeArray(value: JSONArray?, expectedBands: Int): FloatArray? {
+    if (value == null || expectedBands <= 0 || value.length() != expectedBands) return null
+    return try {
+        FloatArray(expectedBands) { index ->
+            val parsed = value.getDouble(index)
+            require(parsed.isFinite())
+            parsed.toFloat().also {
+                require(it.isFinite())
+                require(it >= DynamicsProcessingProbe.MIN_PROBE_GAIN_DB)
+                require(it <= DynamicsProcessingProbe.MAX_PROBE_GAIN_DB)
+            }
         }
     } catch (_: Throwable) {
         null
@@ -80,30 +98,27 @@ class SweetSpotService : Service(), ServiceActions {
     private val pairCodes = PairCodeManager()
     private lateinit var profileStore: ProfileStore
 
-    // Serializes probe runs so a burst of broadcasts cannot overlap probes.
+    /** Serializes probe runs so a burst of broadcasts cannot overlap probes. */
     private val probeExecutor = Executors.newSingleThreadExecutor()
 
-    // Long-lived DynamicsProcessing instance for memory/CPU/reliability checks.
-    // Null unless a persistent probe is currently active.
-    private var persistentDp: DynamicsProcessing? = null
-
-    // Last capacity-probe results, surfaced to the web UI.
+    /** Last capacity-probe results surfaced to the web UI. */
     private var lastProbeResults: List<DynamicsProcessingProbe.ProbeResult>? = null
     private val probeRunning = AtomicBoolean(false)
     private var persistentBands: Int = 0
     private var persistentCurveName: String? = null
 
-    // Persistent global-mix Virtualizer for spatial-widening A/B tests.
-    // Strength fixed at max until the listening test proves the feature.
+    /** Persistent global-mix Virtualizer for spatial-widening A/B tests. */
     private var persistentVirtualizer: Virtualizer? = null
 
+    /**
+     * Enters the foreground before slow runtime initialization. Android allows
+     * only a short window between the foreground-service start and this call.
+     */
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "Service onCreate")
         profileStore = ProfileStore(this)
         createNotificationChannel()
-        // Promote to foreground before slow init; the system enforces a short
-        // window between startForegroundService() and startForeground().
         startForeground(NOTIFICATION_ID, buildNotification())
         Log.i(TAG, "Foreground service shell ready")
     }
@@ -126,13 +141,12 @@ class SweetSpotService : Service(), ServiceActions {
                 createdEngine,
                 createdOverlay,
                 this,
-                eqAppliedNotifier = ::showEqAppliedToast
-            ).also {
-                it.pairCodeProvider = { pairCodes.current() }
-                it.pairCodeRotateProvider = {
+                eqAppliedNotifier = ::showEqAppliedToast,
+                pairCodeProvider = { pairCodes.current() },
+                pairCodeRotateProvider = {
                     pairCodes.rotate().also { code -> overlay?.updatePairInfo(code) }
                 }
-            }
+            )
             createdRelay = MailboxClient(
                 roomProvider = { pairCodes.current() },
                 snapshotProvider = { stateSnapshotJson() },
@@ -212,7 +226,7 @@ class SweetSpotService : Service(), ServiceActions {
             ACTION_BYPASS -> engine?.setEnabled(false)
             ACTION_PROBE -> runProbe()
             ACTION_PROBE_PERSIST -> {
-                val bands = intent.getIntExtra(EXTRA_PROBE_BANDS, 128)
+                val bands = intent.getIntExtra(EXTRA_PROBE_BANDS, DynamicsProcessingEq.INTERNAL_BANDS)
                 runPersistentProbe(bands)
             }
             ACTION_PROBE_RELEASE -> releasePersistentProbe()
@@ -228,7 +242,6 @@ class SweetSpotService : Service(), ServiceActions {
             null -> overlay?.hide()
             else -> Log.d(TAG, "onStartCommand: no/unknown action (intent=$intent)")
         }
-        // Restart if the system kills the service.
         return START_STICKY
     }
 
@@ -269,9 +282,6 @@ class SweetSpotService : Service(), ServiceActions {
         overlay = null
         engine?.release()
         engine = null
-        // Release any long-lived probe instance still held.
-        DynamicsProcessingProbe().releaseInstance(persistentDp)
-        persistentDp = null
         try { persistentVirtualizer?.release() } catch (_: Throwable) {}
         persistentVirtualizer = null
         probeExecutor.shutdownNow()
@@ -279,112 +289,183 @@ class SweetSpotService : Service(), ServiceActions {
     }
 
     /**
-     * Creates a long-lived, enabled [DynamicsProcessing] instance for [bands]
-     * bands on session 0 and keeps it alive (does NOT release it). This lets
-     * the developer measure memory/CPU and run reliability checks with a real
-     * enabled effect in place. Release it with [ACTION_PROBE_RELEASE] or the
-     * web endpoint.
+     * Enables the temporary diagnostic overlay on the production 64-band
+     * DynamicsProcessing instance. A second effect on global session 0 loses
+     * control on the TCL, so transfer/routing probes must use this owner.
      */
     override fun runPersistentProbe(bands: Int) {
         Log.i(TAG, "Persistent DynamicsProcessing probe requested: $bands bands")
-        suspendProduction()
         probeExecutor.submit {
             try {
-                // Replace any existing persistent instance first.
-                persistentDp?.let {
-                    DynamicsProcessingProbe().releaseInstance(it)
-                    Log.i(TAG, "Released previous persistent DynamicsProcessing instance")
-                }
                 persistentCurveName = null
-                // Prefer stereo so both channels of the global mix are affected;
-                // fall back to mono if the 2-channel config is rejected.
-                var usedChannels = 2
-                val dp = try {
-                    DynamicsProcessingProbe().createEnabled(bands, 2)
-                } catch (e: Throwable) {
-                    Log.w(TAG, "2-channel persistent instance failed ($bands bands); falling back to 1 channel", e)
-                    usedChannels = 1
-                    DynamicsProcessingProbe().createEnabled(bands, 1)
+                val eq = dpEq() ?: throw IllegalStateException("Production DynamicsProcessing is not initialized")
+                if (!eq.clearDiagnosticProbe()) throw IllegalStateException("Could not restore production EQ before starting the diagnostic overlay")
+                if (bands != DynamicsProcessingEq.INTERNAL_BANDS) {
+                    Log.w(TAG, "Diagnostic transfer probe requires ${DynamicsProcessingEq.INTERNAL_BANDS} bands; requested $bands")
+                    persistentBands = 0
+                    return@submit
                 }
-                persistentDp = dp
-                persistentBands = bands
+                if (eq.getChannelCount() < 1) throw IllegalStateException("Production DynamicsProcessing has no channels")
+                persistentBands = DynamicsProcessingEq.INTERNAL_BANDS
+                if (!eq.applyDiagnosticProbe(FloatArray(DynamicsProcessingEq.INTERNAL_BANDS))) {
+                    throw IllegalStateException("Production DynamicsProcessing rejected the flat diagnostic overlay")
+                }
+                persistentCurveName = "flat"
                 Log.i(TAG, "=== Persistent DynamicsProcessing ACTIVE ===")
-                Log.i(TAG, "Bands: $bands | Channels: $usedChannels | Session: 0 (global output mix) | Enabled: ${dp.enabled}")
-                Log.i(TAG, "Instance is intentionally left ENABLED for memory/CPU/reliability checks.")
-                Log.i(TAG, "Apply a test curve via web (/api/probe/apply-curve) or release via /api/probe/release.")
+                Log.i(TAG, "Bands: $persistentBands | Channels: ${eq.getChannelCount()} | Session: 0 (production owner)")
+                Log.i(TAG, "Diagnostic overlay is ready; it is not persisted and must be released after the experiment.")
             } catch (e: Throwable) {
                 Log.e(TAG, "Persistent probe failed for $bands bands", e)
+                persistentBands = 0
+                persistentCurveName = null
             }
         }
     }
 
-    /** Releases the long-lived DynamicsProcessing instance, if any. */
+    /** Removes the temporary diagnostic overlay and restores production EQ. */
     override fun releasePersistentProbe() {
         probeExecutor.submit {
             try {
-                persistentDp?.let {
-                    DynamicsProcessingProbe().releaseInstance(it)
-                    Log.i(TAG, "Persistent DynamicsProcessing instance released")
-                } ?: Log.i(TAG, "No persistent DynamicsProcessing instance to release")
-                persistentDp = null
+                if (dpEq()?.clearDiagnosticProbe() != true) {
+                    throw IllegalStateException("Production DynamicsProcessing rejected diagnostic overlay removal")
+                }
                 persistentBands = 0
                 persistentCurveName = null
+                Log.i(TAG, "Diagnostic DynamicsProcessing probe released")
             } catch (e: Throwable) {
                 Log.e(TAG, "Failed to release persistent instance", e)
-            } finally {
-                resumeProduction()
             }
         }
     }
 
-    // --- ServiceActions (web-facing) ---
     override fun getLastProbeResults(): List<DynamicsProcessingProbe.ProbeResult>? = lastProbeResults
     override fun isProbeRunning(): Boolean = probeRunning.get()
-    override fun isPersistentProbeActive(): Boolean = persistentDp != null
-    override fun getPersistentProbeBands(): Int = persistentBands
+    override fun isPersistentProbeActive(): Boolean = dpEq()?.isDiagnosticProbeActive() == true
+    override fun getPersistentProbeBands(): Int = if (isPersistentProbeActive()) persistentBands else 0
 
     /**
      * Dispatches dashboard control commands arriving via the mailbox. Runs on
-     * the mailbox poll thread, so probe work is submitted to [probeExecutor]
+     * the mailbox worker thread, so probe work is submitted to [probeExecutor]
      * and answered with a follow-up probe.status message.
      */
     private fun mailboxCommandHandler() = object : MailboxClient.CommandHandler {
         override fun onCommand(type: String, payload: JSONObject, replyTo: (String, JSONObject) -> Unit) {
             val engine = this@SweetSpotService.engine
+            var commandOk = true
+            var commandError: String? = null
             when (type) {
-                "engine.enable" -> engine?.setEnabled(true)
-                "engine.bypass" -> engine?.setEnabled(false)
+                "engine.enable" -> {
+                    commandOk = engine?.setEnabled(true) == true
+                    if (!commandOk) commandError = "Live DSP rejected enable"
+                }
+                "engine.bypass" -> {
+                    commandOk = engine?.setEnabled(false) == true
+                    if (!commandOk) commandError = "Live DSP rejected bypass"
+                }
                 "engine.setBands" -> {
-                    val arr = payload.optJSONArray("bandsDb") ?: return
-                    for (i in 0 until minOf(arr.length(), engine?.getCapabilities()?.bandCount ?: 0)) {
-                        engine?.setBandLevel(i, (arr.optDouble(i, Double.NaN) * 100).toInt())
+                    val arr = payload.optJSONArray("bandsDb")
+                    val bandCount = engine?.getCapabilities()?.bandCount ?: 0
+                    val previous = engine?.getBandLevels()
+                    val previousPreset = engine?.getActivePreset() ?: 0
+                    if (arr == null || arr.length() != bandCount) {
+                        commandOk = false
+                        commandError = "Expected $bandCount user EQ bands"
+                    } else {
+                        for (i in 0 until bandCount) {
+                            val value = arr.optDouble(i, Double.NaN)
+                            if (!value.isFinite()
+                                || value < DynamicsProcessingEq.MIN_USER_LEVEL_MILLIBELS / 100f
+                                || value > DynamicsProcessingEq.MAX_USER_LEVEL_MILLIBELS / 100f
+                                || engine?.setBandLevel(i, (value * 100).roundToInt()) != true
+                            ) {
+                                commandOk = false
+                                commandError = "Live DSP rejected user EQ band $i"
+                                break
+                            }
+                        }
+                    }
+                    if (!commandOk && previous != null && previous.size == bandCount) {
+                        for (i in previous.indices) {
+                            if (engine.setBandLevel(i, previous[i]) != true) {
+                                commandError = "$commandError; previous user EQ could not be fully restored"
+                                break
+                            }
+                        }
+                        if (previousPreset > 0 && engine.applyPreset(previousPreset) != true) {
+                            commandError = "$commandError; previous EQ preset could not be fully restored"
+                        }
                     }
                 }
-                "engine.applyPreset" -> applyPresetWithFeedback(payload.optInt("preset", -1))
+                "engine.applyPreset" -> {
+                    commandOk = applyPresetWithFeedback(payload.optInt("preset", -1))
+                    if (!commandOk) commandError = "Live DSP rejected preset"
+                }
                 "profile.save" -> payload.optString("name").takeIf { it.isNotBlank() }?.let { engine?.saveCurrentProfile(it) }
-                "profile.load" -> payload.optString("name").takeIf { it.isNotBlank() }?.let { loadProfileWithFeedback(it) }
+                "profile.load" -> {
+                    commandOk = payload.optString("name").takeIf { it.isNotBlank() }?.let { loadProfileWithFeedback(it) } ?: false
+                    if (!commandOk) commandError = "Live DSP rejected profile load"
+                }
                 "profile.delete" -> payload.optString("name").takeIf { it.isNotBlank() }?.let { engine?.deleteProfile(it) }
-                "calibration.apply" -> {
+                "calibration.applyCandidate" -> {
                     val arr = payload.optJSONArray("bandsDb")
                     val leftArr = payload.optJSONArray("leftBandsDb")
                     val rightArr = payload.optJSONArray("rightBandsDb")
                     val left = parseStrictCalibrationArray(leftArr)
                     val right = parseStrictCalibrationArray(rightArr)
                     val common = parseStrictCalibrationArray(arr)
-                    val ok = if (leftArr != null || rightArr != null) {
-                        left != null && right != null && setCalibrationBandsByChannel(left, right)
+                    commandOk = if (leftArr != null || rightArr != null) {
+                        val target = dpEq()
+                        common != null && left != null && right != null && target?.applyCalibrationCandidate(common, left, right) == true
                     } else {
-                        common != null && setCalibrationBands(common)
+                        common != null && dpEq()?.applyCalibrationCandidate(common) == true
                     }
-                    replyTo("state.snapshot", stateSnapshotJson().put("ok", ok))
+                    if (!commandOk) commandError = dpEq()?.getLastCalibrationApplyError() ?: "Calibration candidate was rejected"
+                    replyTo("state.snapshot", stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
                     return
                 }
-                "calibration.reset" -> resetCalibration()
+                "calibration.acceptCandidate" -> {
+                    val candidateId = payload.optString("candidateId")
+                    commandOk = candidateId.isNotBlank() && (dpEq()?.acceptCalibrationCandidate(candidateId) == true)
+                    if (!commandOk) commandError = "Calibration candidate is not available for acceptance"
+                    replyTo("state.snapshot", stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
+                    return
+                }
+                "calibration.rollbackCandidate" -> {
+                    val candidateId = payload.optString("candidateId")
+                    commandOk = candidateId.isNotBlank() && (dpEq()?.rollbackCalibrationCandidate(candidateId) == true)
+                    if (!commandOk) commandError = dpEq()?.getLastCalibrationApplyError() ?: "Calibration candidate rollback failed"
+                    replyTo("state.snapshot", stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
+                    return
+                }
+                "calibration.validation.result" -> {
+                    val candidateId = payload.optString("candidateId")
+                    val status = when (payload.optString("status")) {
+                        "passed" -> CalibrationValidationStatus.PASSED
+                        "worse" -> CalibrationValidationStatus.WORSE
+                        "inconclusive" -> CalibrationValidationStatus.INCONCLUSIVE
+                        "failed" -> CalibrationValidationStatus.FAILED
+                        else -> null
+                    }
+                    val before = if (payload.has("beforeDb")) payload.optDouble("beforeDb", Double.NaN).toFloat().takeIf { it.isFinite() } else null
+                    val after = if (payload.has("afterDb")) payload.optDouble("afterDb", Double.NaN).toFloat().takeIf { it.isFinite() } else null
+                    commandOk = candidateId.isNotBlank() && status != null && dpEq()?.recordCalibrationValidation(
+                        candidateId,
+                        status,
+                        before,
+                        after,
+                        payload.optString("reason").takeIf { it.isNotBlank() },
+                    ) == true
+                    if (!commandOk) commandError = "Calibration validation result was rejected"
+                    replyTo("state.snapshot", stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
+                    return
+                }
+                "calibration.reset" -> commandOk = resetCalibration()
                 "calibrationSession.begin" -> {
                     measurementController?.begin(
                         payload.optString("sessionId"),
                         payload.optString("channel", "both"),
                         payload.optString("phase", "measurement"),
+                        payload.optString("candidateId").takeIf { it.isNotBlank() },
                         null,
                         emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
                     )
@@ -523,8 +604,22 @@ class SweetSpotService : Service(), ServiceActions {
                 "virtualizer.on" -> setVirtualizer(true)
                 "virtualizer.off" -> setVirtualizer(false)
                 "probe.curve.apply" -> {
-                    val curve = payload.optString("curve", "hollow")
-                    applyPersistentCurve(curve)
+                    val commonArray = payload.optJSONArray("bandsDb")
+                    val leftArray = payload.optJSONArray("leftBandsDb")
+                    val rightArray = payload.optJSONArray("rightBandsDb")
+                    commandOk = if (commonArray != null || leftArray != null || rightArray != null) {
+                        val expectedBands = persistentBands
+                        val common = parseStrictProbeArray(commonArray, expectedBands)
+                        val left = parseStrictProbeArray(leftArray, expectedBands)
+                        val right = parseStrictProbeArray(rightArray, expectedBands)
+                        common != null
+                            && ((leftArray == null && rightArray == null && applyPersistentBands(common))
+                                || (leftArray != null && rightArray != null && left != null && right != null && applyPersistentBands(common, left, right)))
+                    } else {
+                        val curve = payload.optString("curve", "hollow")
+                        applyPersistentCurve(curve)
+                    }
+                    if (!commandOk) commandError = "Persistent probe curve was rejected"
                 }
                 "diagnostics.deviceInfo" -> {
                     replyTo("diagnostics.deviceInfo", deviceInfoJson())
@@ -535,7 +630,7 @@ class SweetSpotService : Service(), ServiceActions {
                     return
                 }
             }
-            replyTo("state.snapshot", stateSnapshotJson())
+            replyTo("state.snapshot", stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
         }
 
 
@@ -556,19 +651,24 @@ class SweetSpotService : Service(), ServiceActions {
                     put("exception", r.exception ?: JSONObject.NULL)
                 })
             }
-            val persistent = if (persistentDp != null) JSONObject().apply {
+            val persistent = if (isPersistentProbeActive()) JSONObject().apply {
                 put("active", true)
                 put("bands", persistentBands)
                 put("curve", persistentCurveName ?: JSONObject.NULL)
-                val dp = persistentDp!!
-                val sum = try {
-                    DynamicsProcessingProbe().readCurveSummary(dp, persistentBands)
-                } catch (_: Throwable) { null }
+                val sum = getPersistentProbeCurveSummary(0)
                 if (sum != null) {
                     put("curveSummary", JSONObject().apply {
                         put("bandsTotal", sum.bandsTotal)
                         put("bandsCut", sum.bandsCut)
                         put("bandsFlat", sum.bandsFlat)
+                    })
+                }
+                val right = getPersistentProbeCurveSummary(1)
+                if (right != null) {
+                    put("rightCurveSummary", JSONObject().apply {
+                        put("bandsTotal", right.bandsTotal)
+                        put("bandsCut", right.bandsCut)
+                        put("bandsFlat", right.bandsFlat)
                     })
                 }
             } else JSONObject().put("active", false).put("bands", 0)
@@ -583,7 +683,7 @@ class SweetSpotService : Service(), ServiceActions {
         }
     }
 
-    /** Mirrors WebServer.deviceInfoJson; runs on the mailbox poll thread (~400ms sample window). */
+    /** Mirrors WebServer.deviceInfoJson; runs on the mailbox worker thread (~400ms sample window). */
     private fun deviceInfoJson(): JSONObject {
         val rt = Runtime.getRuntime()
         val memInfo = Debug.MemoryInfo()
@@ -602,8 +702,8 @@ class SweetSpotService : Service(), ServiceActions {
             put("cpuPercent", appCpu)
             put("audioserverCpuPercent", asCpu ?: 0.0)
             put("audioserverPid", asPid ?: JSONObject.NULL)
-            put("persistentProbeActive", persistentDp != null)
-            put("persistentProbeBands", persistentBands)
+            put("persistentProbeActive", isPersistentProbeActive())
+            put("persistentProbeBands", getPersistentProbeBands())
         }
     }
 
@@ -640,14 +740,21 @@ class SweetSpotService : Service(), ServiceActions {
     } catch (_: Throwable) { null }
 
     override fun applyPersistentCurve(curve: String): Boolean {
-        val dp = persistentDp ?: return false
-        val n = persistentBands
+        val eq = dpEq() ?: return false
+        if (!eq.isDiagnosticProbeActive() || persistentBands != DynamicsProcessingEq.INTERNAL_BANDS) return false
+        val n = DynamicsProcessingEq.INTERNAL_BANDS
         return try {
-            when (curve) {
-                "hollow" -> DynamicsProcessingProbe().applyHollowCurve(dp, n)
-                "flat" -> DynamicsProcessingProbe().applyFlatCurve(dp, n)
-                else -> return false
+            val common = FloatArray(n) { index ->
+                val freq = DynamicsProcessingEq.F_MIN.toFloat() *
+                    (DynamicsProcessingEq.F_MAX.toFloat() / DynamicsProcessingEq.F_MIN.toFloat()).pow((index + 1).toFloat() / n)
+                when (curve) {
+                    "hollow" -> if (freq >= 300f && freq < 3000f) -15f else 0f
+                    "flat" -> 0f
+                    else -> return false
+                }
             }
+            val applied = eq.applyDiagnosticProbe(common)
+            if (!applied) return false
             persistentCurveName = curve
             true
         } catch (e: Throwable) {
@@ -656,14 +763,34 @@ class SweetSpotService : Service(), ServiceActions {
         }
     }
 
-    override fun getPersistentProbeCurve(): String? = persistentCurveName
+    override fun applyPersistentBands(common: FloatArray, left: FloatArray?, right: FloatArray?): Boolean {
+        val eq = dpEq() ?: return false
+        val n = DynamicsProcessingEq.INTERNAL_BANDS
+        if (!eq.isDiagnosticProbeActive() || persistentBands != n) return false
+        if (common.size != n || (left == null) != (right == null)) return false
+        if (common.any { !it.isFinite() || it < DynamicsProcessingProbe.MIN_PROBE_GAIN_DB || it > DynamicsProcessingProbe.MAX_PROBE_GAIN_DB }) return false
+        if (left != null) {
+            val rightCurve = right ?: return false
+            if (left.size != n || rightCurve.size != n) return false
+            if (left.any { !it.isFinite() || it < DynamicsProcessingProbe.MIN_PROBE_GAIN_DB || it > DynamicsProcessingProbe.MAX_PROBE_GAIN_DB } ||
+                rightCurve.any { !it.isFinite() || it < DynamicsProcessingProbe.MIN_PROBE_GAIN_DB || it > DynamicsProcessingProbe.MAX_PROBE_GAIN_DB }) return false
+        }
+        return try {
+            val applied = eq.applyDiagnosticProbe(common, left, right)
+            if (applied) persistentCurveName = "custom"
+            applied
+        } catch (e: Throwable) {
+            Log.e(TAG, "applyPersistentBands failed", e)
+            false
+        }
+    }
 
-    // --- Effect chain diagnostics (matrixing capability check) ---
+    override fun getPersistentProbeCurve(): String? = if (isPersistentProbeActive()) persistentCurveName else null
 
     @Volatile private var effectInventory: List<AudioEffectDiagnostics.EffectInventoryEntry>? = null
     @Volatile private var sessionProbes: List<AudioEffectDiagnostics.SessionProbe>? = null
 
-    /** Runs diagnostics synchronously; called from the mailbox poll thread. */
+    /** Runs diagnostics synchronously; called from the mailbox worker thread. */
     fun runEffectDiagnosticsBlocking(): JSONObject {
         suspendProduction()
         try {
@@ -698,14 +825,10 @@ class SweetSpotService : Service(), ServiceActions {
     override fun getSessionProbes(): List<AudioEffectDiagnostics.SessionProbe> =
         sessionProbes ?: emptyList()
 
-    override fun getPersistentProbeCurveSummary(): DynamicsProcessingProbe.CurveSummary? {
-        val dp = persistentDp ?: return null
-        return try {
-            DynamicsProcessingProbe().readCurveSummary(dp, persistentBands)
-        } catch (_: Throwable) { null }
+    override fun getPersistentProbeCurveSummary(channel: Int): DynamicsProcessingProbe.CurveSummary? {
+        if (!isPersistentProbeActive() || persistentBands != DynamicsProcessingEq.INTERNAL_BANDS) return null
+        return dpEq()?.getDiagnosticProbeCurveSummary(channel)
     }
-
-    // --- Calibration (read-only base curve; wizard/API only) ---
 
     private fun dpEq() = engine as? DynamicsProcessingEq
 
@@ -718,10 +841,12 @@ class SweetSpotService : Service(), ServiceActions {
     override fun isCalibrationActive(): Boolean = dpEq()?.isCalibrationActive() ?: false
     override fun wasLastCalibrationApplySuccessful(): Boolean = dpEq()?.wasLastCalibrationApplySuccessful() ?: false
     override fun getLastCalibrationApplyError(): String? = dpEq()?.getLastCalibrationApplyError()
-    override fun setCalibrationBands(gains: FloatArray): Boolean = dpEq()?.setCalibrationBands(gains) ?: false
+    override fun isCalibrationLiveDspVerified(): Boolean = dpEq()?.isLiveDspVerified() ?: false
+    override fun getCalibrationLiveDspVerificationError(): String? = dpEq()?.getLiveDspVerificationError()
+    override fun setCalibrationBands(gains: FloatArray): Boolean = dpEq()?.applyCalibrationCandidate(gains) ?: false
     private fun setCalibrationBandsByChannel(left: FloatArray, right: FloatArray): Boolean =
         dpEq()?.setCalibrationBandsByChannel(left, right) ?: false
-    override fun resetCalibration(): Boolean { dpEq()?.resetCalibration(); return true }
+    override fun resetCalibration(): Boolean = dpEq()?.resetCalibration() ?: false
 
     /** Release the production engine so a diagnostic DynamicsProcessing can own session 0. */
     private fun suspendProduction() {
@@ -733,18 +858,20 @@ class SweetSpotService : Service(), ServiceActions {
         engine?.initialize()
     }
 
-    private fun applyPresetWithFeedback(preset: Int) {
-        val engine = engine ?: return
-        val eqName = engine.getCapabilities().presets[preset] ?: return
-        engine.applyPreset(preset)
+    private fun applyPresetWithFeedback(preset: Int): Boolean {
+        val engine = engine ?: return false
+        val eqName = engine.getCapabilities().presets[preset] ?: return false
+        if (!engine.applyPreset(preset)) return false
         showEqAppliedToast(eqName)
+        return true
     }
 
-    private fun loadProfileWithFeedback(name: String) {
-        val engine = engine ?: return
-        if (name !in engine.listProfiles()) return
-        engine.loadProfile(name)
+    private fun loadProfileWithFeedback(name: String): Boolean {
+        val engine = engine ?: return false
+        if (name !in engine.listProfiles()) return false
+        if (!engine.loadProfile(name)) return false
         showEqAppliedToast(name)
+        return true
     }
 
     private fun showEqAppliedToast(eqName: String) {
@@ -755,7 +882,7 @@ class SweetSpotService : Service(), ServiceActions {
 
     /**
      * Creates (once) and enables or disables the persistent session-0
-     * Virtualizer at max strength. Called from the mailbox poll thread.
+     * Virtualizer at max strength. Called from the mailbox worker thread.
      */
     private fun setVirtualizer(on: Boolean) {
         try {
@@ -791,6 +918,7 @@ class SweetSpotService : Service(), ServiceActions {
         val channelCount = (dpEq()?.getChannelCount() ?: 1).coerceAtLeast(1)
         val headroomDb = dpEq()?.getInputGainDb() ?: 0f
         val headroomVerified = dpEq()?.isHeadroomVerified() ?: false
+        val calibrationTransaction = dpEq()?.getCalibrationTransaction()
         val userLevels = engine.getBandLevels()
         return JSONObject().apply {
             put("device", JSONObject().apply {
@@ -828,9 +956,14 @@ class SweetSpotService : Service(), ServiceActions {
                     put("independent", false)
                 }
                 put("headroomDb", headroomDb)
+                put("inputAttenuationDb", maxOf(0f, -headroomDb))
                 put("headroomVerified", headroomVerified)
-                put("applicationVerified", dpEq()?.wasLastCalibrationApplySuccessful() ?: false)
-                dpEq()?.getLastCalibrationApplyError()?.let { put("applicationError", it) }
+                val eq = dpEq()
+                val liveDspError = eq?.getLiveDspVerificationError()
+                put("applicationVerified", eq != null && liveDspError == null)
+                put("liveDspStatus", if (eq != null && liveDspError == null) "verified" else "degraded")
+                (liveDspError ?: eq?.getLastCalibrationApplyError())?.let { put("applicationError", it) }
+                put("transaction", calibrationTransactionJson(calibrationTransaction))
             })
             put("profiles", JSONArray(engine.listProfiles().map { name ->
                 JSONObject().put("id", name).put("name", name)
@@ -841,6 +974,7 @@ class SweetSpotService : Service(), ServiceActions {
                 put("userBandCount", caps.bandCount)
                 put("supportsSweep", true)
                 put("supportsIndependentCalibration", independentCalibration)
+                put("supportsCalibratedCorrection", DynamicsProcessingEq.BAND_TRANSFER_CHARACTERIZED)
                 put("supportsHeadroomCompensation", headroomVerified)
                 put("presets", JSONArray(caps.presets.entries.sortedBy { it.key }.map { entry ->
                     JSONObject().put("id", entry.key).put("name", entry.value)
@@ -852,6 +986,23 @@ class SweetSpotService : Service(), ServiceActions {
     private fun serviceActionsIsCalibrationActive(): Boolean = try {
         (engine as? DynamicsProcessingEq)?.isCalibrationActive() ?: false
     } catch (_: Exception) { false }
+
+    private fun calibrationTransactionJson(transaction: CalibrationCandidateTransaction?): JSONObject {
+        if (transaction == null) return JSONObject().put("state", "none")
+        val validationStatus = if (transaction.validationStatus == CalibrationValidationStatus.APPLYING) {
+            "pending"
+        } else {
+            transaction.validationStatus.name.lowercase()
+        }
+        return JSONObject().apply {
+            put("state", "candidate_pending")
+            put("candidateId", transaction.candidateId)
+            put("validationStatus", validationStatus)
+            put("beforeDb", transaction.beforeDb ?: JSONObject.NULL)
+            put("afterDb", transaction.afterDb ?: JSONObject.NULL)
+            put("reason", transaction.reason ?: JSONObject.NULL)
+        }
+    }
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(

@@ -55,15 +55,16 @@ interface ServiceActions {
     fun isPersistentProbeActive(): Boolean
     fun getPersistentProbeBands(): Int
     fun applyPersistentCurve(curve: String): Boolean
+    fun applyPersistentBands(common: FloatArray, left: FloatArray? = null, right: FloatArray? = null): Boolean
     fun getPersistentProbeCurve(): String?
-    fun getPersistentProbeCurveSummary(): DynamicsProcessingProbe.CurveSummary?
+    fun getPersistentProbeCurveSummary(channel: Int = 0): DynamicsProcessingProbe.CurveSummary?
 
     /** Audio effect chain diagnostics (effect inventory + session-0 probes). */
     fun runEffectDiagnostics()
     fun getEffectInventory(): List<AudioEffectDiagnostics.EffectInventoryEntry>
     fun getSessionProbes(): List<AudioEffectDiagnostics.SessionProbe>
 
-    // Calibration (64-band read-only base curve; wizard/API only).
+    /** Calibration is a 64-band read-only base curve managed by the wizard/API. */
     fun getCalibrationBands(): FloatArray?
     fun getRequestedCalibrationBands(): FloatArray?
     fun getEffectiveCalibrationBands(): FloatArray?
@@ -73,6 +74,8 @@ interface ServiceActions {
     fun isCalibrationActive(): Boolean
     fun wasLastCalibrationApplySuccessful(): Boolean
     fun getLastCalibrationApplyError(): String?
+    fun isCalibrationLiveDspVerified(): Boolean
+    fun getCalibrationLiveDspVerificationError(): String?
     fun setCalibrationBands(gains: FloatArray): Boolean
     fun resetCalibration(): Boolean
 }
@@ -82,11 +85,10 @@ class WebServer(
     private val overlay: OverlayController? = null,
     private val serviceActions: ServiceActions? = null,
     private val port: Int = Config.WEB_PORT,
-    private val eqAppliedNotifier: ((String) -> Unit)? = null
+    private val eqAppliedNotifier: ((String) -> Unit)? = null,
+    private val pairCodeProvider: () -> String,
+    private val pairCodeRotateProvider: () -> String,
 ) {
-    /** Providers wired by [SweetSpotService]; nullable for legacy construction. */
-    var pairCodeProvider: (() -> String)? = null
-    var pairCodeRotateProvider: (() -> String)? = null
     companion object {
         private const val TAG = "SweetSpotWeb"
         private const val MAX_REQUEST_LINE_CHARS = 4 * 1024
@@ -96,7 +98,56 @@ class WebServer(
         private const val MAX_REQUEST_BODY_CHARS = 64 * 1024
         private const val HTTP_WORKER_COUNT = 2
         private const val HTTP_QUEUE_CAPACITY = 16
+
+        internal fun rootRedirectResponse(pairCodeProvider: () -> String): HttpResponse =
+            redirectResponse(PairCodeManager.connectUrl(pairCodeProvider()))
+
+        internal fun redirectResponse(location: String): HttpResponse =
+            HttpResponse(
+                statusCode = 302,
+                reasonPhrase = "Found",
+                headers = listOf("Location" to location),
+            )
+
+        internal fun serializeResponse(response: HttpResponse): ByteArray {
+            response.headers.forEach { (name, value) ->
+                require('\r' !in name && '\n' !in name && '\r' !in value && '\n' !in value) {
+                    "HTTP header contains CR or LF"
+                }
+            }
+            response.contentType?.let { contentType ->
+                require('\r' !in contentType && '\n' !in contentType) {
+                    "HTTP header contains CR or LF"
+                }
+            }
+
+            val header = buildString {
+                append("HTTP/1.1 ${response.statusCode} ${response.reasonPhrase}\r\n")
+                response.headers.forEach { (name, value) ->
+                    append("$name: $value\r\n")
+                }
+                response.contentType?.let { append("Content-Type: $it\r\n") }
+                append("Content-Length: ${response.body.size}\r\n")
+                append("Connection: close\r\n")
+                append("Cache-Control: no-store\r\n")
+                append("Access-Control-Allow-Origin: *\r\n")
+                append("\r\n")
+            }.toByteArray(StandardCharsets.UTF_8)
+
+            return ByteArray(header.size + response.body.size).also { bytes ->
+                header.copyInto(bytes)
+                response.body.copyInto(bytes, destinationOffset = header.size)
+            }
+        }
     }
+
+    internal data class HttpResponse(
+        val statusCode: Int,
+        val reasonPhrase: String,
+        val contentType: String? = null,
+        val body: ByteArray = byteArrayOf(),
+        val headers: List<Pair<String, String>> = emptyList(),
+    )
 
     @Volatile
     private var serverSocket: ServerSocket? = null
@@ -152,6 +203,10 @@ class WebServer(
         Log.i(TAG, "Server stopped")
     }
 
+    /**
+     * Handles one request. POST bodies without Content-Length consume only
+     * already-available input so the worker does not block waiting for a body.
+     */
     private fun handle(client: Socket) {
         try {
             client.soTimeout = 5000
@@ -165,7 +220,6 @@ class WebServer(
             val method = parts[0]
             val path = parts[1]
 
-            // Read headers until blank line.
             val headers = mutableMapOf<String, String>()
             var headerChars = 0
             var headerCount = 0
@@ -200,8 +254,6 @@ class WebServer(
                 }
                 body = String(buf, 0, read)
             } else if (method == "POST") {
-                // Fallback: some clients omit Content-Length (e.g. chunked).
-                // Read whatever is immediately available without blocking.
                 val sb = StringBuilder()
                 while (input.ready() && sb.length < MAX_REQUEST_BODY_CHARS) {
                     val ch = input.read()
@@ -246,7 +298,7 @@ class WebServer(
     private fun route(client: Socket, method: String, path: String, body: String) {
         when {
             method == "GET" && path == "/" ->
-                sendJson(client, """{"service":"SweetSpot","type":"api","status":"ok"}""")
+                sendResponse(client, rootRedirectResponse(pairCodeProvider))
 
             method == "GET" && path == "/api/health" ->
                 sendJson(client, """{"ok":true,"service":"SweetSpot","apiVersion":1}""")
@@ -260,9 +312,9 @@ class WebServer(
             method == "POST" && path == "/api/preset" -> {
                 val preset = parseIntField(body, "preset") ?: 1
                 val eqName = engine.getCapabilities().presets[preset]
-                engine.applyPreset(preset)
-                eqName?.let { eqAppliedNotifier?.invoke(it) }
-                sendJson(client, stateJson())
+                val ok = engine.applyPreset(preset)
+                if (ok) eqName?.let { eqAppliedNotifier?.invoke(it) }
+                sendJson(client, stateJson(ok, if (ok) null else "Live DSP rejected preset"))
             }
 
             method == "POST" && path == "/api/saveprofile" -> {
@@ -273,11 +325,11 @@ class WebServer(
 
             method == "POST" && path == "/api/loadprofile" -> {
                 val name = parseStringField(body, "name")
-                if (!name.isNullOrBlank() && name in engine.listProfiles()) {
-                    engine.loadProfile(name)
+                val ok = !name.isNullOrBlank() && name in engine.listProfiles() && engine.loadProfile(name)
+                if (ok) {
                     eqAppliedNotifier?.invoke(name)
                 }
-                sendJson(client, stateJson())
+                sendJson(client, stateJson(ok, if (ok) null else "Live DSP rejected profile load"))
             }
 
             method == "POST" && path == "/api/deleteprofile" -> {
@@ -287,21 +339,35 @@ class WebServer(
             }
 
             method == "POST" && path == "/api/bypass" -> {
-                engine.setEnabled(false)
-                sendJson(client, stateJson())
+                val ok = engine.setEnabled(false)
+                sendJson(client, stateJson(ok, if (ok) null else "Live DSP rejected bypass"))
             }
 
             method == "POST" && path == "/api/enable" -> {
-                engine.setEnabled(true)
-                sendJson(client, stateJson())
+                val ok = engine.setEnabled(true)
+                sendJson(client, stateJson(ok, if (ok) null else "Live DSP rejected enable"))
             }
 
             method == "POST" && path == "/api/bands" -> {
                 val levels = parseIntArrayField(body, "levels")
-                if (levels != null) {
-                    levels.forEachIndexed { i, v -> engine.setBandLevel(i, v) }
+                val capabilities = engine.getCapabilities()
+                val previous = engine.getBandLevels()
+                val previousPreset = engine.getActivePreset()
+                var ok = levels != null && levels.size == capabilities.bandCount
+                var error: String? = if (!ok) "Expected ${capabilities.bandCount} user EQ bands" else null
+                if (ok && levels != null) {
+                    levels.forEachIndexed { i, v ->
+                        if (ok && !engine.setBandLevel(i, v)) {
+                            ok = false
+                            error = "Live DSP rejected user EQ band $i"
+                        }
+                    }
                 }
-                sendJson(client, stateJson())
+                if (!ok) {
+                    previous.forEachIndexed { i, v -> engine.setBandLevel(i, v) }
+                    if (previousPreset > 0) engine.applyPreset(previousPreset)
+                }
+                sendJson(client, stateJson(ok, error))
             }
 
             method == "POST" && path == "/api/showui" -> {
@@ -314,7 +380,6 @@ class WebServer(
                 sendJson(client, stateJson())
             }
 
-            // --- DynamicsProcessing diagnostics (web-driven, no adb needed) ---
             method == "POST" && path == "/api/probe" -> {
                 serviceActions?.runProbe()
                 sendJson(client, """{"status":"started"}""")
@@ -325,8 +390,12 @@ class WebServer(
 
             method == "POST" && path == "/api/probe/persist" -> {
                 val bands = parseIntField(body, "bands") ?: 128
-                serviceActions?.runPersistentProbe(bands)
-                sendJson(client, """{"status":"persistent_started","bands":$bands}""")
+                if (bands != DynamicsProcessingEq.INTERNAL_BANDS) {
+                    sendJson(client, """{"status":"rejected","error":"The diagnostic overlay requires exactly 64 bands","bands":$bands}""")
+                } else {
+                    serviceActions?.runPersistentProbe(bands)
+                    sendJson(client, """{"status":"persistent_started","bands":$bands}""")
+                }
             }
 
             method == "POST" && path == "/api/probe/release" -> {
@@ -347,6 +416,23 @@ class WebServer(
                 sendJson(client, """{"status":"$msg","curve":"$curve"}""")
             }
 
+            method == "POST" && path == "/api/probe/apply-bands" -> {
+                val common = parseFloatArrayField(body, "bandsDb")
+                val left = parseFloatArrayField(body, "leftBandsDb")
+                val right = parseFloatArrayField(body, "rightBandsDb")
+                val ok = common != null && serviceActions?.applyPersistentBands(common, left, right) == true
+                val status = when {
+                    serviceActions?.isPersistentProbeActive() != true -> "no-instance"
+                    ok -> "applied"
+                    else -> "rejected"
+                }
+                sendJson(client, JSONObject().apply {
+                    put("ok", ok)
+                    put("status", status)
+                    put("curve", "custom")
+                }.toString())
+            }
+
             method == "GET" && path == "/api/probe/persistent" ->
                 sendJson(client, persistentStatusJson())
 
@@ -358,39 +444,39 @@ class WebServer(
             method == "GET" && path == "/api/effects/diagnostics" ->
                 sendJson(client, effectDiagnosticsJson())
 
-            // --- Calibration (read-only base curve; wizard/API only) ---
             method == "GET" && path == "/api/eq/calibration" ->
                 sendJson(client, calibrationJson())
 
             method == "POST" && path == "/api/eq/calibration" -> {
                 val gains = parseFloatArrayField(body, "gains")
                 val ok = gains != null && (serviceActions?.setCalibrationBands(gains) ?: false)
-                sendJson(client, if (ok) calibrationJson() else """{"error":"invalid","expected":64}""")
+                val error = if (ok) null else serviceActions?.getLastCalibrationApplyError() ?: "Calibration candidate was rejected"
+                sendJson(client, calibrationJson(ok, error))
             }
 
             method == "POST" && path == "/api/eq/calibration/reset" -> {
-                serviceActions?.resetCalibration()
-                sendJson(client, calibrationJson())
+                val ok = serviceActions?.resetCalibration() ?: false
+                val error = if (ok) null else serviceActions?.getLastCalibrationApplyError() ?: "Calibration reset was rejected"
+                sendJson(client, calibrationJson(ok, error))
             }
 
             method == "GET" && path == "/api/deviceinfo" ->
                 sendJson(client, deviceInfoJson())
 
-            // --- Pairing (relay room code shown in QR + dashboard URL) ---
             method == "GET" && path == "/api/paircode" -> {
-                val code = pairCodeProvider?.invoke() ?: ""
-                sendJson(client, """{"pairCode":"$code","url":"${Config.DASHBOARD_URL}/connect/${PairCodeManager.normalize(code)}"}""")
+                val code = pairCodeProvider()
+                sendJson(client, """{"pairCode":"$code","url":"${PairCodeManager.connectUrl(code)}"}""")
             }
 
             method == "POST" && path == "/api/paircode/rotate" -> {
-                val code = pairCodeRotateProvider?.invoke() ?: ""
+                val code = pairCodeRotateProvider()
                 sendJson(client, """{"pairCode":"$code","rotated":true}""")
             }
 
             else -> sendError(client, 404, "Not Found")
         }
     }
-    private fun stateJson(): String {
+    private fun stateJson(ok: Boolean? = null, error: String? = null): String {
         val caps = engine.getCapabilities()
         val levels = engine.getBandLevels()
         val ip = NetworkUtils.getLanIpAddress() ?: "unknown"
@@ -408,7 +494,9 @@ class WebServer(
         val calJson = if (calBands != null && calFreqs != null) {
             """{"active":$calActive,"bands":[${calBands.joinToString(",")}],"frequenciesHz":[${calFreqs.joinToString(",")}]}"""
         } else "null"
+        val outcome = if (ok == null) "" else "\"ok\":$ok,${if (error == null) "" else "\"error\":${JSONObject.quote(error)},"}"
         return """{
+  $outcome
   "enabled": ${engine.isEnabled()},
   "hasControl": ${engine.hasControl()},
   "activePreset": ${engine.getActivePreset()},
@@ -449,6 +537,7 @@ class WebServer(
             put("results", arr)
             put("highest", highest)
             put("recommended", highest)
+            put("persistent", JSONObject(persistentStatusJson()))
         }.toString()
     }
 
@@ -457,6 +546,8 @@ class WebServer(
         val bands = serviceActions?.getPersistentProbeBands() ?: 0
         val curve = serviceActions?.getPersistentProbeCurve()
         val sum = serviceActions?.getPersistentProbeCurveSummary()
+        val leftSum = serviceActions?.getPersistentProbeCurveSummary(0)
+        val rightSum = serviceActions?.getPersistentProbeCurveSummary(1)
         return JSONObject().apply {
             put("active", active)
             put("bands", bands)
@@ -468,6 +559,16 @@ class WebServer(
                     put("bandsFlat", sum.bandsFlat)
                 })
             }
+            if (leftSum != null) put("leftCurveSummary", JSONObject().apply {
+                put("bandsTotal", leftSum.bandsTotal)
+                put("bandsCut", leftSum.bandsCut)
+                put("bandsFlat", leftSum.bandsFlat)
+            })
+            if (rightSum != null) put("rightCurveSummary", JSONObject().apply {
+                put("bandsTotal", rightSum.bandsTotal)
+                put("bandsCut", rightSum.bandsCut)
+                put("bandsFlat", rightSum.bandsFlat)
+            })
         }.toString()
     }
 
@@ -478,11 +579,11 @@ class WebServer(
         return AudioEffectDiagnostics.payloadJson(inv, probes).put("available", true).toString()
     }
 
+    /** Samples app and audioserver CPU in one approximately 400 ms window. */
     private fun deviceInfoJson(): String {
         val rt = Runtime.getRuntime()
         val memInfo = Debug.MemoryInfo()
         Debug.getMemoryInfo(memInfo)
-        // Sample app + audioserver CPU in a single ~400ms window.
         val appT0 = procCpuTicks()
         val asPid = resolveAudioserverPid()
         val asT0 = asPid?.let { procCpuTicksForPid(it) } ?: 0L
@@ -567,17 +668,21 @@ class WebServer(
     }
 
     private fun sendResponse(client: Socket, code: Int, contentType: String, data: ByteArray) {
-        val out: OutputStream = client.getOutputStream()
         val reason = if (code == 200) "OK" else "Error"
-        val header = "HTTP/1.1 $code $reason\r\n" +
-            "Content-Type: $contentType\r\n" +
-            "Content-Length: ${data.size}\r\n" +
-            "Connection: close\r\n" +
-            "Cache-Control: no-store\r\n" +
-            "Access-Control-Allow-Origin: *\r\n" +
-            "\r\n"
-        out.write(header.toByteArray(StandardCharsets.UTF_8))
-        out.write(data)
+        sendResponse(
+            client,
+            HttpResponse(
+                statusCode = code,
+                reasonPhrase = reason,
+                contentType = contentType,
+                body = data,
+            )
+        )
+    }
+
+    private fun sendResponse(client: Socket, response: HttpResponse) {
+        val out: OutputStream = client.getOutputStream()
+        out.write(serializeResponse(response))
         out.flush()
     }
 
@@ -601,7 +706,7 @@ class WebServer(
         return m.groupValues[1].split(',').mapNotNull { it.trim().toIntOrNull() }.toIntArray()
     }
 
-    private fun calibrationJson(): String {
+    private fun calibrationJson(ok: Boolean? = null, error: String? = null): String {
         val bands = serviceActions?.getCalibrationBands()
         val requestedBands = serviceActions?.getRequestedCalibrationBands()
         val effectiveBands = serviceActions?.getEffectiveCalibrationBands()
@@ -609,13 +714,17 @@ class WebServer(
         val active = serviceActions?.isCalibrationActive() ?: false
         return if (bands != null && freqs != null) {
             JSONObject().apply {
+                if (ok != null) put("ok", ok)
+                if (error != null) put("error", error)
                 put("active", active)
                 put("bands", JSONArray().apply { bands.forEach { put(it) } })
                 put("requestedBands", JSONArray().apply { (requestedBands ?: bands).forEach { put(it) } })
                 put("effectiveBands", JSONArray().apply { (effectiveBands ?: bands).forEach { put(it) } })
                 put("frequenciesHz", JSONArray().apply { freqs.forEach { put(it) } })
-                put("applicationVerified", serviceActions?.wasLastCalibrationApplySuccessful() ?: false)
-                serviceActions?.getLastCalibrationApplyError()?.let { put("applicationError", it) }
+                put("applicationVerified", serviceActions.isCalibrationLiveDspVerified())
+                put("liveDspStatus", if (serviceActions.isCalibrationLiveDspVerified()) "verified" else "degraded")
+                (serviceActions.getCalibrationLiveDspVerificationError()
+                    ?: serviceActions.getLastCalibrationApplyError())?.let { put("applicationError", it) }
             }.toString()
         } else """{"active":false,"bands":[],"frequenciesHz":[]}"""
     }

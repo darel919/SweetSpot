@@ -8,9 +8,13 @@ import android.content.Context
 import android.content.Intent
 import android.media.audiofx.DynamicsProcessing
 import android.os.IBinder
+import android.os.Debug
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -85,7 +89,8 @@ class SweetSpotService : Service(), ServiceActions {
         relay = MailboxClient(
             roomProvider = { pairCodes.current() },
             snapshotProvider = { stateSnapshotJson() },
-            effectsDiagnosticsProvider = { runEffectDiagnosticsBlocking() }
+            effectsDiagnosticsProvider = { runEffectDiagnosticsBlocking() },
+            commandHandler = mailboxCommandHandler()
         ).also { client ->
             client.listener = object : MailboxClient.Listener {
                 override fun onDeviceOnline(online: Boolean) {
@@ -237,6 +242,175 @@ class SweetSpotService : Service(), ServiceActions {
     override fun isPersistentProbeActive(): Boolean = persistentDp != null
     override fun getPersistentProbeBands(): Int = persistentBands
 
+    /**
+     * Dispatches dashboard control commands arriving via the mailbox. Runs on
+     * the mailbox poll thread, so probe work is submitted to [probeExecutor]
+     * and answered with a follow-up probe.status message.
+     */
+    private fun mailboxCommandHandler() = object : MailboxClient.CommandHandler {
+        override fun onCommand(type: String, payload: JSONObject, replyTo: (String, JSONObject) -> Unit) {
+            val engine = this@SweetSpotService.engine
+            when (type) {
+                "engine.enable" -> engine?.setEnabled(true)
+                "engine.bypass" -> engine?.setEnabled(false)
+                "engine.setBands" -> {
+                    val arr = payload.optJSONArray("bandsDb") ?: return
+                    for (i in 0 until minOf(arr.length(), engine?.getCapabilities()?.bandCount ?: 0)) {
+                        engine?.setBandLevel(i, (arr.optDouble(i, Double.NaN) * 100).toInt())
+                    }
+                }
+                "engine.applyPreset" -> engine?.applyPreset(payload.optInt("preset", -1))
+                "profile.save" -> payload.optString("name").takeIf { it.isNotBlank() }?.let { engine?.saveCurrentProfile(it) }
+                "profile.load" -> payload.optString("name").takeIf { it.isNotBlank() }?.let { engine?.loadProfile(it) }
+                "profile.delete" -> payload.optString("name").takeIf { it.isNotBlank() }?.let { engine?.deleteProfile(it) }
+                "calibration.apply" -> {
+                    val arr = payload.optJSONArray("bandsDb")
+                    val ok = if (arr == null) false else setCalibrationBands(
+                        FloatArray(arr.length()) { arr.optDouble(it, 0.0).toFloat() }
+                    )
+                    replyTo("state.snapshot", stateSnapshotJson().put("ok", ok))
+                    return
+                }
+                "calibration.reset" -> resetCalibration()
+                "probe.run" -> {
+                    val bands = payload.optInt("bands", 128)
+                    suspendProduction()
+                    probeExecutor.submit {
+                        try {
+                            probeRunning.set(true)
+                            lastProbeResults = DynamicsProcessingProbe().runFor(bands)
+                        } catch (e: Throwable) {
+                            Log.e(TAG, "Mailbox probe failed", e)
+                        } finally {
+                            probeRunning.set(false)
+                            resumeProduction()
+                        }
+                        postProbeStatus(replyTo)
+                    }
+                    return
+                }
+                "probe.status" -> {
+                    postProbeStatus(replyTo)
+                    return
+                }
+                "probe.persistent.start" -> runPersistentProbe(payload.optInt("bands", 64))
+                "probe.persistent.release" -> releasePersistentProbe()
+                "probe.curve.apply" -> {
+                    val curve = payload.optString("curve", "hollow")
+                    applyPersistentCurve(curve)
+                }
+                "diagnostics.deviceInfo" -> {
+                    replyTo("diagnostics.deviceInfo", deviceInfoJson())
+                    return
+                }
+                else -> {
+                    Log.d(TAG, "mailbox: unknown command $type")
+                    return
+                }
+            }
+            replyTo("state.snapshot", stateSnapshotJson())
+        }
+
+        private fun postProbeStatus(replyTo: (String, JSONObject) -> Unit) {
+            val results = lastProbeResults.orEmpty()
+            var highest = -1
+            val arr = JSONArray()
+            for (r in results) {
+                val pass = r.constructed && r.hasControl && r.enabled && r.actualBands == r.requested
+                if (pass) highest = maxOf(highest, r.requested)
+                arr.put(JSONObject().apply {
+                    put("requested", r.requested)
+                    put("constructed", r.constructed)
+                    put("hasControl", r.hasControl)
+                    put("enabled", r.enabled)
+                    put("actualBands", r.actualBands)
+                    put("pass", pass)
+                    put("exception", r.exception ?: JSONObject.NULL)
+                })
+            }
+            val persistent = if (persistentDp != null) JSONObject().apply {
+                put("active", true)
+                put("bands", persistentBands)
+                put("curve", persistentCurveName ?: JSONObject.NULL)
+                val dp = persistentDp!!
+                val sum = try {
+                    DynamicsProcessingProbe().readCurveSummary(dp, persistentBands)
+                } catch (_: Throwable) { null }
+                if (sum != null) {
+                    put("curveSummary", JSONObject().apply {
+                        put("bandsTotal", sum.bandsTotal)
+                        put("bandsCut", sum.bandsCut)
+                        put("bandsFlat", sum.bandsFlat)
+                    })
+                }
+            } else JSONObject().put("active", false).put("bands", 0)
+            replyTo("probe.status", JSONObject().apply {
+                put("running", probeRunning.get())
+                put("available", lastProbeResults != null)
+                put("results", arr)
+                put("highest", highest)
+                put("recommended", highest)
+                put("persistent", persistent)
+            })
+        }
+    }
+
+    /** Mirrors WebServer.deviceInfoJson; runs on the mailbox poll thread (~400ms sample window). */
+    private fun deviceInfoJson(): JSONObject {
+        val rt = Runtime.getRuntime()
+        val memInfo = Debug.MemoryInfo()
+        Debug.getMemoryInfo(memInfo)
+        val appCpu = cpuPercentFor(android.os.Process.myPid())
+        val asPid = findProcessPid("audioserver") ?: findProcessPid("audioserver64")
+        val asCpu = asPid?.let { cpuPercentFor(it) }
+        return JSONObject().apply {
+            put("javaHeapMax", rt.maxMemory())
+            put("javaHeapTotal", rt.totalMemory())
+            put("javaHeapFree", rt.freeMemory())
+            put("nativeHeapAllocated", Debug.getNativeHeapAllocatedSize())
+            put("nativeHeapSize", Debug.getNativeHeapSize())
+            put("pssTotalKb", memInfo.totalPss)
+            put("privateDirtyKb", memInfo.totalPrivateDirty)
+            put("cpuPercent", appCpu)
+            put("audioserverCpuPercent", asCpu ?: 0.0)
+            put("audioserverPid", asPid ?: JSONObject.NULL)
+            put("persistentProbeActive", persistentDp != null)
+            put("persistentProbeBands", persistentBands)
+        }
+    }
+
+    /** Samples utime+stime over a ~400ms window and returns percent of one core. */
+    private fun cpuPercentFor(pid: Int): Double {
+        fun ticks(): Long = try {
+            val stat = File("/proc/$pid/stat").readText()
+            val parts = stat.substring(stat.lastIndexOf(')') + 1).trim().split("\\s+".toRegex())
+            (parts.getOrNull(12)?.toLongOrNull() ?: 0L) + (parts.getOrNull(13)?.toLongOrNull() ?: 0L)
+        } catch (_: Throwable) { 0L }
+        val t0 = ticks()
+        val start = System.nanoTime()
+        try { Thread.sleep(400) } catch (_: InterruptedException) {}
+        val t1 = ticks()
+        val wallSecs = (System.nanoTime() - start) / 1e9
+        val clk = try {
+            Os.sysconf(OsConstants._SC_CLK_TCK).toDouble()
+        } catch (_: Throwable) { 100.0 }
+        return if (wallSecs > 0) ((t1 - t0) / clk / wallSecs) * 100.0 else 0.0
+    }
+
+    /** Finds a process PID by its comm name via /proc; null when SELinux hides it. */
+    private fun findProcessPid(name: String): Int? = try {
+        File("/proc").list()?.firstOrNull { entry ->
+            val pid = entry.toIntOrNull() ?: return@firstOrNull false
+            try {
+                File("/proc/$pid/stat").readText().let { stat ->
+                    val s = stat.indexOf('(')
+                    val e = stat.lastIndexOf(')')
+                    s in 0 until e && stat.substring(s + 1, e) == name
+                }
+            } catch (_: Throwable) { false }
+        }?.toIntOrNull()
+    } catch (_: Throwable) { null }
+
     override fun applyPersistentCurve(curve: String): Boolean {
         val dp = persistentDp ?: return false
         val n = persistentBands
@@ -364,6 +538,9 @@ class SweetSpotService : Service(), ServiceActions {
                 put("calibrationBandCount", if (calBands.isNotEmpty()) calBands.size else 64)
                 put("userBandCount", caps.bandCount)
                 put("supportsSweep", false)
+                put("presets", JSONArray(caps.presets.entries.sortedBy { it.key }.map { entry ->
+                    JSONObject().put("id", entry.key).put("name", entry.value)
+                }))
             })
         }
     }

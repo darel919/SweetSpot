@@ -66,7 +66,6 @@ class DynamicsProcessingProbe {
         for (n in CANDIDATE_BANDS) {
             results.add(testBandCount(n))
         }
-
         // Only push further if the highest required candidate (64) passed cleanly.
         val sixtyFour = results.find { it.requested == 64 }
         if (sixtyFour != null && sixtyFour.constructed && sixtyFour.actualBands == sixtyFour.requested) {
@@ -99,6 +98,10 @@ class DynamicsProcessingProbe {
         logSummary(results)
         return results
     }
+
+    /** Probes the standard candidate ladder capped at [cap]; used by mailbox-driven probes. */
+    fun runFor(cap: Int): List<ProbeResult> =
+        CANDIDATE_BANDS.filter { it <= cap }.map { testBandCount(it) }
 
     /**
      * Probes a single band count. Always releases the effect in finally.

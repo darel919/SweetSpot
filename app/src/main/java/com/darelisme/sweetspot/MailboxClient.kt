@@ -21,7 +21,15 @@ class MailboxClient(
     private val snapshotProvider: () -> JSONObject,
     /** Runs effect-chain diagnostics on a background thread; called for 'diagnostics.effects'. */
     private val effectsDiagnosticsProvider: (() -> JSONObject)? = null,
+    /** Dispatches control commands; replies are posted back to the room. Nullable = legacy. */
+    private val commandHandler: CommandHandler? = null,
 ) {
+
+    /** Handles dashboard control commands. All methods run on the mailbox poll thread. */
+    interface CommandHandler {
+        /** Handle a non-query command; return true if a state.snapshot should be posted back. */
+        fun onCommand(type: String, payload: JSONObject, replyTo: (String, JSONObject) -> Unit)
+    }
 
     companion object {
         private const val TAG = "SweetSpotMailbox"
@@ -118,7 +126,9 @@ class MailboxClient(
     }
 
     private fun handleCommand(env: JSONObject) {
-        when (env.optString("type")) {
+        val type = env.optString("type")
+        val payload = env.optJSONObject("payload") ?: JSONObject()
+        when (type) {
             "ping" -> postToDevice(env, "pong")
             "state.get" -> postToDevice(env, "state.snapshot", snapshotProvider())
             "diagnostics.effects" -> {
@@ -134,11 +144,28 @@ class MailboxClient(
                     }
                 }
             }
-            else -> Log.d(TAG, "Ignoring command type ${env.optString("type")}")
+            else -> {
+                val handler = commandHandler
+                if (handler != null) {
+                    try {
+                        handler.onCommand(type, payload) { replyType, replyPayload ->
+                            postToDevice(env, replyType, replyPayload)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "command $type failed", e)
+                        postToDevice(
+                            env, "state.snapshot", snapshotProvider(),
+                            JSONObject().put("ok", false).put("error", "${e.javaClass.simpleName}: ${e.message}")
+                        )
+                    }
+                } else {
+                    Log.d(TAG, "Ignoring command type $type")
+                }
+            }
         }
     }
 
-    private fun postToDevice(requestEnv: JSONObject, type: String, payload: JSONObject = JSONObject()) {
+    private fun postToDevice(requestEnv: JSONObject, type: String, payload: JSONObject = JSONObject(), extra: JSONObject? = null) {
         val out = JSONObject().apply {
             put("v", 1)
             put("id", "dev_${System.currentTimeMillis().toString(36)}")
@@ -146,6 +173,9 @@ class MailboxClient(
             put("ts", System.currentTimeMillis())
             put("replyTo", requestEnv.optString("id"))
             put("payload", payload)
+            if (extra != null) {
+                for (key in extra.keys()) payload.put(key, extra.get(key))
+            }
         }
         val room = PairCodeManager.normalize(roomProvider())
         val req = okhttp3.Request.Builder()

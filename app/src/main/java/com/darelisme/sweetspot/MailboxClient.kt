@@ -3,6 +3,7 @@ package com.darelisme.sweetspot
 import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -36,6 +37,7 @@ class MailboxClient(
         private const val DEVICE_TTL_MS = 15_000L
         private const val POLL_WAIT_SECONDS = 9
         private const val ERROR_BACKOFF_MS = 3_000L
+        private const val MAX_COMMAND_RESPONSE_BYTES = 1 * 1024 * 1024
     }
 
     interface Listener {
@@ -82,7 +84,7 @@ class MailboxClient(
 
                 client.newCall(req).execute().use { res ->
                     if (!res.isSuccessful) throw IllegalStateException("HTTP ${res.code}")
-                    val body = res.body?.string() ?: "{}"
+                    val body = readBodyBounded(res.body)
                     val json = JSONObject(body)
                     val commands = json.optJSONArray("commands") ?: JSONArray()
                     for (i in 0 until commands.length()) {
@@ -123,6 +125,39 @@ class MailboxClient(
         client.newCall(req).execute().use { res ->
             if (!res.isSuccessful) throw IllegalStateException("register HTTP ${res.code}")
         }
+    }
+
+    /**
+     * The relay bounds individual envelopes, but a response may contain a
+     * batch. Keep a malformed or unexpectedly large batch from allocating an
+     * unbounded String before it reaches JSONObject.
+     */
+    private fun readBodyBounded(body: okhttp3.ResponseBody?): String {
+        if (body == null) return "{}"
+        val declaredLength = body.contentLength()
+        if (declaredLength > MAX_COMMAND_RESPONSE_BYTES.toLong()) {
+            throw IllegalStateException("Mailbox response exceeds ${MAX_COMMAND_RESPONSE_BYTES} bytes")
+        }
+        val initialCapacity = if (declaredLength >= 0L && declaredLength <= MAX_COMMAND_RESPONSE_BYTES.toLong()) {
+            declaredLength.toInt()
+        } else {
+            8 * 1024
+        }
+        val output = ByteArrayOutputStream(initialCapacity)
+        body.byteStream().use { input ->
+            val buffer = ByteArray(8 * 1024)
+            var total = 0
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                total += read
+                if (total > MAX_COMMAND_RESPONSE_BYTES) {
+                    throw IllegalStateException("Mailbox response exceeds ${MAX_COMMAND_RESPONSE_BYTES} bytes")
+                }
+                output.write(buffer, 0, read)
+            }
+        }
+        return output.toString(Charsets.UTF_8.name())
     }
 
     private fun handleCommand(env: JSONObject) {

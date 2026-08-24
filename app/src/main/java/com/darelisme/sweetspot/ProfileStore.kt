@@ -83,7 +83,7 @@ class ProfileStore(context: Context) {
         }
     }
 
-    // ---- calibration (128-band read-only base curve) ----
+    // ---- calibration (64-band read-only base curve) ----
 
     fun loadCalibration(): FloatArray? {
         val s = prefs.getString(KEY_CALIBRATION, null)
@@ -94,7 +94,33 @@ class ProfileStore(context: Context) {
     }
 
     fun saveCalibration(gains: FloatArray) {
-        prefs.edit().putString(KEY_CALIBRATION, gains.joinToString(",")).apply()
+        prefs.edit()
+            .putString(KEY_CALIBRATION, gains.joinToString(","))
+            .remove(KEY_CALIBRATION_LEFT)
+            .remove(KEY_CALIBRATION_RIGHT)
+            .apply()
+    }
+
+    fun loadCalibrationChannels(): Pair<FloatArray, FloatArray>? {
+        val left = loadCalibrationArray(KEY_CALIBRATION_LEFT)
+        val right = loadCalibrationArray(KEY_CALIBRATION_RIGHT)
+        return if (left != null && right != null) left to right else null
+    }
+
+    fun saveCalibrationChannels(left: FloatArray, right: FloatArray) {
+        prefs.edit()
+            .remove(KEY_CALIBRATION)
+            .putString(KEY_CALIBRATION_LEFT, left.joinToString(","))
+            .putString(KEY_CALIBRATION_RIGHT, right.joinToString(","))
+            .apply()
+    }
+
+    private fun loadCalibrationArray(key: String): FloatArray? {
+        val values = prefs.getString(key, null)
+            ?.split(',')
+            ?.mapNotNull { it.toFloatOrNull() }
+            ?.toFloatArray()
+        return if (values != null && values.size == 64) values else null
     }
 
     private fun profileKey(name: String) = "p_$name"
@@ -110,6 +136,8 @@ class ProfileStore(context: Context) {
         private const val SUFFIX_PRESET = "_p"
         private const val SUFFIX_LEVELS = "_l"
         private const val KEY_CALIBRATION = "calibration"
+        private const val KEY_CALIBRATION_LEFT = "calibration_left"
+        private const val KEY_CALIBRATION_RIGHT = "calibration_right"
     }
 }
 

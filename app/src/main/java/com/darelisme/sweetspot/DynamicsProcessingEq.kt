@@ -8,7 +8,7 @@ import kotlin.math.*
  * Production audio engine: a single [DynamicsProcessing] on session 0 with
  * [INTERNAL_BANDS] pre-EQ bands that combines two layers:
  *
- *  - calibration: a read-only 128-band base curve (dB) set ONLY by the calibrate
+ *  - calibration: a read-only 64-band base curve (dB) set ONLY by the calibrate
  *    wizard (fed by iPhone-mic measurements). Persisted separately.
  *  - user: 24 user-facing bands (dB, exposed in millibels via the [AudioEngine]
  *    contract) that act as macro controls — each internal band takes the gain of
@@ -35,8 +35,13 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         private const val NIGHT_CUT_BANDS = 3
     }
 
+    /** Upper cutoff of each real DynamicsProcessing band, not a PEQ center. */
     private val internalFreqs = FloatArray(INTERNAL_BANDS) { i ->
-        (F_MIN * (F_MAX.toDouble() / F_MIN).pow(i.toDouble() / (INTERNAL_BANDS - 1))).toFloat()
+        (F_MIN * (F_MAX.toDouble() / F_MIN).pow((i + 1).toDouble() / INTERNAL_BANDS)).toFloat()
+    }
+    private val internalCenters = FloatArray(INTERNAL_BANDS) { i ->
+        val lower = if (i == 0) F_MIN.toFloat() else internalFreqs[i - 1]
+        sqrt(lower * internalFreqs[i])
     }
     private val userFreqs = FloatArray(USER_BANDS) { i ->
         (F_MIN * (F_MAX.toDouble() / F_MIN).pow(i.toDouble() / (USER_BANDS - 1))).toFloat()
@@ -45,7 +50,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         var best = 0
         var bestD = Float.MAX_VALUE
         for (u in 0 until USER_BANDS) {
-            val d = abs(internalFreqs[i] - userFreqs[u])
+            val d = abs(internalCenters[i] - userFreqs[u])
             if (d < bestD) { bestD = d; best = u }
         }
         best
@@ -56,7 +61,11 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     @Volatile private var activePreset = PRESET_FLAT
     private var userGains = FloatArray(USER_BANDS)        // dB
     private var calibration = FloatArray(INTERNAL_BANDS)  // dB, read-only base
+    private var calibrationLeft: FloatArray? = null
+    private var calibrationRight: FloatArray? = null
     private var calibrationActive = false
+    private var inputGainDb = 0f
+    private var headroomVerified = false
     private var measurementBypassState: MeasurementAudioState? = null
 
     @Synchronized
@@ -187,13 +196,35 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         IntArray(INTERNAL_BANDS) { internalFreqs[it].roundToInt() }
 
     @Synchronized
+    fun getCalibrationBandsForChannel(channel: Int): FloatArray? = when (channel) {
+        0 -> calibrationLeft?.copyOf()
+        1 -> calibrationRight?.copyOf()
+        else -> null
+    }
+
+    @Synchronized
+    fun supportsIndependentCalibration(): Boolean = (dp?.channelCount ?: 0) >= 2
+
+    @Synchronized
+    fun getChannelCount(): Int = dp?.channelCount ?: 0
+
+    @Synchronized
+    fun getInputGainDb(): Float = inputGainDb
+
+    @Synchronized
+    fun isHeadroomVerified(): Boolean = headroomVerified
+
+    @Synchronized
     fun isCalibrationActive(): Boolean = calibrationActive
 
     @Synchronized
     fun setCalibrationBands(gains: FloatArray): Boolean {
         if (measurementBypassState != null) return false
         if (gains.size != INTERNAL_BANDS) return false
+        if (gains.any { !it.isFinite() }) return false
         for (i in 0 until INTERNAL_BANDS) calibration[i] = gains[i]
+        calibrationLeft = null
+        calibrationRight = null
         calibrationActive = true
         applyAll()
         profileStore.saveCalibration(calibration)
@@ -201,9 +232,26 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     }
 
     @Synchronized
+    fun setCalibrationBandsByChannel(left: FloatArray, right: FloatArray): Boolean {
+        if (measurementBypassState != null) return false
+        if (!supportsIndependentCalibration()) return false
+        if (left.size != INTERNAL_BANDS || right.size != INTERNAL_BANDS) return false
+        if (left.any { !it.isFinite() } || right.any { !it.isFinite() }) return false
+        calibrationLeft = left.copyOf()
+        calibrationRight = right.copyOf()
+        calibration = FloatArray(INTERNAL_BANDS) { (left[it] + right[it]) / 2f }
+        calibrationActive = true
+        applyAll()
+        profileStore.saveCalibrationChannels(left, right)
+        return true
+    }
+
+    @Synchronized
     fun resetCalibration() {
         if (measurementBypassState != null) return
         calibration = FloatArray(INTERNAL_BANDS)
+        calibrationLeft = null
+        calibrationRight = null
         calibrationActive = false
         applyAll()
         profileStore.saveCalibration(calibration)
@@ -214,7 +262,9 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         val existing = measurementBypassState
         if (existing != null) return existing.copy(
             userBandLevelsMillibels = existing.userBandLevelsMillibels.copyOf(),
-            calibrationGainsDb = existing.calibrationGainsDb.copyOf()
+            calibrationGainsDb = existing.calibrationGainsDb.copyOf(),
+            calibrationLeftGainsDb = existing.calibrationLeftGainsDb?.copyOf(),
+            calibrationRightGainsDb = existing.calibrationRightGainsDb?.copyOf(),
         )
 
         val state = MeasurementAudioState(
@@ -222,7 +272,11 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
             activePreset = activePreset,
             userBandLevelsMillibels = getBandLevels(),
             calibrationGainsDb = calibration.copyOf(),
-            calibrationActive = calibrationActive
+            calibrationActive = calibrationActive,
+            calibrationLeftGainsDb = calibrationLeft?.copyOf(),
+            calibrationRightGainsDb = calibrationRight?.copyOf(),
+            inputGainDb = inputGainDb,
+            headroomVerified = headroomVerified,
         )
         measurementBypassState = state
         enabled = true
@@ -247,17 +301,62 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     private fun applyAll() {
         val d = dp ?: return
         val nCh = d.channelCount
+        if (measurementBypassState != null) {
+            setInputGain(d, 0f)
+        } else {
+            setInputGain(d, requiredInputGainDb())
+        }
         for (ch in 0 until nCh) {
+            val channelCalibration = when (ch) {
+                0 -> calibrationLeft ?: calibration
+                1 -> calibrationRight ?: calibration
+                else -> calibration
+            }
             for (i in 0 until INTERNAL_BANDS) {
                 val eff = if (measurementBypassState != null) {
                     0f
                 } else {
-                    calibration[i] + userGains[userBandForInternal[i]]
+                    val requested = channelCalibration[i] + userGains[userBandForInternal[i]]
+                    if (headroomVerified) requested else min(0f, requested)
                 }
                 val band = d.getPreEqBandByChannelIndex(ch, i)
                 band.setGain(eff)
                 d.setPreEqBandByChannelIndex(ch, i, band)
             }
+        }
+    }
+
+    @Synchronized
+    private fun requiredInputGainDb(): Float {
+        var maximum = 0f
+        val channelCount = dp?.channelCount ?: 0
+        for (ch in 0 until maxOf(1, channelCount)) {
+            val channelCalibration = when (ch) {
+                0 -> calibrationLeft ?: calibration
+                1 -> calibrationRight ?: calibration
+                else -> calibration
+            }
+            for (i in 0 until INTERNAL_BANDS) {
+                maximum = max(maximum, channelCalibration[i] + userGains[userBandForInternal[i]])
+            }
+        }
+        return if (maximum > 0f) -(maximum + 0.5f) else 0f
+    }
+
+    private fun setInputGain(d: DynamicsProcessing, requestedDb: Float) {
+        val bounded = requestedDb.coerceIn(-60f, 0f)
+        try {
+            d.setInputGainAllChannelsTo(bounded)
+            val count = d.channelCount
+            val verified = count > 0 && (0 until count).all { channel ->
+                abs(d.getInputGainByChannelIndex(channel) - bounded) <= 0.25f
+            }
+            inputGainDb = if (verified) bounded else 0f
+            headroomVerified = verified
+        } catch (error: Throwable) {
+            inputGainDb = 0f
+            headroomVerified = false
+            Log.w(TAG, "Input headroom gain is not controllable on this device", error)
         }
     }
 
@@ -268,10 +367,16 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         if (state.calibrationGainsDb.size == INTERNAL_BANDS) {
             calibration = state.calibrationGainsDb.copyOf()
         }
+        calibrationLeft = state.calibrationLeftGainsDb?.takeIf { it.size == INTERNAL_BANDS }?.copyOf()
+        calibrationRight = state.calibrationRightGainsDb?.takeIf { it.size == INTERNAL_BANDS }?.copyOf()
         activePreset = state.activePreset
         calibrationActive = state.calibrationActive
         enabled = state.enabled
         applyAll()
+        // The input gain is derived from the restored layers. Keep the saved
+        // diagnostic value as well so a bypass round-trip is exact.
+        inputGainDb = state.inputGainDb
+        headroomVerified = state.headroomVerified
         dp?.enabled = state.enabled
     }
 
@@ -286,7 +391,13 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         enabled = saved.enabled
         dp?.enabled = saved.enabled
         val cal = profileStore.loadCalibration()
-        if (cal != null && cal.size == INTERNAL_BANDS) {
+        val channels = profileStore.loadCalibrationChannels()
+        if (channels != null && channels.first.size == INTERNAL_BANDS && channels.second.size == INTERNAL_BANDS) {
+            calibrationLeft = channels.first.copyOf()
+            calibrationRight = channels.second.copyOf()
+            calibration = FloatArray(INTERNAL_BANDS) { (channels.first[it] + channels.second[it]) / 2f }
+            calibrationActive = true
+        } else if (cal != null && cal.size == INTERNAL_BANDS) {
             for (i in 0 until INTERNAL_BANDS) calibration[i] = cal[i]
             calibrationActive = true
         }

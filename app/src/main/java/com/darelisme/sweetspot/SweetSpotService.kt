@@ -137,6 +137,7 @@ class SweetSpotService : Service(), ServiceActions {
                         overlay?.updateRelayState(
                             if (present) OverlayController.RELAY_CONNECTED else OverlayController.RELAY_WAITING
                         )
+                        measurementController?.clientPresenceChanged(present)
                     }
                 }
             }
@@ -352,9 +353,16 @@ class SweetSpotService : Service(), ServiceActions {
                 "profile.delete" -> payload.optString("name").takeIf { it.isNotBlank() }?.let { engine?.deleteProfile(it) }
                 "calibration.apply" -> {
                     val arr = payload.optJSONArray("bandsDb")
-                    val ok = if (arr == null) false else setCalibrationBands(
-                        FloatArray(arr.length()) { arr.optDouble(it, 0.0).toFloat() }
-                    )
+                    val leftArr = payload.optJSONArray("leftBandsDb")
+                    val rightArr = payload.optJSONArray("rightBandsDb")
+                    val ok = if (leftArr != null && rightArr != null) {
+                        setCalibrationBandsByChannel(
+                            FloatArray(leftArr.length()) { leftArr.optDouble(it, 0.0).toFloat() },
+                            FloatArray(rightArr.length()) { rightArr.optDouble(it, 0.0).toFloat() }
+                        )
+                    } else if (arr != null) {
+                        setCalibrationBands(FloatArray(arr.length()) { arr.optDouble(it, 0.0).toFloat() })
+                    } else false
                     replyTo("state.snapshot", stateSnapshotJson().put("ok", ok))
                     return
                 }
@@ -363,6 +371,7 @@ class SweetSpotService : Service(), ServiceActions {
                     measurementController?.begin(
                         payload.optString("sessionId"),
                         payload.optString("channel", "both"),
+                        payload.optString("phase", "measurement"),
                         null,
                         emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
                     )
@@ -384,17 +393,63 @@ class SweetSpotService : Service(), ServiceActions {
                     )
                     return
                 }
-                "measurement.prepare" -> {
-                    measurementController?.prepare(
+                "calibrationSession.loudness.start" -> {
+                    measurementController?.startLoudness(
                         payload.optString("sessionId"),
                         null,
                         emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
                     )
                     return
                 }
+                "calibrationSession.loudness.stop" -> {
+                    measurementController?.stopLoudness(
+                        payload.optString("sessionId"),
+                        null,
+                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
+                    )
+                    return
+                }
+                "calibrationSession.progress" -> {
+                    measurementController?.updateProgress(
+                        payload.optString("sessionId"),
+                        payload.optString("stage"),
+                        payload.optInt("current", -1),
+                        payload.optInt("total", -1),
+                        payload.optInt("estimatedRemainingSeconds", -1).takeIf { payload.has("estimatedRemainingSeconds") },
+                        payload.optString("message").takeIf { payload.has("message") }
+                    )
+                    return
+                }
+                "measurement.prepare" -> {
+                    val context = MeasurementContext.fromJson(payload.optJSONObject("context"))
+                    if (payload.has("context") && context == null) {
+                        replyTo("measurement.error", JSONObject()
+                            .put("sessionId", payload.optString("sessionId"))
+                            .put("code", "invalid_session")
+                            .put("message", "Invalid measurement context"))
+                        return
+                    }
+                    measurementController?.prepare(
+                        payload.optString("sessionId"),
+                        payload.optString("channel", "both"),
+                        context,
+                        null,
+                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
+                    )
+                    return
+                }
                 "measurement.playSweep" -> {
+                    val context = MeasurementContext.fromJson(payload.optJSONObject("context"))
+                    if (payload.has("context") && context == null) {
+                        replyTo("measurement.error", JSONObject()
+                            .put("sessionId", payload.optString("sessionId"))
+                            .put("code", "invalid_session")
+                            .put("message", "Invalid measurement context"))
+                        return
+                    }
                     measurementController?.playSweep(
                         payload.optString("sessionId"),
+                        context,
                         null,
                         emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
                     )
@@ -405,6 +460,18 @@ class SweetSpotService : Service(), ServiceActions {
                         payload.optString("sessionId"),
                         null,
                         emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
+                    )
+                    return
+                }
+                "measurement.diagnostics" -> {
+                    val context = MeasurementContext.fromJson(payload.optJSONObject("context"))
+                    if (context == null) return
+                    measurementController?.updateDiagnostics(
+                        payload.optString("sessionId"),
+                        context,
+                        payload.optInt("current", -1),
+                        payload.optInt("total", -1),
+                        payload.optJSONObject("diagnostics") ?: return
                     )
                     return
                 }
@@ -624,6 +691,8 @@ class SweetSpotService : Service(), ServiceActions {
     override fun getCalibrationFrequenciesHz(): IntArray? = dpEq()?.getCalibrationFrequenciesHz()
     override fun isCalibrationActive(): Boolean = dpEq()?.isCalibrationActive() ?: false
     override fun setCalibrationBands(gains: FloatArray): Boolean = dpEq()?.setCalibrationBands(gains) ?: false
+    private fun setCalibrationBandsByChannel(left: FloatArray, right: FloatArray): Boolean =
+        dpEq()?.setCalibrationBandsByChannel(left, right) ?: false
     override fun resetCalibration(): Boolean { dpEq()?.resetCalibration(); return true }
 
     /** Release the production engine so a diagnostic DynamicsProcessing can own session 0. */
@@ -685,6 +754,12 @@ class SweetSpotService : Service(), ServiceActions {
         val caps = engine.getCapabilities()
         val calBands = dpEq()?.getCalibrationBands() ?: FloatArray(0)
         val calFreqs = dpEq()?.getCalibrationFrequenciesHz() ?: IntArray(0)
+        val calLeft = dpEq()?.getCalibrationBandsForChannel(0)
+        val calRight = dpEq()?.getCalibrationBandsForChannel(1)
+        val independentCalibration = dpEq()?.supportsIndependentCalibration() ?: false
+        val channelCount = (dpEq()?.getChannelCount() ?: 1).coerceAtLeast(1)
+        val headroomDb = dpEq()?.getInputGainDb() ?: 0f
+        val headroomVerified = dpEq()?.isHeadroomVerified() ?: false
         val userLevels = engine.getBandLevels()
         return JSONObject().apply {
             put("device", JSONObject().apply {
@@ -708,15 +783,26 @@ class SweetSpotService : Service(), ServiceActions {
                 put("active", serviceActionsIsCalibrationActive())
                 put("bandsDb", JSONArray(calBands.toList()))
                 put("frequenciesHz", JSONArray(calFreqs.toList()))
+                if (independentCalibration && calLeft != null && calRight != null) {
+                    put("leftBandsDb", JSONArray(calLeft.toList()))
+                    put("rightBandsDb", JSONArray(calRight.toList()))
+                    put("independent", true)
+                } else {
+                    put("independent", false)
+                }
+                put("headroomDb", headroomDb)
+                put("headroomVerified", headroomVerified)
             })
             put("profiles", JSONArray(engine.listProfiles().map { name ->
                 JSONObject().put("id", name).put("name", name)
             }))
             put("capabilities", JSONObject().apply {
-                put("channels", 2)
+                put("channels", channelCount)
                 put("calibrationBandCount", if (calBands.isNotEmpty()) calBands.size else 64)
                 put("userBandCount", caps.bandCount)
-                put("supportsSweep", false)
+                put("supportsSweep", true)
+                put("supportsIndependentCalibration", independentCalibration)
+                put("supportsHeadroomCompensation", headroomVerified)
                 put("presets", JSONArray(caps.presets.entries.sortedBy { it.key }.map { entry ->
                     JSONObject().put("id", entry.key).put("name", entry.value)
                 }))

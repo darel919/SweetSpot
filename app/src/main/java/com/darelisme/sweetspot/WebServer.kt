@@ -13,7 +13,9 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
 import java.nio.charset.StandardCharsets
-import java.util.concurrent.Executors
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONArray
 import org.json.JSONObject
@@ -81,12 +83,31 @@ class WebServer(
     var pairCodeRotateProvider: (() -> String)? = null
     companion object {
         private const val TAG = "SweetSpotWeb"
+        private const val MAX_REQUEST_LINE_CHARS = 4 * 1024
+        private const val MAX_HEADER_LINE_CHARS = 8 * 1024
+        private const val MAX_HEADER_CHARS = 32 * 1024
+        private const val MAX_HEADER_COUNT = 32
+        private const val MAX_REQUEST_BODY_CHARS = 64 * 1024
+        private const val HTTP_WORKER_COUNT = 2
+        private const val HTTP_QUEUE_CAPACITY = 16
     }
 
     @Volatile
     private var serverSocket: ServerSocket? = null
     private val running = AtomicBoolean(false)
-    private val executor = Executors.newFixedThreadPool(2)
+    /**
+     * Keep local-control bursts from accumulating an unbounded Runnable queue
+     * on the always-running TV service. CallerRunsPolicy applies backpressure
+     * on the accept thread while keeping the request observable to the client.
+     */
+    private val executor = ThreadPoolExecutor(
+        HTTP_WORKER_COUNT,
+        HTTP_WORKER_COUNT,
+        0L,
+        TimeUnit.MILLISECONDS,
+        ArrayBlockingQueue(HTTP_QUEUE_CAPACITY),
+        ThreadPoolExecutor.CallerRunsPolicy()
+    )
     private var acceptThread: Thread? = null
 
     fun start() {
@@ -129,7 +150,7 @@ class WebServer(
         try {
             client.soTimeout = 5000
             val input = BufferedReader(InputStreamReader(client.getInputStream(), StandardCharsets.UTF_8))
-            val requestLine = input.readLine() ?: return
+            val requestLine = readBoundedLine(input, MAX_REQUEST_LINE_CHARS) ?: return
             val parts = requestLine.split(" ")
             if (parts.size < 2) {
                 sendError(client, 400, "Bad Request")
@@ -140,9 +161,16 @@ class WebServer(
 
             // Read headers until blank line.
             val headers = mutableMapOf<String, String>()
+            var headerChars = 0
+            var headerCount = 0
             while (true) {
-                val line = input.readLine() ?: break
+                val line = readBoundedLine(input, MAX_HEADER_LINE_CHARS) ?: break
                 if (line.isEmpty()) break
+                headerCount++
+                headerChars += line.length
+                if (headerCount > MAX_HEADER_COUNT || headerChars > MAX_HEADER_CHARS) {
+                    throw RequestTooLargeException()
+                }
                 val idx = line.indexOf(':')
                 if (idx > 0) {
                     headers[line.substring(0, idx).trim().lowercase()] =
@@ -153,6 +181,10 @@ class WebServer(
             var body = ""
             val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
             if (contentLength > 0 && method == "POST") {
+                if (contentLength > MAX_REQUEST_BODY_CHARS) {
+                    sendError(client, 413, "Request body too large")
+                    return
+                }
                 val buf = CharArray(contentLength)
                 var read = 0
                 while (read < contentLength) {
@@ -165,21 +197,45 @@ class WebServer(
                 // Fallback: some clients omit Content-Length (e.g. chunked).
                 // Read whatever is immediately available without blocking.
                 val sb = StringBuilder()
-                while (input.ready()) {
+                while (input.ready() && sb.length < MAX_REQUEST_BODY_CHARS) {
                     val ch = input.read()
                     if (ch == -1) break
                     sb.append(ch.toChar())
+                }
+                if (sb.length >= MAX_REQUEST_BODY_CHARS) {
+                    sendError(client, 413, "Request body too large")
+                    return
                 }
                 body = sb.toString()
             }
 
             route(client, method, path, body)
+        } catch (_: RequestTooLargeException) {
+            try { sendError(client, 413, "Request headers or body too large") } catch (_: Exception) {}
         } catch (e: Exception) {
             Log.e(TAG, "handle error", e)
         } finally {
             try { client.close() } catch (_: Exception) {}
         }
     }
+
+    private fun readBoundedLine(input: BufferedReader, maxChars: Int): String? {
+        val line = StringBuilder(minOf(maxChars, 128))
+        var sawCharacter = false
+        while (true) {
+            val codePoint = input.read()
+            if (codePoint < 0) return if (sawCharacter) line.toString() else null
+            sawCharacter = true
+            if (codePoint == '\n'.code) {
+                if (line.isNotEmpty() && line.last() == '\r') line.setLength(line.length - 1)
+                return line.toString()
+            }
+            if (line.length >= maxChars) throw RequestTooLargeException()
+            line.append(codePoint.toChar())
+        }
+    }
+
+    private class RequestTooLargeException : RuntimeException()
 
     private fun route(client: Socket, method: String, path: String, body: String) {
         when {

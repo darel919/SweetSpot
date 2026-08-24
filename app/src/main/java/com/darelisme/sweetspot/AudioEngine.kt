@@ -36,7 +36,11 @@ data class MeasurementAudioState(
     val activePreset: Int,
     val userBandLevelsMillibels: IntArray,
     val calibrationGainsDb: FloatArray,
-    val calibrationActive: Boolean
+    val calibrationActive: Boolean,
+    val calibrationLeftGainsDb: FloatArray? = null,
+    val calibrationRightGainsDb: FloatArray? = null,
+    val inputGainDb: Float = 0f,
+    val headroomVerified: Boolean = false,
 )
 
 data class EngineCapabilities(

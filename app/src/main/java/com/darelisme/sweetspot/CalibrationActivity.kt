@@ -54,8 +54,8 @@ class CalibrationActivity : Activity() {
 
         activeActivity = WeakReference(this)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        requestFullscreen(window)
         setContentView(buildContent())
+        requestFullscreen(window)
     }
 
     override fun onResume() {
@@ -105,11 +105,12 @@ class CalibrationActivity : Activity() {
         root.addView(statusView, centeredParams())
 
         val hint = TextView(this).apply {
-            text = "Follow the instructions shown on this TV.\n\n" +
+            text = "The TV shows the current stage and progress.\n\n" +
                 "Hold the iPhone at ear height.\n" +
                 "Point the bottom / USB-C edge toward the center of the speakers.\n" +
                 "Keep the same orientation and do not cover the bottom microphone.\n" +
-                "Do not change TV volume or switch apps."
+                "Set the TV volume when the pink-noise step starts.\n" +
+                "Keep the volume unchanged after you continue."
             textSize = 17f
             setTextColor(0xFFB8B8BC.toInt())
             setPadding(0, 0, 0, 32)

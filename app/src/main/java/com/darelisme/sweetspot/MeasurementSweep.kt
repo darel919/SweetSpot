@@ -25,10 +25,26 @@ data class MeasurementSweep(
 }
 
 object MeasurementSweepGenerator {
-    fun generateStereoPcm(sweep: MeasurementSweep): ShortArray {
+    fun generateStereoPcm(sweep: MeasurementSweep, channel: String = "both"): ShortArray {
+        val output = ShortArray(sweep.totalFrames * 2)
+        writeStereoPcm(sweep, channel, 0, sweep.totalFrames, output)
+        return output
+    }
+
+    fun writeStereoPcm(
+        sweep: MeasurementSweep,
+        channel: String,
+        firstFrame: Int,
+        frameCount: Int,
+        output: ShortArray
+    ) {
         require(sweep.sampleRate > 0)
         require(sweep.startHz > 0f && sweep.endHz > sweep.startHz)
         require(sweep.durationMs > 0)
+        require(channel == "both" || channel == "left" || channel == "right")
+        require(firstFrame in 0..sweep.totalFrames)
+        require(frameCount in 0..(sweep.totalFrames - firstFrame))
+        require(output.size >= frameCount * 2)
 
         val totalFrames = sweep.totalFrames
         val preRollFrames = (sweep.preRollMs * sweep.sampleRate / 1000f).roundToInt()
@@ -37,9 +53,10 @@ object MeasurementSweepGenerator {
         val fadeOutFrames = (sweep.fadeOutMs * sweep.sampleRate / 1000f).roundToInt()
         val amplitude = 10.0.pow(sweep.levelDbfs / 20.0)
         val k = (sweep.durationMs / 1000.0) / ln(sweep.endHz / sweep.startHz)
-        val output = ShortArray(totalFrames * 2)
+        val activeEndFrame = min(totalFrames, preRollFrames + sweepFrames)
+        output.fill(0, 0, frameCount * 2)
 
-        for (frame in 0 until min(totalFrames, preRollFrames + sweepFrames)) {
+        for (frame in firstFrame until min(firstFrame + frameCount, activeEndFrame)) {
             val sweepFrame = frame - preRollFrames
             if (sweepFrame < 0 || sweepFrame >= sweepFrames) continue
 
@@ -56,10 +73,9 @@ object MeasurementSweepGenerator {
                 .roundToInt()
                 .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
                 .toShort()
-            output[frame * 2] = sample
-            output[frame * 2 + 1] = sample
+            val outputFrame = frame - firstFrame
+            output[outputFrame * 2] = if (channel == "right") 0 else sample
+            output[outputFrame * 2 + 1] = if (channel == "left") 0 else sample
         }
-        return output
     }
-
 }

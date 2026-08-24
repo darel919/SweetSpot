@@ -207,7 +207,7 @@ class DynamicsProcessingProbe {
         for (ch in 0..1) {
             for (i in 0 until n) {
                 try {
-                    val freq = F_MIN * (F_MAX / F_MIN).pow(i.toFloat() / (n - 1))
+                    val freq = F_MIN * (F_MAX / F_MIN).pow((i + 1).toFloat() / n)
                     val band = dp.getPreEqBandByChannelIndex(ch, i)
                     band.setGain(gainForFreq(freq))
                     dp.setPreEqBandByChannelIndex(ch, i, band)
@@ -280,7 +280,7 @@ class DynamicsProcessingProbe {
         // Both Eq booleans are true (inUse + enabled); order is irrelevant here.
         val eq = DynamicsProcessing.Eq(true, true, n)
         for (i in 0 until n) {
-            val freq = F_MIN * (F_MAX / F_MIN).pow(i.toFloat() / (n - 1))
+            val freq = F_MIN * (F_MAX / F_MIN).pow((i + 1).toFloat() / n)
             // All gains at 0 dB during the capability probe (engine test, not sound change).
             eq.setBand(i, DynamicsProcessing.EqBand(true, freq, 0f))
         }

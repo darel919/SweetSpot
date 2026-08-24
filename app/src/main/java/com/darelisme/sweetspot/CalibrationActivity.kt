@@ -27,6 +27,17 @@ class CalibrationActivity : Activity() {
             }
         }
 
+        internal fun updateGraph(sessionId: String, response: MeasurementResponse) {
+            activeActivity?.get()?.let { activity ->
+                if (activity.sessionId != sessionId || response.sessionId != sessionId) return
+                activity.runOnUiThread {
+                    if (activity.sessionId == sessionId) {
+                        activity.graphView?.setMeasurementResponse(response)
+                    }
+                }
+            }
+        }
+
         fun finishForSession(sessionId: String) {
             activeActivity?.get()?.let { activity ->
                 if (activity.sessionId != sessionId) return
@@ -40,6 +51,7 @@ class CalibrationActivity : Activity() {
 
     private var sessionId: String = ""
     private var statusView: TextView? = null
+    private var graphView: CalibrationGraphView? = null
     private var expectedClose = false
     private var goneSent = false
     private var readySent = false
@@ -103,6 +115,16 @@ class CalibrationActivity : Activity() {
             setPadding(0, 28, 0, 32)
         }
         root.addView(statusView, centeredParams())
+
+        val graph = CalibrationGraphView(this)
+        graphView = graph
+        root.addView(graph, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            0,
+            1f
+        ).apply {
+            setMargins(0, 0, 0, 24)
+        })
 
         val hint = TextView(this).apply {
             text = "The TV shows the current stage and progress.\n\n" +

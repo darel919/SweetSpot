@@ -420,6 +420,15 @@ class SweetSpotService : Service(), ServiceActions {
                     )
                     return
                 }
+                "measurement.response" -> {
+                    val response = MeasurementResponsePayload.parse(payload)
+                    if (response == null) {
+                        Log.w(TAG, "Rejected invalid measurement.response payload")
+                        return
+                    }
+                    measurementController?.updateResponse(response)
+                    return
+                }
                 "measurement.prepare" -> {
                     val context = MeasurementContext.fromJson(payload.optJSONObject("context"))
                     if (payload.has("context") && context == null) {

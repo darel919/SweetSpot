@@ -7,6 +7,21 @@ import org.junit.Test
 
 class MeasurementSweepTest {
     @Test
+    fun defaultSweepUsesTheCalibrationTimingContract() {
+        val sweep = MeasurementSweep(48_000)
+
+        assertEquals(4_000, sweep.durationMs)
+        assertEquals(500, sweep.preRollMs)
+        assertEquals(1_500, sweep.postRollMs)
+        assertEquals(48_000 * 6, sweep.totalFrames)
+        assertEquals(20f, sweep.startHz, 0f)
+        assertEquals(20_000f, sweep.endHz, 0f)
+        assertEquals(-12f, sweep.levelDbfs, 0f)
+        assertEquals(20, sweep.fadeInMs)
+        assertEquals(20, sweep.fadeOutMs)
+    }
+
+    @Test
     fun defaultSweepHasDeterministicStereoLayoutAndSilence() {
         val sweep = MeasurementSweep(48_000)
         val pcm = MeasurementSweepGenerator.generateStereoPcm(sweep)

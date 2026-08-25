@@ -74,13 +74,11 @@ data class MeasurementContext(
     fun assetPath(): String? = CalibrationPositionAssets.pathFor(positionId)
 
     fun instruction(): String {
-        if (attemptIndex > 0) return retryInstruction()
-        if (phase == "validation") {
-            return "VALIDATION\n" +
-                "Return the iPhone to the ORIGINAL CENTER listening position used at the start.\n" +
-                "Use the same height and orientation as the first measurement."
-        }
+        val normalInstruction = if (attemptIndex > 0) retryInstruction() else normalPositionInstruction()
+        return if (phase == "validation") "VALIDATION\n$normalInstruction" else normalInstruction
+    }
 
+    private fun normalPositionInstruction(): String {
         val horizontalCm = distance(xCm)
         val verticalCm = distance(yCm)
         val depthCm = distance(zCm)
@@ -108,7 +106,7 @@ data class MeasurementContext(
     }
 
     private fun retryInstruction(): String =
-        "RETRY — ${positionTitle()}\n" +
+        "RETRY • ${positionTitle()}\n" +
             "Keep the iPhone at the same ${retryPositionLabel()} position.\n" +
             "Do not move it.\n" +
             "Keep the phone upright and point the bottom edge toward the center of the TV."
@@ -152,7 +150,7 @@ data class MeasurementContext(
 
     fun readyStatus(): String {
         val state = when {
-            phase == "validation" -> "Validation ready. Return to the original center position."
+            phase == "validation" -> "Validation ready. ${positionTitle().lowercase()} requested."
             attemptIndex > 0 -> "Retry ready. Keep the phone here."
             else -> "Position ready. Keep the phone still."
         }

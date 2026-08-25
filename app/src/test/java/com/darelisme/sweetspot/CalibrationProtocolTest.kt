@@ -9,6 +9,9 @@ class CalibrationProtocolTest {
     fun abortRequiresARecognizedCode() {
         assertNull(parseCalibrationSessionAbortValues("session-1", "", null))
         assertNull(parseCalibrationSessionAbortValues("session-1", "unknown_failure", null))
+        listOf("direct_arrival_low_confidence", "impulse_not_found", "response_not_generated").forEach { code ->
+            assertEquals(code, parseCalibrationSessionAbortValues("session-1", code, null)?.code)
+        }
     }
 
     @Test

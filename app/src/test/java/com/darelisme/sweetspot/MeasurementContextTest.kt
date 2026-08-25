@@ -130,11 +130,29 @@ class MeasurementContextTest {
     }
 
     @Test
-    fun validationInstructionNamesTheOriginalCenterListeningPosition() {
-        val validation = context(phase = "validation")
+    fun validationInstructionKeepsTheRequestedPhysicalPosition() {
+        val expected = mapOf(
+            "center" to "normal listening position",
+            "left" to "LEFT",
+            "right" to "RIGHT",
+            "forward" to "TOWARD THE TV",
+            "backward" to "AWAY FROM THE TV",
+        )
 
-        assertEquals(true, validation.instruction().contains("ORIGINAL CENTER"))
-        assertEquals(true, validation.instruction().contains("first measurement"))
+        expected.forEach { (positionId, phrase) ->
+            val validation = context(positionId = positionId, phase = "validation")
+            assertEquals(true, validation.instruction().startsWith("VALIDATION"))
+            assertEquals(true, validation.instruction().contains(phrase))
+        }
+    }
+
+    @Test
+    fun validationRetryKeepsValidationPrefixAndPositionIdentity() {
+        val validation = context(positionId = "right", phase = "validation", attemptIndex = 1)
+
+        assertEquals(true, validation.instruction().startsWith("VALIDATION"))
+        assertEquals(true, validation.instruction().contains("same right-side position"))
+        assertEquals(true, validation.readyStatus().contains("right position"))
     }
 
     @Test

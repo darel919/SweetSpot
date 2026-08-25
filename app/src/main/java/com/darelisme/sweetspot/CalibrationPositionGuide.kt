@@ -96,9 +96,11 @@ internal class CalibrationPositionGuideView(context: Context) : LinearLayout(con
     fun show(measurementContext: MeasurementContext, state: CalibrationGuideState) {
         progressView.text = measurementContext.label()
         titleView.text = when {
-            measurementContext.attemptIndex > 0 -> "RETRY — KEEP THE PHONE HERE"
-            measurementContext.phase == "validation" -> "VALIDATION"
-            state == CalibrationGuideState.MEASURING -> "MEASURING — HOLD STILL"
+            measurementContext.phase == "validation" && measurementContext.attemptIndex > 0 -> "VALIDATION • RETRY • ${measurementContext.positionTitle()}"
+            measurementContext.phase == "validation" && state == CalibrationGuideState.MEASURING -> "VALIDATION • MEASURING • ${measurementContext.positionTitle()}"
+            measurementContext.phase == "validation" -> "VALIDATION • ${measurementContext.positionTitle()}"
+            measurementContext.attemptIndex > 0 -> "RETRY • ${measurementContext.positionTitle()}"
+            state == CalibrationGuideState.MEASURING -> "MEASURING • ${measurementContext.positionTitle()}"
             else -> measurementContext.positionTitle()
         }
         instructionView.text = measurementContext.instruction()

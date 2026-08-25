@@ -13,6 +13,8 @@ data class MeasurementContext(
     val channel: String,
     val takeIndex: Int,
     val takeCount: Int,
+    val attemptIndex: Int,
+    val attemptCount: Int,
     val phase: String
 ) {
     fun isValid(): Boolean =
@@ -21,12 +23,15 @@ data class MeasurementContext(
             positionCount in 1..16 &&
             channel in CHANNELS &&
             takeIndex in 0 until takeCount &&
-            takeCount in 1..8 &&
+            takeCount in 1..3 &&
+            attemptIndex in 0 until attemptCount &&
+            attemptCount in 1..2 &&
             phase in PHASES
 
     fun label(): String =
         "Position ${positionIndex + 1} of $positionCount · ${channelLabel(channel)} · " +
-            "take ${takeIndex + 1} of $takeCount"
+            "Take ${takeIndex + 1} of $takeCount" +
+            if (attemptIndex == 0) "" else " · Retry $attemptIndex of ${attemptCount - 1}"
 
     fun instruction(): String = when (positionId) {
         "center" -> "Hold the iPhone at your normal listening position."
@@ -38,6 +43,15 @@ data class MeasurementContext(
     }
 
     fun requiresRemoteContinue(): Boolean = positionIndex > 0 && takeIndex == 0
+
+    fun sameLogicalTake(other: MeasurementContext?): Boolean = other != null &&
+        positionId == other.positionId &&
+        positionIndex == other.positionIndex &&
+        positionCount == other.positionCount &&
+        channel == other.channel &&
+        takeIndex == other.takeIndex &&
+        takeCount == other.takeCount &&
+        phase == other.phase
 
     fun readyStatus(): String = "${label()}\n${instruction()}\n" + if (!requiresRemoteContinue()) {
         "Keep the same bottom-mic orientation while the TV starts the measurement."
@@ -52,6 +66,8 @@ data class MeasurementContext(
         .put("channel", channel)
         .put("takeIndex", takeIndex)
         .put("takeCount", takeCount)
+        .put("attemptIndex", attemptIndex)
+        .put("attemptCount", attemptCount)
         .put("phase", phase)
 
     companion object {
@@ -68,6 +84,8 @@ data class MeasurementContext(
                 channel = value.optString("channel"),
                 takeIndex = value.optInt("takeIndex", -1),
                 takeCount = value.optInt("takeCount", -1),
+                attemptIndex = value.optInt("attemptIndex", -1),
+                attemptCount = value.optInt("attemptCount", -1),
                 phase = value.optString("phase")
             )
             return context.takeIf { it.isValid() }

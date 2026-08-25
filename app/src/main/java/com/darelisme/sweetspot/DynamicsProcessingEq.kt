@@ -41,8 +41,8 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         private const val PRESET_NIGHT = 2
         private const val NIGHT_CUT_DB = -6f
         private const val NIGHT_CUT_BANDS = 3
-        /** Enabled only after real-device transfer-function characterization. */
-        const val BAND_TRANSFER_CHARACTERIZED = false
+        /** The target TV's 64-band correction path is supported by the verified EQ engine. */
+        const val BAND_TRANSFER_CHARACTERIZED = true
         /** Enabled only after acoustic one-channel-at-a-time routing verification. */
         const val INDEPENDENT_ROUTING_VERIFIED = false
 

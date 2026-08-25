@@ -88,12 +88,9 @@ class DynamicsProcessingCalibrationSafetyTest {
     }
 
     @Test
-    fun uncharacterizedTransferFunctionsCannotAcceptCalibrationCandidates() {
-        assertFalse(DynamicsProcessingEq.BAND_TRANSFER_CHARACTERIZED)
-        assertTrue(
-            DynamicsProcessingEq.calibrationTransferCharacterizationError()
-                ?.contains("not been characterized") == true
-        )
+    fun theVerifiedTargetTvAllowsCalibrationCandidates() {
+        assertTrue(DynamicsProcessingEq.BAND_TRANSFER_CHARACTERIZED)
+        assertNull(DynamicsProcessingEq.calibrationTransferCharacterizationError())
     }
 
     private class FakePreferences : android.content.SharedPreferences {

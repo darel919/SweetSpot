@@ -209,6 +209,7 @@ class MeasurementController(
         var validationRecoveryEventsPublished: Boolean = false,
         var endedEventPublished: Boolean = false,
         var validationAbortError: Pair<String, String>? = null,
+        var cancellationRequested: Boolean = false,
     )
 
     private class PlaybackResources(val track: AudioTrack) {
@@ -229,6 +230,7 @@ class MeasurementController(
 
     @Volatile
     private var activeSession: Session? = null
+    private val sessionFence = MeasurementSessionFence()
     private var state: SessionState = SessionState.Idle
     private var focusRequest: AudioFocusRequest? = null
     @Volatile
@@ -260,7 +262,7 @@ class MeasurementController(
                 emitError(emit, replyTo, sessionId, "invalid_session", "Invalid session, channel, or phase")
                 return@submit
             }
-            if (activeSession != null || state !is SessionState.Idle) {
+            if (activeSession != null || state !is SessionState.Idle || !sessionFence.begin(sessionId)) {
                 emitError(emit, replyTo, sessionId, "already_measuring", "Another calibration session is active")
                 return@submit
             }
@@ -348,8 +350,8 @@ class MeasurementController(
                 when (state) {
                     is SessionState.ValidationFinalized -> closeValidationUi(session)
                     is SessionState.AwaitingValidationFinalization ->
-                        finishWithError(session, "calibration_ui_closed", "Calibration UI closed unexpectedly")
-                    else -> finishWithError(session, "calibration_ui_closed", "Calibration UI closed unexpectedly")
+                        finishCancelled(session, "calibration_ui_closed", "Calibration UI closed unexpectedly")
+                    else -> finishCancelled(session, "calibration_ui_closed", "Calibration UI closed unexpectedly")
                 }
             }
         }
@@ -364,6 +366,7 @@ class MeasurementController(
     ) {
         submit {
             val session = activeSession
+            if (sessionFence.shouldIgnore(sessionId)) return@submit
             if (session == null || session.id != sessionId) {
                 emitError(emit, replyTo, sessionId, "invalid_session", "No matching calibration session")
                 return@submit
@@ -372,11 +375,11 @@ class MeasurementController(
             session.replyTo = replyTo
             when (state) {
                 is SessionState.ValidationFinalized -> closeValidationUi(session)
-                else -> finishWithError(
-                    session,
-                    code,
-                    message ?: defaultCalibrationAbortMessage(code),
-                )
+                else -> if (isUserCalibrationCancellation(code)) {
+                    finishCancelled(session, code, message ?: defaultCalibrationAbortMessage(code))
+                } else {
+                    finishWithError(session, code, message ?: defaultCalibrationAbortMessage(code))
+                }
             }
         }
     }
@@ -387,7 +390,7 @@ class MeasurementController(
                 if (session.id != sessionId) return@let
                 when (state) {
                     is SessionState.ValidationFinalized -> closeValidationUi(session)
-                    else -> finishWithError(session, "calibration_aborted", "Calibration cancelled")
+                    else -> finishCancelled(session, "calibration_aborted", "Calibration cancelled")
                 }
             }
         }
@@ -399,7 +402,7 @@ class MeasurementController(
             activeSession?.let { session ->
                 when (state) {
                     is SessionState.ValidationFinalized -> closeValidationUi(session)
-                    else -> finishWithError(session, "calibration_aborted", "Calibration dashboard disconnected")
+                    else -> finishCancelled(session, "calibration_aborted", "Calibration dashboard disconnected")
                 }
             }
         }
@@ -413,7 +416,7 @@ class MeasurementController(
                 is SessionState.Loudness -> stopLoudnessInternal(session)
                 is SessionState.Ready -> {
                     val context = current.context ?: return@submit
-                    if (!context.requiresRemoteContinue() || session.continuedPositionContext == context) return@submit
+                    if (!context.requiresRemoteContinue() || context.sameLogicalTake(session.continuedPositionContext)) return@submit
                     session.continuedPositionContext = context
                     CalibrationActivity.updatePrimaryAction(session.id, null)
                     session.emit(
@@ -644,6 +647,7 @@ class MeasurementController(
     ) {
         submit {
             val session = activeSession
+            if (sessionFence.shouldIgnore(sessionId)) return@submit
             if (session == null || session.id != sessionId) {
                 emitError(emit, replyTo, sessionId, "invalid_session", "No matching calibration session")
                 return@submit
@@ -660,7 +664,7 @@ class MeasurementController(
                     try {
                         stopAudioTrack()
                         val sweep = prepareSweep(route)
-                        if (context != session.continuedPositionContext) {
+                        if (context == null || !context.sameLogicalTake(session.continuedPositionContext)) {
                             session.continuedPositionContext = null
                         }
                         state = SessionState.Ready(session, sweep, route, context)
@@ -668,7 +672,7 @@ class MeasurementController(
                         CalibrationActivity.updateStatus(sessionId, context?.readyStatus() ?: "TV ready. Follow the instructions shown here.")
                         CalibrationActivity.updatePrimaryAction(
                             sessionId,
-                            context?.takeIf { it.requiresRemoteContinue() && it != session.continuedPositionContext }
+                            context?.takeIf { it.requiresRemoteContinue() && !it.sameLogicalTake(session.continuedPositionContext) }
                                 ?.let { "Continue" },
                         )
                         touchWatchdog()
@@ -677,6 +681,7 @@ class MeasurementController(
                     }
                 }
                 is SessionState.AwaitingUi -> touchWatchdog()
+                is SessionState.Finishing -> Unit
                 else -> emitError(emit, replyTo, sessionId, "invalid_session", "Session is not ready to prepare")
             }
         }
@@ -691,6 +696,7 @@ class MeasurementController(
         submit {
             val current = state
             val session = activeSession
+            if (sessionFence.shouldIgnore(sessionId) || current is SessionState.Finishing) return@submit
             if (session == null || session.id != sessionId || current !is SessionState.Ready) {
                 emitError(emit, replyTo, sessionId, "invalid_session", "Session is not ready for playback")
                 return@submit
@@ -742,7 +748,7 @@ class MeasurementController(
         try {
             executor.execute {
                 try {
-                    activeSession?.let { finishWithError(it, "calibration_aborted", "Service stopped") }
+                    activeSession?.let { finishCancelled(it, "calibration_aborted", "Service stopped") }
                 } finally {
                     stopAudioTrack()
                     done.countDown()
@@ -997,9 +1003,15 @@ class MeasurementController(
         finishSession(session, code to message)
     }
 
+    private fun finishCancelled(session: Session, code: String, message: String) {
+        session.cancellationRequested = true
+        finishSession(session, code to message)
+    }
+
     private fun finishSession(session: Session, error: Pair<String, String>?) {
         if (activeSession !== session) return
         if (state is SessionState.ValidationFinalized) return
+        if (state is SessionState.Finishing) return
 
         if (session.phase == "validation" && session.validationRecoveryResult != null) {
             presentValidationRecovery(session, session.validationAbortError ?: error)
@@ -1077,9 +1089,11 @@ class MeasurementController(
         }
         publishSessionEvents(session, finalError)
         CalibrationActivity.finishForSession(session.id)
+        sessionFence.terminate(session.id)
         activeSession = null
         state = SessionState.Idle
-        Log.i(TAG, "Calibration session ended: ${session.id}, error=${finalError?.first}")
+        val outcome = if (session.cancellationRequested) "cancelled" else "error=${finalError?.first}"
+        Log.i(TAG, "Calibration session ended: ${session.id}, outcome=$outcome")
     }
 
     private fun restoreValidationState(session: Session): Boolean {
@@ -1209,6 +1223,7 @@ class MeasurementController(
         watchdog?.cancel(false)
         watchdog = null
         CalibrationActivity.finishForSession(session.id)
+        sessionFence.terminate(session.id)
         activeSession = null
         state = SessionState.Idle
     }

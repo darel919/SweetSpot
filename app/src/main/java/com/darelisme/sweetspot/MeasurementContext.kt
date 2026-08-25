@@ -4,6 +4,26 @@ import org.json.JSONObject
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
+internal data class MeasurementContextWire(
+    val positionId: String,
+    val positionIndex: Int,
+    val positionCount: Int,
+    val channel: String,
+    val captureKind: String,
+    val repairChannel: String,
+    val attemptIndex: Int,
+    val attemptCount: Int,
+    val phase: String,
+    val geometry: MeasurementGeometry? = null,
+)
+
+internal data class MeasurementGeometry(
+    val reference: String,
+    val xCm: Double,
+    val yCm: Double,
+    val zCm: Double,
+)
+
 /**
  * Identity for one browser-owned acoustic measurement. The TV uses this only
  * to route the sweep and render progress; it never performs DSP policy.
@@ -169,22 +189,64 @@ data class MeasurementContext(
 
         fun fromJson(value: JSONObject?): MeasurementContext? {
             if (value == null) return null
-            val context = MeasurementContext(
-                positionId = value.optString("positionId"),
-                reference = value.optString("reference"),
-                xCm = value.optDouble("xCm", Double.NaN),
-                yCm = value.optDouble("yCm", Double.NaN),
-                zCm = value.optDouble("zCm", Double.NaN),
-                positionIndex = value.optInt("positionIndex", -1),
-                positionCount = value.optInt("positionCount", -1),
-                channel = value.optString("channel"),
-                captureKind = value.optString("captureKind"),
-                repairChannel = value.optString("repairChannel"),
-                attemptIndex = value.optInt("attemptIndex", -1),
-                attemptCount = value.optInt("attemptCount", -1),
-                phase = value.optString("phase")
+            val positionId = value.optString("positionId")
+            if (positionTarget(positionId) == null) return null
+            val geometryFields = listOf("reference", "xCm", "yCm", "zCm")
+            val hasWireGeometry = geometryFields.any(value::has)
+            val hasCompleteWireGeometry = geometryFields.all(value::has)
+            if (hasWireGeometry && !hasCompleteWireGeometry) return null
+            return fromWire(
+                MeasurementContextWire(
+                    positionId = positionId,
+                    positionIndex = value.optInt("positionIndex", -1),
+                    positionCount = value.optInt("positionCount", -1),
+                    channel = value.optString("channel"),
+                    captureKind = value.optString("captureKind"),
+                    repairChannel = value.optString("repairChannel"),
+                    attemptIndex = value.optInt("attemptIndex", -1),
+                    attemptCount = value.optInt("attemptCount", -1),
+                    phase = value.optString("phase"),
+                    geometry = if (hasCompleteWireGeometry) {
+                        MeasurementGeometry(
+                            reference = value.optString("reference"),
+                            xCm = value.optDouble("xCm", Double.NaN),
+                            yCm = value.optDouble("yCm", Double.NaN),
+                            zCm = value.optDouble("zCm", Double.NaN),
+                        )
+                    } else {
+                        null
+                    },
+                ),
             )
-            return context.takeIf { it.isValid() }
+        }
+
+        internal fun fromWire(value: MeasurementContextWire): MeasurementContext? {
+            val target = positionTarget(value.positionId) ?: return null
+            val geometry = value.geometry ?: target
+            return MeasurementContext(
+                positionId = value.positionId,
+                reference = geometry.reference,
+                xCm = geometry.xCm,
+                yCm = geometry.yCm,
+                zCm = geometry.zCm,
+                positionIndex = value.positionIndex,
+                positionCount = value.positionCount,
+                channel = value.channel,
+                captureKind = value.captureKind,
+                repairChannel = value.repairChannel,
+                attemptIndex = value.attemptIndex,
+                attemptCount = value.attemptCount,
+                phase = value.phase,
+            ).takeIf { it.isValid() }
+        }
+
+        private fun positionTarget(positionId: String): MeasurementGeometry? = when (positionId) {
+            "center" -> MeasurementGeometry(REFERENCE_CENTER, 0.0, 0.0, 0.0)
+            "left" -> MeasurementGeometry(REFERENCE_CENTER, -35.0, 0.0, 0.0)
+            "right" -> MeasurementGeometry(REFERENCE_CENTER, 35.0, 0.0, 0.0)
+            "forward" -> MeasurementGeometry(REFERENCE_CENTER, 0.0, 10.0, 35.0)
+            "backward" -> MeasurementGeometry(REFERENCE_CENTER, 0.0, -10.0, -35.0)
+            else -> null
         }
     }
 }

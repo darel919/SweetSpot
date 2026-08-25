@@ -162,4 +162,47 @@ class MeasurementContextTest {
         assertEquals(false, original.copy(reference = "previous").isValid())
         assertEquals(false, original.copy(xCm = 35.0).isValid())
     }
+
+    @Test
+    fun parsesAContextWithoutWireGeometryUsingThePositionIdentity() {
+        val parsed = MeasurementContext.fromWire(
+            MeasurementContextWire(
+                positionId = "center",
+                positionIndex = 0,
+                positionCount = 3,
+                channel = "both",
+                captureKind = "position-composite",
+                repairChannel = "both",
+                attemptIndex = 0,
+                attemptCount = 2,
+                phase = "measurement",
+            ),
+        )
+
+        assertEquals(true, parsed?.isValid())
+        assertEquals("center", parsed?.reference)
+        assertEquals(0.0, parsed?.xCm ?: Double.NaN, 0.0)
+        assertEquals(0.0, parsed?.yCm ?: Double.NaN, 0.0)
+        assertEquals(0.0, parsed?.zCm ?: Double.NaN, 0.0)
+    }
+
+    @Test
+    fun rejectsContradictoryWireGeometry() {
+        val parsed = MeasurementContext.fromWire(
+            MeasurementContextWire(
+                positionId = "center",
+                positionIndex = 0,
+                positionCount = 3,
+                channel = "both",
+                captureKind = "position-composite",
+                repairChannel = "both",
+                attemptIndex = 0,
+                attemptCount = 2,
+                phase = "measurement",
+                geometry = MeasurementGeometry("center", 35.0, 0.0, 0.0),
+            ),
+        )
+
+        assertNull(parsed)
+    }
 }

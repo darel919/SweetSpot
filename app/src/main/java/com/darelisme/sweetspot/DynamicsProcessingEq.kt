@@ -583,7 +583,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     @Synchronized
     internal fun rollbackCalibrationCandidate(candidateId: String): Boolean {
         val transaction = profileStore.loadCalibrationTransaction() ?: return false
-        if (transaction.candidateId != candidateId || transaction.validationStatus == CalibrationValidationStatus.APPLYING) return false
+        if (!canRollbackCalibrationCandidate(transaction, candidateId)) return false
         if (transaction.validationStatus != CalibrationValidationStatus.ROLLING_BACK
             && !profileStore.saveCandidateRollingBack(transaction)
         ) {

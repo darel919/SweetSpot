@@ -8,6 +8,22 @@ import org.junit.Test
 
 class ProfileStoreCalibrationTransactionTest {
     @Test
+    fun rollbackRequiresTheExactCandidateId() {
+        val transaction = CalibrationCandidateTransaction(
+            candidateId = "candidate-rollback",
+            previous = CalibrationCurveState(FloatArray(64), null, null, true),
+            candidate = CalibrationCurveState(FloatArray(64) { 1f }, null, null, true),
+            validationStatus = CalibrationValidationStatus.PENDING,
+            beforeDb = null,
+            afterDb = null,
+            reason = null,
+        )
+
+        assertTrue(canRollbackCalibrationCandidate(transaction, "candidate-rollback"))
+        assertTrue(!canRollbackCalibrationCandidate(transaction, "stale-candidate"))
+    }
+
+    @Test
     fun candidateStateSurvivesApplyingPendingValidationAndClear() {
         val store = ProfileStore(FakePreferences())
         val previous = CalibrationCurveState(FloatArray(64) { -1f }, null, null, true)

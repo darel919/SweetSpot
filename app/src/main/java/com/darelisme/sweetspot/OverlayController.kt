@@ -211,8 +211,8 @@ class OverlayController(private val context: Context) {
         }
         container.addView(status)
 
-        val code = pairCode
-        if (code != null && relayState != RELAY_CONNECTED) {
+        val code = pairCode.orEmpty()
+        if (shouldShowPairingQr(code, relayState)) {
             try {
                 val connectUrl = pairUrl(code)
                 val qr = ImageView(context).apply {

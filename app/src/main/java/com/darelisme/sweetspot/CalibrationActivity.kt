@@ -27,6 +27,18 @@ class CalibrationActivity : Activity() {
             }
         }
 
+        fun updatePrimaryAction(sessionId: String, label: String?) {
+            activeActivity?.get()?.let { activity ->
+                if (activity.sessionId != sessionId) return
+                activity.runOnUiThread {
+                    val button = activity.primaryActionButton ?: return@runOnUiThread
+                    button.text = label.orEmpty()
+                    button.visibility = if (label.isNullOrBlank()) View.GONE else View.VISIBLE
+                    if (!label.isNullOrBlank()) button.requestFocus()
+                }
+            }
+        }
+
         internal fun updateGraph(sessionId: String, response: MeasurementResponse) {
             activeActivity?.get()?.let { activity ->
                 if (activity.sessionId != sessionId || response.sessionId != sessionId) return
@@ -52,6 +64,7 @@ class CalibrationActivity : Activity() {
     private var sessionId: String = ""
     private var statusView: TextView? = null
     private var graphView: CalibrationGraphView? = null
+    private var primaryActionButton: Button? = null
     private var expectedClose = false
     private var goneSent = false
     private var readySent = false
@@ -110,9 +123,10 @@ class CalibrationActivity : Activity() {
 
         statusView = TextView(this).apply {
             text = "Preparing measurement…"
-            textSize = 22f
+            textSize = 25f
             setTextColor(0xFFE8E8EA.toInt())
             setPadding(0, 28, 0, 32)
+            gravity = android.view.Gravity.CENTER
         }
         root.addView(statusView, centeredParams())
 
@@ -127,21 +141,27 @@ class CalibrationActivity : Activity() {
         })
 
         val hint = TextView(this).apply {
-            text = "The TV shows the current stage and progress.\n\n" +
-                "Hold the iPhone at ear height.\n" +
-                "Point the bottom / USB-C edge toward the center of the speakers.\n" +
-                "Keep the same orientation and do not cover the bottom microphone.\n" +
-                "Set the TV volume when the pink-noise step starts.\n" +
-                "Keep the volume unchanged after you continue."
-            textSize = 17f
+            text = "Keep the iPhone at ear height.\n" +
+                "Point the bottom / USB-C edge toward the speakers.\n" +
+                "Keep the same orientation and do not cover the bottom microphone."
+            textSize = 18f
             setTextColor(0xFFB8B8BC.toInt())
             setPadding(0, 0, 0, 32)
             gravity = android.view.Gravity.CENTER
         }
         root.addView(hint, centeredParams())
 
+        primaryActionButton = Button(this).apply {
+            textSize = 20f
+            visibility = View.GONE
+            isFocusable = true
+            setOnClickListener { sendServiceAction(SweetSpotService.ACTION_CALIBRATION_CONTINUE) }
+        }
+        root.addView(primaryActionButton, centeredParams())
+
         val cancel = Button(this).apply {
             text = "Cancel"
+            textSize = 18f
             setOnClickListener { sendServiceAction(SweetSpotService.ACTION_CALIBRATION_CANCEL) }
         }
         root.addView(cancel, centeredParams())

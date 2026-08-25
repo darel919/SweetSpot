@@ -52,3 +52,12 @@ internal data class CalibrationCandidateTransaction(
         candidate = candidate.copyArrays(),
     )
 }
+
+internal fun canRollbackCalibrationCandidate(
+    transaction: CalibrationCandidateTransaction?,
+    candidateId: String,
+): Boolean =
+    candidateId.isNotBlank() &&
+        transaction != null &&
+        transaction.candidateId == candidateId &&
+        transaction.validationStatus != CalibrationValidationStatus.APPLYING

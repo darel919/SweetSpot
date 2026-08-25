@@ -160,6 +160,8 @@ class MeasurementController(
     private val context: Context,
     private val engine: AudioEngine,
     private val rollbackCandidate: (String) -> Boolean = { false },
+    private val stateSnapshotProvider: () -> JSONObject = { JSONObject() },
+    private val finalStateVerifier: () -> Boolean = { true },
 ) {
     companion object {
         private const val TAG = "SweetSpotMeasurement"
@@ -200,6 +202,13 @@ class MeasurementController(
         var continuedPositionContext: MeasurementContext? = null,
         var validationFinalizationBlocked: Boolean = false,
         var validationFatal: Boolean = false,
+        var validationOverrideApplied: Boolean = false,
+        var validationOverrideRestored: Boolean = false,
+        val validationRecoveryGate: ValidationRecoveryGate = ValidationRecoveryGate(),
+        var validationRecoveryResult: ValidationRecoveryResult? = null,
+        var validationRecoveryEventsPublished: Boolean = false,
+        var endedEventPublished: Boolean = false,
+        var validationAbortError: Pair<String, String>? = null,
     )
 
     private class PlaybackResources(val track: AudioTrack) {
@@ -301,7 +310,9 @@ class MeasurementController(
                     engine.beginMeasurementBypass()
                 }
                 bypassState = when (overrideResult) {
-                    is MeasurementAudioOverrideResult.Applied -> overrideResult.previousState
+                    is MeasurementAudioOverrideResult.Applied -> overrideResult.previousState.also {
+                        session.validationOverrideApplied = session.phase == "validation"
+                    }
                     is MeasurementAudioOverrideResult.Failed -> {
                         finishWithError(
                             session,
@@ -337,14 +348,20 @@ class MeasurementController(
                 when (state) {
                     is SessionState.ValidationFinalized -> closeValidationUi(session)
                     is SessionState.AwaitingValidationFinalization ->
-                        abortAwaitingValidation(session, "Calibration UI closed unexpectedly")
+                        finishWithError(session, "calibration_ui_closed", "Calibration UI closed unexpectedly")
                     else -> finishWithError(session, "calibration_ui_closed", "Calibration UI closed unexpectedly")
                 }
             }
         }
     }
 
-    fun cancel(sessionId: String, replyTo: String?, emit: (String, org.json.JSONObject, String?) -> Unit) {
+    fun cancel(
+        sessionId: String,
+        code: String,
+        message: String?,
+        replyTo: String?,
+        emit: (String, org.json.JSONObject, String?) -> Unit,
+    ) {
         submit {
             val session = activeSession
             if (session == null || session.id != sessionId) {
@@ -355,9 +372,11 @@ class MeasurementController(
             session.replyTo = replyTo
             when (state) {
                 is SessionState.ValidationFinalized -> closeValidationUi(session)
-                is SessionState.AwaitingValidationFinalization ->
-                    abortAwaitingValidation(session, "Calibration cancelled")
-                else -> finishWithError(session, "calibration_aborted", "Calibration cancelled")
+                else -> finishWithError(
+                    session,
+                    code,
+                    message ?: defaultCalibrationAbortMessage(code),
+                )
             }
         }
     }
@@ -368,8 +387,6 @@ class MeasurementController(
                 if (session.id != sessionId) return@let
                 when (state) {
                     is SessionState.ValidationFinalized -> closeValidationUi(session)
-                    is SessionState.AwaitingValidationFinalization ->
-                        abortAwaitingValidation(session, "Calibration cancelled")
                     else -> finishWithError(session, "calibration_aborted", "Calibration cancelled")
                 }
             }
@@ -382,8 +399,6 @@ class MeasurementController(
             activeSession?.let { session ->
                 when (state) {
                     is SessionState.ValidationFinalized -> closeValidationUi(session)
-                    is SessionState.AwaitingValidationFinalization ->
-                        abortAwaitingValidation(session, "Calibration dashboard disconnected")
                     else -> finishWithError(session, "calibration_aborted", "Calibration dashboard disconnected")
                 }
             }
@@ -417,27 +432,28 @@ class MeasurementController(
         }
     }
 
-    fun validationFinalized(candidateId: String, outcome: String) {
+    fun validationFinalized(candidateId: String, outcome: String, reason: String? = null) {
         submit {
             val session = activeSession ?: return@submit
             if (session.phase != "validation" || session.candidateId != candidateId ||
                 state !is SessionState.AwaitingValidationFinalization
             ) return@submit
-            if (outcome == "improved" && session.validationFinalizationBlocked) {
+            val abortOutcome = session.validationAbortError?.let { error ->
+                if (isUserCalibrationCancellation(error.first)) "cancelled" else "error"
+            }
+            val finalOutcome = abortOutcome ?: outcome
+            if (finalOutcome == "improved" && session.validationFinalizationBlocked) {
                 showValidationFailure(session, "The TV could not verify restoration before accepting the candidate")
                 return@submit
             }
             state = SessionState.ValidationFinalized(session)
             watchdog?.cancel(false)
             watchdog = null
-            val status = when (outcome) {
-                "improved" -> "Calibration complete — improved.\nThe new calibration is active."
-                "inconclusive" -> "Calibration inconclusive.\nPrevious settings were restored."
-                "worse" -> "Calibration rejected — previous settings restored."
-                "error" -> "Calibration could not be validated.\nPrevious settings were restored."
-                else -> "Calibration complete.\nThe TV confirmed the final state."
-            }
-            CalibrationActivity.updateStatus(session.id, status)
+            val result = calibrationResultText(
+                finalOutcome,
+                if (finalOutcome == "error") session.validationAbortError?.second ?: reason else reason,
+            )
+            CalibrationActivity.updateStatus(session.id, "${result.title}\n${result.body}")
             CalibrationActivity.updatePrimaryAction(session.id, "Done")
         }
     }
@@ -983,58 +999,23 @@ class MeasurementController(
 
     private fun finishSession(session: Session, error: Pair<String, String>?) {
         if (activeSession !== session) return
-        if (state is SessionState.AwaitingValidationFinalization) {
-            showValidationFailure(session, error?.second ?: "Validation finalization timed out")
+        if (state is SessionState.ValidationFinalized) return
+
+        if (session.phase == "validation" && session.validationRecoveryResult != null) {
+            presentValidationRecovery(session, session.validationAbortError ?: error)
             return
         }
-        if (state is SessionState.ValidationFinalized) return
+
+        if (state is SessionState.AwaitingValidationFinalization && error == null) {
+            showValidationFailure(session, "Validation finalization timed out")
+            return
+        }
 
         state = SessionState.Finishing(session)
         var finalError = error
         watchdog?.cancel(false)
         watchdog = null
         stopAudioTrack()
-
-        bypassState?.let { saved ->
-            try {
-                val restored = if (session.phase == "validation") {
-                    engine.endCalibrationValidation(saved)
-                } else {
-                    engine.endMeasurementBypass(saved)
-                }
-                if (!restored) {
-                    finalError = if (finalError == null) {
-                        "dsp_restore_failed" to "The TV could not verify restoration of its previous audio state"
-                    } else {
-                        "dsp_restore_failed" to "The measurement failed and the TV could not verify restoration of its previous audio state"
-                    }
-                }
-            } catch (restoreError: Throwable) {
-                Log.e(TAG, "Failed to restore measurement DSP state", restoreError)
-                finalError = "dsp_restore_failed" to if (finalError == null) {
-                    "The TV could not restore its previous audio state"
-                } else {
-                    "The measurement failed and the TV could not restore its previous audio state"
-                }
-            }
-            bypassState = null
-        }
-
-        if (session.phase == "validation" && error?.first in setOf("calibration_aborted", "calibration_ui_closed")) {
-            // Restore the validation override before rolling back. The saved override state contains
-            // the staged candidate; rolling back first would let this restore reapply that candidate.
-            val rolledBack = try {
-                session.candidateId?.let(rollbackCandidate) == true
-            } catch (rollbackError: Throwable) {
-                Log.e(TAG, "Failed to roll back validation candidate after session error", rollbackError)
-                false
-            }
-            if (!rolledBack) {
-                val existingError = finalError ?: ("candidate_rollback_failed" to "Calibration could not be completed")
-                finalError = existingError.first to
-                    "${existingError.second}. The previous calibration could not be verified after cancellation."
-            }
-        }
 
         focusRequest?.let { request ->
             try {
@@ -1044,58 +1025,169 @@ class MeasurementController(
         }
         focusRequest = null
 
-        val keepValidationUi = session.phase == "validation" &&
-            error?.first !in setOf("calibration_aborted", "calibration_ui_closed")
-        finalError?.let { (code, message) ->
-            session.emit("measurement.error", JSONObjectPayload.error(session.id, code, message), session.replyTo)
-        }
-        session.emit("calibrationSession.ended", JSONObjectPayload.session(session), session.replyTo)
-
-        if (keepValidationUi) {
-            session.validationFinalizationBlocked = finalError != null
-            state = SessionState.AwaitingValidationFinalization(session)
-            if (finalError == null) {
-                CalibrationActivity.updateStatus(
-                    session.id,
-                    "Validation measurements complete.\nWaiting for the TV to confirm the final result.",
+        if (session.phase == "validation") {
+            if (error != null) session.validationAbortError = error
+            val originalError = session.validationAbortError
+            if (error != null) {
+                session.validationRecoveryResult = session.validationRecoveryGate.recover(
+                    candidateId = session.candidateId,
+                    restoreValidationState = { restoreValidationState(session) },
+                    rollbackCandidate = rollbackCandidate,
+                    verifyFinalState = finalStateVerifier,
                 )
-                CalibrationActivity.updatePrimaryAction(session.id, null)
-            } else {
-                showValidationFailure(session, finalError.second)
+                finalError = validationRecoveryError(originalError, session.validationRecoveryResult!!)
+                presentValidationRecovery(session, finalError)
+                return
             }
+
+            val restored = restoreValidationState(session)
+            if (!restored) {
+                val restoreError = "dsp_restore_failed" to
+                    "The TV could not verify restoration of its previous audio state"
+                session.validationAbortError = restoreError
+                session.validationRecoveryResult = session.validationRecoveryGate.recover(
+                    candidateId = session.candidateId,
+                    restoreValidationState = { false },
+                    rollbackCandidate = rollbackCandidate,
+                    verifyFinalState = finalStateVerifier,
+                )
+                finalError = validationRecoveryError(restoreError, session.validationRecoveryResult!!)
+                presentValidationRecovery(session, finalError)
+                return
+            }
+
+            publishSessionEvents(session, null)
+            state = SessionState.AwaitingValidationFinalization(session)
+            CalibrationActivity.updateStatus(
+                session.id,
+                "Validation measurements complete.\nWaiting for the TV to confirm the final result.",
+            )
+            CalibrationActivity.updatePrimaryAction(session.id, null)
             touchWatchdog()
-            Log.i(TAG, "Validation measurements ended: ${session.id}, error=${finalError?.first}")
+            Log.i(TAG, "Validation measurements ended: ${session.id}")
             return
         }
 
+        if (!restoreMeasurementState()) {
+            finalError = if (finalError == null) {
+                "dsp_restore_failed" to "The TV could not verify restoration of its previous audio state"
+            } else {
+                finalError.first to "${finalError.second}. The TV could not verify restoration of its previous audio state."
+            }
+        }
+        publishSessionEvents(session, finalError)
         CalibrationActivity.finishForSession(session.id)
         activeSession = null
         state = SessionState.Idle
         Log.i(TAG, "Calibration session ended: ${session.id}, error=${finalError?.first}")
     }
 
-    private fun abortAwaitingValidation(session: Session, message: String) {
-        val rolledBack = try {
-            session.candidateId?.let(rollbackCandidate) == true
-        } catch (rollbackError: Throwable) {
-            Log.e(TAG, "Failed to roll back validation candidate after cancellation", rollbackError)
+    private fun restoreValidationState(session: Session): Boolean {
+        if (!session.validationOverrideApplied || session.validationOverrideRestored) return true
+        val saved = bypassState ?: return false
+        val restored = try {
+            engine.endCalibrationValidation(saved)
+        } catch (restoreError: Throwable) {
+            Log.e(TAG, "Failed to restore validation DSP state", restoreError)
             false
         }
-        val finalMessage = if (rolledBack) {
-            message
-        } else {
-            "$message. The previous calibration could not be verified after cancellation."
+        bypassState = null
+        if (restored) session.validationOverrideRestored = true
+        return restored
+    }
+
+    private fun restoreMeasurementState(): Boolean {
+        val saved = bypassState ?: return true
+        val restored = try {
+            engine.endMeasurementBypass(saved)
+        } catch (restoreError: Throwable) {
+            Log.e(TAG, "Failed to restore measurement DSP state", restoreError)
+            false
         }
-        session.emit(
-            "measurement.error",
-            JSONObjectPayload.error(
-                session.id,
-                if (rolledBack) "calibration_aborted" else "candidate_rollback_failed",
-                finalMessage,
-            ),
-            session.replyTo,
-        )
-        closeValidationUi(session)
+        bypassState = null
+        return restored
+    }
+
+    private fun validationRecoveryError(
+        originalError: Pair<String, String>?,
+        recovery: ValidationRecoveryResult,
+    ): Pair<String, String>? {
+        if (recovery.finalStateVerified) return originalError
+        val recoveryReason = when {
+            !recovery.validationStateRestored ->
+                "The TV could not verify restoration of its previous audio state"
+            !recovery.candidateRolledBack ->
+                "The previous calibration could not be verified after rollback"
+            else ->
+                "The final calibration state could not be verified"
+        }
+        val code = if (!recovery.validationStateRestored) {
+            "dsp_restore_failed"
+        } else {
+            "candidate_rollback_failed"
+        }
+        val prefix = originalError?.let { "${it.first}: ${it.second}. " }.orEmpty()
+        return code to prefix + recoveryReason
+    }
+
+    private fun presentValidationRecovery(session: Session, finalError: Pair<String, String>?) {
+        if (activeSession !== session) return
+        if (!session.validationRecoveryEventsPublished) {
+            publishStateSnapshot(session)
+            finalError?.let { (code, message) ->
+                session.emit("measurement.error", JSONObjectPayload.error(session.id, code, message), session.replyTo)
+            }
+            publishSessionEnded(session)
+            session.validationRecoveryEventsPublished = true
+        }
+
+        val recovery = session.validationRecoveryResult ?: return
+        if (!recovery.finalStateVerified) {
+            showValidationFailure(session, finalError?.second ?: "Calibration recovery could not be verified")
+            return
+        }
+
+        val original = session.validationAbortError ?: finalError
+        val outcome = if (original != null && isUserCalibrationCancellation(original.first)) {
+            "cancelled"
+        } else {
+            "error"
+        }
+        val result = calibrationResultText(outcome, if (outcome == "error") original?.second else null)
+        session.validationFinalizationBlocked = false
+        session.validationFatal = false
+        state = SessionState.ValidationFinalized(session)
+        watchdog?.cancel(false)
+        watchdog = null
+        CalibrationActivity.updateStatus(session.id, "${result.title}\n${result.body}")
+        CalibrationActivity.updatePrimaryAction(session.id, "Done")
+        Log.i(TAG, "Validation recovery completed: ${session.id}, outcome=$outcome, code=${original?.first}")
+    }
+
+    private fun publishSessionEvents(session: Session, error: Pair<String, String>?) {
+        error?.let { (code, message) ->
+            session.emit("measurement.error", JSONObjectPayload.error(session.id, code, message), session.replyTo)
+        }
+        publishSessionEnded(session)
+    }
+
+    private fun publishSessionEnded(session: Session) {
+        if (session.endedEventPublished) return
+        session.emit("calibrationSession.ended", JSONObjectPayload.session(session), session.replyTo)
+        session.endedEventPublished = true
+    }
+
+    private fun publishStateSnapshot(session: Session) {
+        try {
+            session.emit("state.snapshot", stateSnapshotProvider(), session.replyTo)
+        } catch (error: Throwable) {
+            Log.e(TAG, "Failed to publish final calibration state", error)
+        }
+    }
+
+    private fun defaultCalibrationAbortMessage(code: String): String = when {
+        isUserCalibrationCancellation(code) -> "Calibration cancelled"
+        else -> "Calibration could not be validated"
     }
 
     private fun showValidationFailure(session: Session, message: String) {

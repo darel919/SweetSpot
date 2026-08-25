@@ -110,6 +110,7 @@ class SweetSpotService : Service(), ServiceActions {
 
     private var validationOutcomeCandidateId: String? = null
     private var validationOutcomeStatus: CalibrationValidationStatus? = null
+    private var validationOutcomeReason: String? = null
 
     /** Persistent global-mix Virtualizer for spatial-widening A/B tests. */
     private var persistentVirtualizer: Virtualizer? = null
@@ -172,7 +173,13 @@ class SweetSpotService : Service(), ServiceActions {
                     }
                 }
             }
-            createdMeasurementController = MeasurementController(this, createdEngine, ::rollbackCalibrationCandidate)
+            createdMeasurementController = MeasurementController(
+                this,
+                createdEngine,
+                ::rollbackCalibrationCandidate,
+                ::stateSnapshotJson,
+                ::isCalibrationStateVerified,
+            )
 
             engine = createdEngine
             overlay = createdOverlay
@@ -415,6 +422,7 @@ class SweetSpotService : Service(), ServiceActions {
                 "calibration.applyCandidate" -> {
                     validationOutcomeCandidateId = null
                     validationOutcomeStatus = null
+                    validationOutcomeReason = null
                     val arr = payload.optJSONArray("bandsDb")
                     val leftArr = payload.optJSONArray("leftBandsDb")
                     val rightArr = payload.optJSONArray("rightBandsDb")
@@ -428,6 +436,7 @@ class SweetSpotService : Service(), ServiceActions {
                         common != null && dpEq()?.applyCalibrationCandidate(common) == true
                     }
                     if (!commandOk) commandError = dpEq()?.getLastCalibrationApplyError() ?: "Calibration candidate was rejected"
+                    if (!commandOk) showCalibrationErrorToast(commandError ?: "Calibration candidate was rejected")
                     replyTo("state.snapshot", stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
                     return
                 }
@@ -436,9 +445,10 @@ class SweetSpotService : Service(), ServiceActions {
                     commandOk = candidateId.isNotBlank() && (dpEq()?.acceptCalibrationCandidate(candidateId) == true)
                     if (!commandOk) commandError = "Calibration candidate is not available for acceptance"
                     if (commandOk) {
-                        measurementController?.validationFinalized(candidateId, "improved")
+                        measurementController?.validationFinalized(candidateId, "improved", validationOutcomeReason)
                         validationOutcomeCandidateId = null
                         validationOutcomeStatus = null
+                        validationOutcomeReason = null
                     } else if (candidateId.isNotBlank()) {
                         measurementController?.validationFinalizationFailed(candidateId, commandError ?: "Calibration candidate acceptance failed")
                     }
@@ -453,12 +463,13 @@ class SweetSpotService : Service(), ServiceActions {
                         CalibrationValidationStatus.FAILED -> "error"
                         else -> "inconclusive"
                     }
-                    commandOk = candidateId.isNotBlank() && (dpEq()?.rollbackCalibrationCandidate(candidateId) == true)
+                    commandOk = candidateId.isNotBlank() && rollbackCalibrationCandidate(candidateId)
                     if (!commandOk) commandError = dpEq()?.getLastCalibrationApplyError() ?: "Calibration candidate rollback failed"
                     if (commandOk) {
-                        measurementController?.validationFinalized(candidateId, result)
+                        measurementController?.validationFinalized(candidateId, result, validationOutcomeReason)
                         validationOutcomeCandidateId = null
                         validationOutcomeStatus = null
+                        validationOutcomeReason = null
                     } else if (candidateId.isNotBlank()) {
                         measurementController?.validationFinalizationFailed(candidateId, commandError ?: "Calibration candidate rollback failed")
                     }
@@ -491,6 +502,7 @@ class SweetSpotService : Service(), ServiceActions {
                     if (commandOk && normalized != null) {
                         validationOutcomeCandidateId = candidateId
                         validationOutcomeStatus = normalized.status
+                        validationOutcomeReason = normalized.reason
                     } else if (candidateId.isNotBlank()) {
                         measurementController?.validationFinalizationFailed(candidateId, commandError ?: "Calibration validation result was rejected")
                     }
@@ -501,6 +513,7 @@ class SweetSpotService : Service(), ServiceActions {
                     commandOk = resetCalibration()
                     validationOutcomeCandidateId = null
                     validationOutcomeStatus = null
+                    validationOutcomeReason = null
                 }
                 "calibrationSession.begin" -> {
                     measurementController?.begin(
@@ -522,11 +535,24 @@ class SweetSpotService : Service(), ServiceActions {
                     return
                 }
                 "calibrationSession.abort" -> {
-                    measurementController?.cancel(
-                        payload.optString("sessionId"),
-                        null,
-                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
-                    )
+                    val abort = parseCalibrationSessionAbortPayload(payload)
+                    if (abort == null) {
+                        replyTo(
+                            "measurement.error",
+                            JSONObject()
+                                .put("sessionId", payload.optString("sessionId"))
+                                .put("code", "invalid_session")
+                                .put("message", "calibrationSession.abort requires a valid error code"),
+                        )
+                    } else {
+                        measurementController?.cancel(
+                            sessionId = abort.sessionId,
+                            code = abort.code,
+                            message = abort.message,
+                            replyTo = null,
+                            emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) },
+                        )
+                    }
                     return
                 }
                 "calibrationSession.loudness.start" -> {
@@ -602,9 +628,11 @@ class SweetSpotService : Service(), ServiceActions {
                 }
                 "measurement.abort" -> {
                     measurementController?.cancel(
-                        payload.optString("sessionId"),
-                        null,
-                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
+                        sessionId = payload.optString("sessionId"),
+                        code = "calibration_aborted",
+                        message = "Calibration cancelled",
+                        replyTo = null,
+                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) },
                     )
                     return
                 }
@@ -874,8 +902,16 @@ class SweetSpotService : Service(), ServiceActions {
 
     private fun dpEq() = engine as? DynamicsProcessingEq
 
-    private fun rollbackCalibrationCandidate(candidateId: String): Boolean =
-        dpEq()?.rollbackCalibrationCandidate(candidateId) == true
+    private fun rollbackCalibrationCandidate(candidateId: String): Boolean {
+        val eq = dpEq() ?: return false
+        if (!eq.rollbackCalibrationCandidate(candidateId)) return false
+        return eq.getCalibrationTransaction() == null && eq.isLiveDspVerified()
+    }
+
+    private fun isCalibrationStateVerified(): Boolean {
+        val eq = dpEq() ?: return false
+        return eq.getCalibrationTransaction() == null && eq.isLiveDspVerified()
+    }
 
     override fun getCalibrationBands(): FloatArray? = dpEq()?.getCalibrationBands()
     override fun getRequestedCalibrationBands(): FloatArray? = dpEq()?.getRequestedCalibrationBands()
@@ -922,6 +958,12 @@ class SweetSpotService : Service(), ServiceActions {
     private fun showEqAppliedToast(eqName: String) {
         mainHandler.post {
             Toast.makeText(this, "Sweetspot applied $eqName EQ.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun showCalibrationErrorToast(message: String) {
+        mainHandler.post {
+            Toast.makeText(this, "Calibration could not continue: $message", Toast.LENGTH_LONG).show()
         }
     }
 

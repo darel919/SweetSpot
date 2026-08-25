@@ -93,6 +93,28 @@ class DynamicsProcessingCalibrationSafetyTest {
         assertNull(DynamicsProcessingEq.calibrationTransferCharacterizationError())
     }
 
+    @Test
+    fun onlyPassedOrImportedCandidatesCanBeAcceptedAfterLiveVerification() {
+        val imported = candidateTransaction(CalibrationValidationStatus.IMPORTED)
+        val passed = candidateTransaction(CalibrationValidationStatus.PASSED)
+        val pending = candidateTransaction(CalibrationValidationStatus.PENDING)
+
+        assertTrue(canAcceptCalibrationCandidate(imported, "candidate", liveDspVerified = true))
+        assertTrue(canAcceptCalibrationCandidate(passed, "candidate", liveDspVerified = true))
+        assertFalse(canAcceptCalibrationCandidate(pending, "candidate", liveDspVerified = true))
+        assertFalse(canAcceptCalibrationCandidate(imported, "candidate", liveDspVerified = false))
+    }
+
+    private fun candidateTransaction(status: CalibrationValidationStatus) = CalibrationCandidateTransaction(
+        candidateId = "candidate",
+        previous = CalibrationCurveState(FloatArray(64), null, null, true),
+        candidate = CalibrationCurveState(FloatArray(64) { 1f }, null, null, true),
+        validationStatus = status,
+        beforeDb = null,
+        afterDb = null,
+        reason = null,
+    )
+
     private class FakePreferences : android.content.SharedPreferences {
         private val values = linkedMapOf<String, Any?>()
 

@@ -88,12 +88,11 @@ class ProfileStore private constructor(
 
     fun loadCalibration(): FloatArray? = loadCalibrationArray(KEY_CALIBRATION)
 
-    fun saveCalibration(gains: FloatArray) {
-        prefs.edit().also { editor ->
+    fun saveCalibration(gains: FloatArray): Boolean {
+        return prefs.edit().also { editor ->
             writeActiveCalibration(editor, CalibrationCurveState(gains, null, null, true))
             clearTransaction(editor)
-            editor.apply()
-        }
+        }.commit()
     }
 
     fun loadCalibrationChannels(): Pair<FloatArray, FloatArray>? {
@@ -102,8 +101,8 @@ class ProfileStore private constructor(
         return if (left != null && right != null) left to right else null
     }
 
-    fun saveCalibrationChannels(left: FloatArray, right: FloatArray) {
-        prefs.edit().also { editor ->
+    fun saveCalibrationChannels(left: FloatArray, right: FloatArray): Boolean {
+        return prefs.edit().also { editor ->
             writeActiveCalibration(editor, CalibrationCurveState(
                 common = FloatArray(64) { (left[it] + right[it]) / 2f },
                 left = left,
@@ -111,8 +110,7 @@ class ProfileStore private constructor(
                 active = true,
             ))
             clearTransaction(editor)
-            editor.apply()
-        }
+        }.commit()
     }
 
     fun clearCalibration(): Boolean = prefs.edit().also { editor ->
@@ -134,6 +132,7 @@ class ProfileStore private constructor(
             STATUS_WORSE -> CalibrationValidationStatus.WORSE
             STATUS_INCONCLUSIVE -> CalibrationValidationStatus.INCONCLUSIVE
             STATUS_FAILED -> CalibrationValidationStatus.FAILED
+            STATUS_IMPORTED -> CalibrationValidationStatus.IMPORTED
             else -> return null
         }
         val beforeRaw = prefs.getString(KEY_CANDIDATE_BEFORE_DB, null)
@@ -174,6 +173,11 @@ class ProfileStore private constructor(
     internal fun saveCandidateValidation(transaction: CalibrationCandidateTransaction): Boolean =
         prefs.edit().also { editor ->
             writeTransaction(editor, transaction, statusKey(transaction.validationStatus))
+        }.commit()
+
+    internal fun saveCandidateImported(transaction: CalibrationCandidateTransaction): Boolean =
+        prefs.edit().also { editor ->
+            writeTransaction(editor, transaction.copy(validationStatus = CalibrationValidationStatus.IMPORTED), STATUS_IMPORTED)
         }.commit()
 
     internal fun saveActiveCalibrationAndClearCandidate(curve: CalibrationCurveState): Boolean =
@@ -281,6 +285,7 @@ class ProfileStore private constructor(
         CalibrationValidationStatus.WORSE -> STATUS_WORSE
         CalibrationValidationStatus.INCONCLUSIVE -> STATUS_INCONCLUSIVE
         CalibrationValidationStatus.FAILED -> STATUS_FAILED
+        CalibrationValidationStatus.IMPORTED -> STATUS_IMPORTED
     }
 
     private fun loadCalibrationArray(key: String): FloatArray? {
@@ -324,6 +329,7 @@ class ProfileStore private constructor(
         private const val STATUS_WORSE = "worse"
         private const val STATUS_INCONCLUSIVE = "inconclusive"
         private const val STATUS_FAILED = "failed"
+        private const val STATUS_IMPORTED = "imported"
     }
 }
 

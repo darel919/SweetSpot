@@ -21,6 +21,7 @@ internal enum class CalibrationValidationStatus {
     WORSE,
     INCONCLUSIVE,
     FAILED,
+    IMPORTED,
 }
 
 internal enum class CalibrationRecoveryTarget {
@@ -35,7 +36,8 @@ internal fun CalibrationValidationStatus.recoveryTarget(): CalibrationRecoveryTa
     CalibrationValidationStatus.INCONCLUSIVE,
     CalibrationValidationStatus.FAILED -> CalibrationRecoveryTarget.PREVIOUS
     CalibrationValidationStatus.PENDING,
-    CalibrationValidationStatus.PASSED -> CalibrationRecoveryTarget.CANDIDATE
+    CalibrationValidationStatus.PASSED,
+    CalibrationValidationStatus.IMPORTED -> CalibrationRecoveryTarget.CANDIDATE
 }
 
 internal data class CalibrationCandidateTransaction(
@@ -61,3 +63,15 @@ internal fun canRollbackCalibrationCandidate(
         transaction != null &&
         transaction.candidateId == candidateId &&
         transaction.validationStatus != CalibrationValidationStatus.APPLYING
+
+internal fun canAcceptCalibrationCandidate(
+    transaction: CalibrationCandidateTransaction?,
+    candidateId: String,
+    liveDspVerified: Boolean,
+): Boolean =
+    candidateId.isNotBlank() &&
+        transaction != null &&
+        transaction.candidateId == candidateId &&
+        liveDspVerified &&
+        (transaction.validationStatus == CalibrationValidationStatus.PASSED
+            || transaction.validationStatus == CalibrationValidationStatus.IMPORTED)

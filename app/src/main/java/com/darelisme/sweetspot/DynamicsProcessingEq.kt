@@ -367,6 +367,42 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         IntArray(INTERNAL_BANDS) { internalFreqs[it].roundToInt() }
 
     @Synchronized
+    internal fun exportCalibrationPackage(sourceDevice: CalibrationPackageSourceDevice): CalibrationPackage? {
+        if (!calibrationActive || profileStore.loadCalibrationTransaction() != null || !isLiveDspVerified()) return null
+        val requested = getRequestedCalibrationBands()
+        val effective = getEffectiveCalibrationBands()
+        val frequencies = getCalibrationFrequenciesHz()
+        if (!isValidCalibrationArray(requested) || !isValidCalibrationArray(effective)) return null
+        val requestedLeft = getRequestedCalibrationBandsForChannel(0)
+        val requestedRight = getRequestedCalibrationBandsForChannel(1)
+        val effectiveLeft = getEffectiveCalibrationBandsForChannel(0)
+        val effectiveRight = getEffectiveCalibrationBandsForChannel(1)
+        val independent = supportsIndependentCalibration()
+        val pairedRequested = if (independent && requestedLeft != null && requestedRight != null) {
+            requestedLeft to requestedRight
+        } else {
+            null
+        }
+        val pairedEffective = if (independent && effectiveLeft != null && effectiveRight != null) {
+            effectiveLeft to effectiveRight
+        } else {
+            null
+        }
+        return CalibrationPackage(
+            exportedAt = System.currentTimeMillis().toDouble(),
+            sourceDevice = sourceDevice,
+            active = true,
+            frequenciesHz = frequencies.map(Int::toDouble).toDoubleArray(),
+            bandsDb = requested,
+            leftBandsDb = pairedRequested?.first,
+            rightBandsDb = pairedRequested?.second,
+            effectiveBandsDb = effective,
+            effectiveLeftBandsDb = pairedEffective?.first,
+            effectiveRightBandsDb = pairedEffective?.second,
+        )
+    }
+
+    @Synchronized
     fun getCalibrationBandsForChannel(channel: Int): FloatArray? = when (channel) {
         0 -> effectiveCalibrationLeft?.copyOf()
         1 -> effectiveCalibrationRight?.copyOf()
@@ -570,10 +606,47 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     }
 
     @Synchronized
+    internal fun applyImportedCalibrationCandidate(packageValue: CalibrationPackage): Boolean {
+        if (!packageValue.active) {
+            recordCalibrationFailure("Inactive calibration packages cannot be imported")
+            return false
+        }
+        if (!applyCalibrationCandidate(packageValue.bandsDb, packageValue.leftBandsDb, packageValue.rightBandsDb)) {
+            return false
+        }
+        val transaction = profileStore.loadCalibrationTransaction()
+        if (transaction == null || transaction.validationStatus != CalibrationValidationStatus.PENDING) {
+            recordCalibrationFailure("Imported calibration candidate was not persisted")
+            return false
+        }
+        val imported = transaction.copy(
+            validationStatus = CalibrationValidationStatus.IMPORTED,
+            reason = "Imported calibration was applied and verified on the TV",
+        )
+        if (profileStore.saveCandidateImported(imported)) return true
+
+        val rolledBack = rollbackCalibrationCandidate(transaction.candidateId)
+        recordCalibrationFailure(
+            if (rolledBack) {
+                "Imported calibration could not be persisted and was rolled back"
+            } else {
+                "Imported calibration could not be persisted and rollback could not be verified"
+            },
+        )
+        return false
+    }
+
+    @Synchronized
     internal fun acceptCalibrationCandidate(candidateId: String): Boolean {
         val transaction = profileStore.loadCalibrationTransaction() ?: return false
-        if (transaction.candidateId != candidateId || transaction.validationStatus != CalibrationValidationStatus.PASSED) return false
-        if (!isLiveDspVerified()) {
+        if (transaction.candidateId != candidateId
+            || (transaction.validationStatus != CalibrationValidationStatus.PASSED
+                && transaction.validationStatus != CalibrationValidationStatus.IMPORTED)
+        ) {
+            recordCalibrationFailure("Calibration candidate is not ready for acceptance")
+            return false
+        }
+        if (!canAcceptCalibrationCandidate(transaction, candidateId, isLiveDspVerified())) {
             recordCalibrationFailure("Calibration candidate cannot be accepted while live DSP readback is degraded")
             return false
         }
@@ -670,8 +743,10 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         if (!applyAll(trackCalibrationStatus = true)) {
             return rollbackCalibration(previous)
         }
-        profileStore.saveCalibration(calibration)
-        return true
+        if (profileStore.saveCalibration(calibration)) return true
+        rollbackCalibration(previous)
+        recordCalibrationFailure("Calibration was applied but could not be saved on the TV")
+        return false
     }
 
     @Synchronized
@@ -697,8 +772,10 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         if (!applyAll(trackCalibrationStatus = true)) {
             return rollbackCalibration(previous)
         }
-        profileStore.saveCalibrationChannels(leftCopy, rightCopy)
-        return true
+        if (profileStore.saveCalibrationChannels(leftCopy, rightCopy)) return true
+        rollbackCalibration(previous)
+        recordCalibrationFailure("Channel calibration was applied but could not be saved on the TV")
+        return false
     }
 
     @Synchronized

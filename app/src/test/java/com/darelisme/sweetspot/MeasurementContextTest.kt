@@ -4,69 +4,84 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class MeasurementContextTest {
-    @Test
-    fun parsesAndLabelsAValidRoutedTake() {
-        val context = MeasurementContext("right", 2, 5, "left", 1, 3, 0, 2, "measurement")
+    private fun context(
+        positionId: String = "center",
+        positionIndex: Int = 0,
+        positionCount: Int = 3,
+        repairChannel: String = "both",
+        attemptIndex: Int = 0,
+        attemptCount: Int = 2,
+    ) = MeasurementContext(
+        positionId = positionId,
+        positionIndex = positionIndex,
+        positionCount = positionCount,
+        channel = "both",
+        captureKind = "position-composite",
+        repairChannel = repairChannel,
+        attemptIndex = attemptIndex,
+        attemptCount = attemptCount,
+        phase = "measurement",
+    )
 
-        assertEquals(true, context.isValid())
-        assertEquals("Position 3 of 5 · left channel · Take 2 of 3", context.label())
+    @Test
+    fun parsesAndLabelsAValidCompositePosition() {
+        val value = context(positionId = "right", positionIndex = 2, positionCount = 5, repairChannel = "right")
+
+        assertEquals(true, value.isValid())
+        assertEquals("Position 3 of 5", value.label())
     }
 
     @Test
     fun rejectsOutOfRangeContext() {
-        val context = MeasurementContext("center", 5, 5, "right", 0, 3, 0, 2, "measurement")
-
-        assertEquals(false, context.isValid())
+        assertEquals(false, context(positionIndex = 5, positionCount = 5).isValid())
     }
 
     @Test
     fun readyStatusKeepsInstructionsOnTheTv() {
-        val context = MeasurementContext("left", 1, 3, "both", 0, 2, 0, 2, "measurement")
+        val value = context(positionId = "left", positionIndex = 1)
 
         assertEquals(
-            "Position 2 of 3 · both channels · Take 1 of 2\n" +
-                "Move the iPhone about 20 cm left.\n" +
-                "Keep the same bottom-mic orientation, then press Continue on the TV.",
-            context.readyStatus(),
+            "Position 2 of 3\n" +
+                "Move the iPhone about 30–40 cm left. Keep the bottom edge pointed toward the center of the TV.\n" +
+                "Keep this orientation, then press Continue on the TV.",
+            value.readyStatus(),
         )
     }
 
     @Test
     fun centerReadyStatusDoesNotAskForASecondConfirmation() {
-        val context = MeasurementContext("center", 0, 3, "both", 0, 2, 0, 2, "measurement")
+        val value = context()
 
-        assertEquals(true, context.readyStatus().contains("while the TV starts the measurement"))
-        assertEquals(false, context.readyStatus().contains("Continue"))
+        assertEquals(true, value.readyStatus().contains("while the TV starts the measurement"))
+        assertEquals(false, value.readyStatus().contains("Continue"))
     }
 
     @Test
-    fun repeatedTakeAtTheSamePositionDoesNotAskForRemoteConfirmation() {
-        val context = MeasurementContext("left", 1, 3, "both", 1, 2, 0, 2, "measurement")
+    fun channelRepairAtTheSamePositionDoesNotAskForRemoteConfirmation() {
+        val value = context(positionId = "left", positionIndex = 1, repairChannel = "right")
 
-        assertEquals(false, context.requiresRemoteContinue())
-        assertEquals(false, context.readyStatus().contains("Continue"))
+        assertEquals(false, value.requiresRemoteContinue())
+        assertEquals(false, value.readyStatus().contains("Continue"))
     }
 
     @Test
-    fun retryOfTheSameLogicalTakeKeepsRemotePositionConfirmation() {
-        val original = MeasurementContext("left", 1, 3, "both", 0, 2, 0, 2, "measurement")
-        val retry = MeasurementContext("left", 1, 3, "both", 0, 2, 1, 2, "measurement")
+    fun retryOfTheSameCaptureHasTheSamePositionButASeparateOperationIdentity() {
+        val original = context(positionId = "left", positionIndex = 1)
+        val retry = context(positionId = "left", positionIndex = 1, attemptIndex = 1)
 
-        assertEquals(true, retry.sameLogicalTake(original))
-    }
-
-    @Test
-    fun labelsAReplayAsASeparateRetryWithoutChangingTheLogicalTake() {
-        val context = MeasurementContext("center", 0, 1, "left", 0, 2, 1, 2, "measurement")
-
-        assertEquals("Position 1 of 1 · left channel · Take 1 of 2 · Retry 1 of 1", context.label())
-        assertEquals(true, context.isValid())
+        assertEquals(false, retry.sameCapture(original))
+        assertEquals(original.positionId, retry.positionId)
     }
 
     @Test
     fun rejectsAttemptsBeyondTheSingleRetryBound() {
-        assertEquals(false, MeasurementContext("center", 0, 1, "left", 0, 2, 2, 2, "measurement").isValid())
-        assertEquals(false, MeasurementContext("center", 0, 1, "left", 0, 2, 0, 3, "measurement").isValid())
-        assertEquals(false, MeasurementContext("center", 0, 1, "left", 0, 4, 0, 2, "measurement").isValid())
+        assertEquals(false, context(attemptIndex = 2).isValid())
+        assertEquals(false, context(attemptCount = 3).isValid())
+        assertEquals(false, context(repairChannel = "single").isValid())
+    }
+
+    @Test
+    fun rejectsAChannelSpecificWireRouteForACompositeCapture() {
+        assertEquals(false, context().copy(channel = "left").isValid())
     }
 }

@@ -440,6 +440,57 @@ class SweetSpotService : Service(), ServiceActions {
                     replyTo("state.snapshot", stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
                     return
                 }
+                "calibration.export" -> {
+                    val target = dpEq()
+                    val packageValue = target?.exportCalibrationPackage(
+                        CalibrationPackageSourceDevice(
+                            id = DeviceIdentity.get(this@SweetSpotService),
+                            name = DeviceIdentity.getName(this@SweetSpotService),
+                            appVersion = "0.1.0",
+                        ),
+                    )
+                    commandOk = packageValue != null
+                    if (packageValue != null) {
+                        replyTo("calibration.exported", CalibrationPackageCodec.serialize(packageValue))
+                        return
+                    }
+                    commandError = target?.getLastCalibrationApplyError()
+                        ?: target?.getLiveDspVerificationError()
+                        ?: "No verified active calibration is available"
+                    replyTo("state.snapshot", stateSnapshotJson().put("ok", false).put("error", commandError))
+                    return
+                }
+                "calibration.import" -> {
+                    val target = dpEq()
+                    val expectedFrequencies = target?.getCalibrationFrequenciesHz() ?: IntArray(0)
+                    val parsed = if (target == null) {
+                        CalibrationPackageParseResult.Rejected("The TV audio engine is unavailable")
+                    } else {
+                        CalibrationPackageCodec.parseForImport(
+                            payload = payload,
+                            expectedFrequenciesHz = expectedFrequencies,
+                            independentRoutingVerified = target.supportsIndependentCalibration(),
+                        )
+                    }
+                    when (parsed) {
+                        is CalibrationPackageParseResult.Accepted -> {
+                            commandOk = target?.applyImportedCalibrationCandidate(parsed.value) == true
+                            if (!commandOk) {
+                                commandError = target?.getLastCalibrationApplyError()
+                                    ?: "Imported calibration was rejected"
+                            }
+                        }
+                        is CalibrationPackageParseResult.Rejected -> {
+                            commandOk = false
+                            commandError = parsed.error
+                        }
+                    }
+                    if (!commandOk) showCalibrationErrorToast(commandError ?: "Imported calibration was rejected")
+                    replyTo("state.snapshot", stateSnapshotJson().put("ok", commandOk).apply {
+                        commandError?.let { put("error", it) }
+                    })
+                    return
+                }
                 "calibration.acceptCandidate" -> {
                     val candidateId = payload.optString("candidateId")
                     commandOk = candidateId.isNotBlank() && (dpEq()?.acceptCalibrationCandidate(candidateId) == true)

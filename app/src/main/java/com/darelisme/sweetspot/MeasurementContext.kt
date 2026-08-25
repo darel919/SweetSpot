@@ -11,8 +11,8 @@ data class MeasurementContext(
     val positionIndex: Int,
     val positionCount: Int,
     val channel: String,
-    val takeIndex: Int,
-    val takeCount: Int,
+    val captureKind: String,
+    val repairChannel: String,
     val attemptIndex: Int,
     val attemptCount: Int,
     val phase: String
@@ -21,42 +21,42 @@ data class MeasurementContext(
         positionId in POSITION_IDS &&
             positionIndex in 0 until positionCount &&
             positionCount in 1..16 &&
-            channel in CHANNELS &&
-            takeIndex in 0 until takeCount &&
-            takeCount in 1..3 &&
+            channel == COMPOSITE_CHANNEL &&
+            captureKind == CAPTURE_KIND &&
+            repairChannel in CHANNELS &&
             attemptIndex in 0 until attemptCount &&
             attemptCount in 1..2 &&
             phase in PHASES
 
     fun label(): String =
-        "Position ${positionIndex + 1} of $positionCount · ${channelLabel(channel)} · " +
-            "Take ${takeIndex + 1} of $takeCount" +
-            if (attemptIndex == 0) "" else " · Retry $attemptIndex of ${attemptCount - 1}"
+        "Position ${positionIndex + 1} of $positionCount"
 
     fun instruction(): String = when (positionId) {
-        "center" -> "Hold the iPhone at your normal listening position."
-        "left" -> "Move the iPhone about 20 cm left."
-        "right" -> "Move the iPhone about 20 cm right."
-        "forward" -> "Move the iPhone about 20 cm forward and slightly up."
-        "backward" -> "Move the iPhone about 20 cm backward and slightly down."
+        "center" -> "Hold the iPhone upright at your normal listening position. Point the bottom edge toward the center of the TV."
+        "left" -> "Move the iPhone about 30–40 cm left. Keep the bottom edge pointed toward the center of the TV."
+        "right" -> "Move the iPhone about 30–40 cm right. Keep the bottom edge pointed toward the center of the TV."
+        "forward" -> "Move the iPhone about 30–40 cm forward and slightly up. Keep the bottom edge pointed toward the center of the TV."
+        "backward" -> "Move the iPhone about 30–40 cm backward and slightly down. Keep the bottom edge pointed toward the center of the TV."
         else -> "Hold the iPhone at the instructed position."
     }
 
-    fun requiresRemoteContinue(): Boolean = positionIndex > 0 && takeIndex == 0
+    fun requiresRemoteContinue(): Boolean = positionIndex > 0 && attemptIndex == 0 && repairChannel == "both"
 
-    fun sameLogicalTake(other: MeasurementContext?): Boolean = other != null &&
+    fun sameCapture(other: MeasurementContext?): Boolean = other != null &&
         positionId == other.positionId &&
         positionIndex == other.positionIndex &&
         positionCount == other.positionCount &&
         channel == other.channel &&
-        takeIndex == other.takeIndex &&
-        takeCount == other.takeCount &&
+        captureKind == other.captureKind &&
+        repairChannel == other.repairChannel &&
+        attemptIndex == other.attemptIndex &&
+        attemptCount == other.attemptCount &&
         phase == other.phase
 
     fun readyStatus(): String = "${label()}\n${instruction()}\n" + if (!requiresRemoteContinue()) {
-        "Keep the same bottom-mic orientation while the TV starts the measurement."
+        "Keep this orientation while the TV starts the measurement."
     } else {
-        "Keep the same bottom-mic orientation, then press Continue on the TV."
+        "Keep this orientation, then press Continue on the TV."
     }
 
     fun toJson(): JSONObject = JSONObject()
@@ -64,8 +64,8 @@ data class MeasurementContext(
         .put("positionIndex", positionIndex)
         .put("positionCount", positionCount)
         .put("channel", channel)
-        .put("takeIndex", takeIndex)
-        .put("takeCount", takeCount)
+        .put("captureKind", captureKind)
+        .put("repairChannel", repairChannel)
         .put("attemptIndex", attemptIndex)
         .put("attemptCount", attemptCount)
         .put("phase", phase)
@@ -74,6 +74,8 @@ data class MeasurementContext(
         private val POSITION_IDS = setOf("center", "left", "right", "forward", "backward")
         private val CHANNELS = setOf("both", "left", "right")
         private val PHASES = setOf("measurement", "validation")
+        private const val CAPTURE_KIND = "position-composite"
+        private const val COMPOSITE_CHANNEL = "both"
 
         fun fromJson(value: JSONObject?): MeasurementContext? {
             if (value == null) return null
@@ -82,19 +84,13 @@ data class MeasurementContext(
                 positionIndex = value.optInt("positionIndex", -1),
                 positionCount = value.optInt("positionCount", -1),
                 channel = value.optString("channel"),
-                takeIndex = value.optInt("takeIndex", -1),
-                takeCount = value.optInt("takeCount", -1),
+                captureKind = value.optString("captureKind"),
+                repairChannel = value.optString("repairChannel"),
                 attemptIndex = value.optInt("attemptIndex", -1),
                 attemptCount = value.optInt("attemptCount", -1),
                 phase = value.optString("phase")
             )
             return context.takeIf { it.isValid() }
-        }
-
-        private fun channelLabel(channel: String): String = when (channel) {
-            "left" -> "left channel"
-            "right" -> "right channel"
-            else -> "both channels"
         }
     }
 }

@@ -236,6 +236,7 @@ class MeasurementController(
     @Volatile
     private var playbackResources: PlaybackResources? = null
     private val playbackLock = Any()
+    private var preparedSweep: MeasurementSweep? = null
     private var bypassState: MeasurementAudioState? = null
     private var watchdog: ScheduledFuture<*>? = null
     @Volatile
@@ -416,7 +417,7 @@ class MeasurementController(
                 is SessionState.Loudness -> stopLoudnessInternal(session)
                 is SessionState.Ready -> {
                     val context = current.context ?: return@submit
-                    if (!context.requiresRemoteContinue() || context.sameLogicalTake(session.continuedPositionContext)) return@submit
+                    if (!context.requiresRemoteContinue() || context.sameCapture(session.continuedPositionContext)) return@submit
                     session.continuedPositionContext = context
                     CalibrationActivity.updatePrimaryAction(session.id, null)
                     session.emit(
@@ -662,9 +663,8 @@ class MeasurementController(
                         return@submit
                     }
                     try {
-                        stopAudioTrack()
                         val sweep = prepareSweep(route)
-                        if (context == null || !context.sameLogicalTake(session.continuedPositionContext)) {
+                        if (context == null || !context.sameCapture(session.continuedPositionContext)) {
                             session.continuedPositionContext = null
                         }
                         state = SessionState.Ready(session, sweep, route, context)
@@ -672,7 +672,7 @@ class MeasurementController(
                         CalibrationActivity.updateStatus(sessionId, context?.readyStatus() ?: "TV ready. Follow the instructions shown here.")
                         CalibrationActivity.updatePrimaryAction(
                             sessionId,
-                            context?.takeIf { it.requiresRemoteContinue() && !it.sameLogicalTake(session.continuedPositionContext) }
+                            context?.takeIf { it.requiresRemoteContinue() && !it.sameCapture(session.continuedPositionContext) }
                                 ?.let { "Continue" },
                         )
                         touchWatchdog()
@@ -720,13 +720,16 @@ class MeasurementController(
             try {
                 playTrack(playback)
                 val playbackContext = context ?: current.context
+                val playbackChannel = playbackContext?.repairChannel
+                    ?.takeUnless { it == "both" }
+                    ?: current.channel
                 state = SessionState.Playing(session, current.sweep, current.channel, playbackContext)
                 CalibrationActivity.updatePrimaryAction(sessionId, null)
                 emit("measurement.started", JSONObjectPayload.started(session, current.sweep, playbackContext), replyTo)
                 CalibrationActivity.updateStatus(sessionId, playbackContext?.let { "${it.label()}\nPlaying measurement sweep…" } ?: "Playing measurement sweep…")
                 touchWatchdog()
                 Thread {
-                    playSweep(session, current.sweep, current.channel, playbackContext, playback)
+                    playSweep(session, current.sweep, playbackChannel, playbackContext, playback)
                 }.apply {
                     name = "sweetspot-sweep-playback"
                     isDaemon = true
@@ -798,7 +801,7 @@ class MeasurementController(
                     playbackResources !== playback ||
                     playback.stopped
                 ) return@submit
-                stopAudioTrack()
+                pauseAudioTrack()
                 state = SessionState.Ready(session, sweep, channel, context)
                 touchWatchdog()
                 session.emit("measurement.finished", JSONObjectPayload.finished(session, context), session.replyTo)
@@ -878,6 +881,9 @@ class MeasurementController(
     }
 
     private fun prepareSweep(channel: String): MeasurementSweep {
+        preparedSweep?.let { sweep ->
+            if (playbackResources != null) return sweep
+        }
         val nativeRate = AudioTrack.getNativeOutputSampleRate(AudioManager.STREAM_MUSIC)
         val candidateRates = listOf(48_000, nativeRate).filter { it > 0 }.distinct()
         var lastError: Throwable? = null
@@ -911,6 +917,7 @@ class MeasurementController(
                 }
                 installPlaybackResources(candidate)
                 track = null
+                preparedSweep = sweep
                 Log.i(TAG, "AudioTrack prepared: rate=${candidate.sampleRate}, buffer=$minBuffer, frames=${sweep.totalFrames}")
                 return sweep
             } catch (error: Throwable) {
@@ -1232,6 +1239,7 @@ class MeasurementController(
         val resources = synchronized(playbackLock) {
             val current = playbackResources
             playbackResources = null
+            preparedSweep = null
             current?.stopped = true
             current
         } ?: return
@@ -1239,6 +1247,17 @@ class MeasurementController(
             try { resources.track.stop() } catch (_: Throwable) {}
             try { resources.track.flush() } catch (_: Throwable) {}
             try { resources.track.release() } catch (_: Throwable) {}
+        }
+    }
+
+    /** Stop and rewind the persistent measurement track without releasing it. */
+    private fun pauseAudioTrack() {
+        val resources = playbackResources ?: return
+        synchronized(resources) {
+            resources.stopped = true
+            try { resources.track.stop() } catch (_: Throwable) {}
+            try { resources.track.flush() } catch (_: Throwable) {}
+            resources.stopped = false
         }
     }
 
@@ -1337,8 +1356,13 @@ class MeasurementController(
                 .put("syncMarkerEndHz", sweep.syncMarkerEndHz)
                 .put("syncMarkerDurationMs", sweep.syncMarkerDurationMs)
                 .put("syncMarkerGapMs", sweep.syncMarkerGapMs)
+                .put("endMarkerStartHz", sweep.endMarkerStartHz)
+                .put("endMarkerEndHz", sweep.endMarkerEndHz)
+                .put("endMarkerDurationMs", sweep.endMarkerDurationMs)
+                .put("interSweepGapMs", sweep.interSweepGapMs)
                 .put("levelDbfs", sweep.levelDbfs)
                 .put("fadeInMs", sweep.fadeInMs)
                 .put("fadeOutMs", sweep.fadeOutMs)
+                .put("captureKind", sweep.captureKind)
     }
 }

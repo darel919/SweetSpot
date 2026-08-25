@@ -122,6 +122,29 @@ class ProfileStoreCalibrationTransactionTest {
         )
     }
 
+    @Test
+    fun importedCandidateSurvivesReloadAndRecoversToCandidate() {
+        val preferences = FakePreferences()
+        val store = ProfileStore(preferences)
+        val candidate = CalibrationCurveState(FloatArray(64) { 2f }, null, null, true)
+        val transaction = CalibrationCandidateTransaction(
+            candidateId = "candidate-imported",
+            previous = CalibrationCurveState(FloatArray(64) { -1f }, null, null, true),
+            candidate = candidate,
+            validationStatus = CalibrationValidationStatus.IMPORTED,
+            beforeDb = null,
+            afterDb = null,
+            reason = "Imported from another TV",
+        )
+
+        assertTrue(store.saveCandidateImported(transaction))
+        val reloaded = ProfileStore(preferences).loadCalibrationTransaction()
+
+        assertEquals(CalibrationValidationStatus.IMPORTED, reloaded?.validationStatus)
+        assertEquals(CalibrationRecoveryTarget.CANDIDATE, reloaded?.validationStatus?.recoveryTarget())
+        assertTrue(candidate.common.contentEquals(reloaded?.candidate?.common ?: FloatArray(0)))
+    }
+
     private class FakePreferences : SharedPreferences {
         private val values = linkedMapOf<String, Any?>()
 

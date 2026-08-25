@@ -42,8 +42,10 @@ class CalibrationActivity : Activity() {
         internal fun updateGraph(sessionId: String, response: MeasurementResponse) {
             activeActivity?.get()?.let { activity ->
                 if (activity.sessionId != sessionId || response.sessionId != sessionId) return
+                val summary = MeasurementResponseSummary.from(response).displayText()
                 activity.runOnUiThread {
                     if (activity.sessionId == sessionId) {
+                        activity.measurementSummaryView?.text = summary
                         activity.graphView?.setMeasurementResponse(response)
                     }
                 }
@@ -63,6 +65,7 @@ class CalibrationActivity : Activity() {
 
     private var sessionId: String = ""
     private var statusView: TextView? = null
+    private var measurementSummaryView: TextView? = null
     private var graphView: CalibrationGraphView? = null
     private var primaryActionButton: Button? = null
     private var expectedClose = false
@@ -129,6 +132,19 @@ class CalibrationActivity : Activity() {
             gravity = android.view.Gravity.CENTER
         }
         root.addView(statusView, centeredParams())
+
+        measurementSummaryView = TextView(this).apply {
+            text = "Waiting for phone data."
+            textSize = 18f
+            setTextColor(0xFFB8B8BC.toInt())
+            gravity = android.view.Gravity.CENTER
+        }
+        root.addView(measurementSummaryView, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply {
+            setMargins(0, 0, 0, 20)
+        })
 
         val graph = CalibrationGraphView(this)
         graphView = graph

@@ -40,6 +40,17 @@ class CalibrationActivity : Activity() {
             }
         }
 
+        internal fun updatePositionGuide(sessionId: String, context: MeasurementContext?, state: CalibrationGuideState) {
+            activeActivity?.get()?.let { activity ->
+                if (activity.sessionId != sessionId) return
+                activity.runOnUiThread {
+                    if (activity.sessionId != sessionId) return@runOnUiThread
+                    val guide = activity.positionGuideView ?: return@runOnUiThread
+                    if (context == null) guide.showEmpty() else guide.show(context, state)
+                }
+            }
+        }
+
         internal fun updateGraph(sessionId: String, response: MeasurementResponse) {
             activeActivity?.get()?.let { activity ->
                 if (activity.sessionId != sessionId || response.sessionId != sessionId) return
@@ -66,6 +77,7 @@ class CalibrationActivity : Activity() {
 
     private var sessionId: String = ""
     private var statusView: TextView? = null
+    private var positionGuideView: CalibrationPositionGuideView? = null
     private var measurementSummaryView: TextView? = null
     private var graphView: CalibrationGraphView? = null
     private var primaryActionButton: Button? = null
@@ -113,86 +125,149 @@ class CalibrationActivity : Activity() {
 
     private fun buildContent(): View {
         val density = resources.displayMetrics.density
-        val horizontalPadding = (36f * density).roundToInt()
-        val verticalPadding = (20f * density).roundToInt()
+        val horizontalPadding = (28f * density).roundToInt()
+        val verticalPadding = (14f * density).roundToInt()
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = android.view.Gravity.CENTER
             setPadding(horizontalPadding, verticalPadding, horizontalPadding, verticalPadding)
             setBackgroundColor(0xFF0A0A0B.toInt())
         }
         val title = TextView(this).apply {
             text = "SweetSpot Calibration"
-            textSize = 30f
+            textSize = 27f
             setTextColor(0xFFFFFFFF.toInt())
+            gravity = android.view.Gravity.CENTER
         }
-        root.addView(title, centeredParams())
+        root.addView(title, fullWidthParams(bottom = 2))
 
         statusView = TextView(this).apply {
             text = "Preparing measurement…"
-            textSize = 25f
+            textSize = 19f
             setTextColor(0xFFE8E8EA.toInt())
-            setPadding(0, (10f * density).roundToInt(), 0, (12f * density).roundToInt())
             gravity = android.view.Gravity.CENTER
+            setPadding(0, 0, 0, (6f * density).roundToInt())
         }
-        root.addView(statusView, centeredParams())
+        root.addView(statusView, fullWidthParams(bottom = 6))
+
+        val positionGuide = CalibrationPositionGuideView(this)
+        positionGuideView = positionGuide
 
         measurementSummaryView = TextView(this).apply {
             text = "Waiting for phone data."
-            textSize = 18f
+            textSize = 16f
             setTextColor(0xFFB8B8BC.toInt())
             gravity = android.view.Gravity.CENTER
+            setPadding(0, 0, 0, (5f * density).roundToInt())
         }
-        root.addView(measurementSummaryView, LinearLayout.LayoutParams(
+
+        val graph = CalibrationGraphView(this)
+        graphView = graph
+
+        val graphPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(0xFF111214.toInt())
+            addView(measurementSummaryView, fullWidthParams())
+            addView(graph, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f,
+            ))
+        }
+
+        val mainContent = LinearLayout(this).apply {
+            orientation = if (resources.configuration.screenWidthDp >= 800) {
+                LinearLayout.HORIZONTAL
+            } else {
+                LinearLayout.VERTICAL
+            }
+            gravity = android.view.Gravity.FILL
+        }
+        if (mainContent.orientation == LinearLayout.HORIZONTAL) {
+            addWeightedPanel(mainContent, positionGuide, 0.38f, right = 8)
+            addWeightedPanel(mainContent, graphPanel, 0.62f)
+        } else {
+            addWeightedPanel(mainContent, positionGuide, 0.34f, bottom = 8)
+            addWeightedPanel(mainContent, graphPanel, 0.66f)
+        }
+        root.addView(mainContent, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT,
+            0,
+            1f,
         ).apply {
             setMargins(0, 0, 0, (8f * density).roundToInt())
         })
 
-        val graph = CalibrationGraphView(this)
-        graphView = graph
-        root.addView(graph, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            0,
-            1f
-        ).apply {
-            setMargins(0, 0, 0, (12f * density).roundToInt())
-        })
-
         val hint = TextView(this).apply {
-            text = "Keep the iPhone at ear height.\n" +
-                "Point the bottom / USB-C edge toward the speakers.\n" +
-                "Keep the same orientation and do not cover the bottom microphone."
-            textSize = 16f
+            text = "Keep the iPhone upright.\n" +
+                "Point the bottom edge toward the center of the TV."
+            textSize = 15f
             setTextColor(0xFFB8B8BC.toInt())
-            setPadding(0, 0, 0, (12f * density).roundToInt())
-            gravity = android.view.Gravity.CENTER
+            gravity = android.view.Gravity.CENTER_VERTICAL
         }
-        root.addView(hint, centeredParams())
 
         primaryActionButton = Button(this).apply {
-            textSize = 20f
+            textSize = 18f
             visibility = View.GONE
             isFocusable = true
             setOnClickListener { sendServiceAction(SweetSpotService.ACTION_CALIBRATION_CONTINUE) }
         }
-        root.addView(primaryActionButton, centeredParams())
 
         val cancel = Button(this).apply {
             text = "Cancel"
-            textSize = 18f
+            textSize = 16f
             setOnClickListener { sendServiceAction(SweetSpotService.ACTION_CALIBRATION_CANCEL) }
         }
-        root.addView(cancel, centeredParams())
+
+        val footer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            addView(hint, LinearLayout.LayoutParams(
+                0,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                1f,
+            ))
+            addView(primaryActionButton, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                setMargins((8f * density).roundToInt(), 0, 0, 0)
+            })
+            addView(cancel, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                setMargins((8f * density).roundToInt(), 0, 0, 0)
+            })
+        }
+        root.addView(footer, fullWidthParams())
         return root
     }
 
-    private fun centeredParams(): LinearLayout.LayoutParams =
+    private fun fullWidthParams(bottom: Int = 0): LinearLayout.LayoutParams =
         LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { gravity = android.view.Gravity.CENTER_HORIZONTAL }
+        ).apply {
+            if (bottom > 0) setMargins(0, 0, 0, (bottom * resources.displayMetrics.density).roundToInt())
+        }
+
+    private fun addWeightedPanel(
+        parent: LinearLayout,
+        child: View,
+        weight: Float,
+        right: Int = 0,
+        bottom: Int = 0,
+    ) {
+        val isWide = parent.orientation == LinearLayout.HORIZONTAL
+        parent.addView(child, LinearLayout.LayoutParams(
+            if (isWide) 0 else LinearLayout.LayoutParams.MATCH_PARENT,
+            if (isWide) LinearLayout.LayoutParams.MATCH_PARENT else 0,
+            weight,
+        ).apply {
+            val density = resources.displayMetrics.density
+            setMargins(0, 0, (right * density).roundToInt(), (bottom * density).roundToInt())
+        })
+    }
 
     private fun sendUiGone() {
         if (goneSent || expectedClose || sessionId.isBlank()) return

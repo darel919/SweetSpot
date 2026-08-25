@@ -43,6 +43,7 @@ kotlin {
 }
 
 dependencies {
+    implementation(libs.androidsvg)
     implementation(libs.okhttp)
     implementation(libs.zxing.core)
     testImplementation(libs.junit)

@@ -53,7 +53,16 @@ internal data class CalibrationResultText(
     val body: String,
 )
 
-internal fun calibrationResultText(outcome: String, reason: String? = null): CalibrationResultText {
+internal fun calibrationResultText(
+    outcome: String,
+    reason: String? = null,
+    rollbackTargetActive: Boolean? = null,
+): CalibrationResultText {
+    val rollbackSummary = when (rollbackTargetActive) {
+        true -> "The previously active calibration was restored."
+        false -> "It was removed, and calibration remains off. Your pre-calibration audio settings are unchanged."
+        null -> "The original pre-candidate audio state was kept."
+    }
     val result = when (outcome) {
         "improved" -> CalibrationResultText(
             title = "Calibration complete — improved",
@@ -61,19 +70,19 @@ internal fun calibrationResultText(outcome: String, reason: String? = null): Cal
         )
         "inconclusive" -> CalibrationResultText(
             title = "Calibration inconclusive",
-            body = "The result could not be proven better. Previous settings were restored.",
+            body = "The candidate could not be proven better. $rollbackSummary",
         )
         "worse" -> CalibrationResultText(
             title = "Calibration rejected",
-            body = "The candidate measured worse. Previous settings were restored.",
+            body = "The candidate did not improve the measured result. $rollbackSummary",
         )
         "cancelled" -> CalibrationResultText(
             title = "Calibration cancelled",
-            body = "Previous settings were restored.",
+            body = rollbackSummary,
         )
         else -> CalibrationResultText(
             title = "Calibration could not be validated",
-            body = "Previous settings were restored.",
+            body = rollbackSummary,
         )
     }
     val conciseReason = reason?.trim()?.takeIf { it.isNotEmpty() }

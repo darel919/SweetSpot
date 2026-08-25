@@ -11,6 +11,9 @@ import android.content.SharedPreferences
  *    used to restore state on service start / after a reboot.
  *  - "named profiles": an explicit, user-created collection the UI lists and
  *    lets the user choose from. Each is stored under a name.
+ *  - Calibration keys hold the currently applied calibration. When no candidate
+ *    transaction exists, those keys are the committed calibration. Candidate
+ *    keys hold the persisted transaction and its pre-candidate live calibration.
  */
 class ProfileStore private constructor(
     private val prefs: SharedPreferences,
@@ -122,7 +125,7 @@ class ProfileStore private constructor(
         val candidateId = prefs.getString(KEY_CANDIDATE_ID, null)
             ?.takeIf { it.isNotBlank() && it.length <= 128 }
             ?: return null
-        val previous = readStoredCurve(KEY_CANDIDATE_PREVIOUS) ?: return null
+        val preCandidateLiveState = readStoredCurve(KEY_CANDIDATE_PREVIOUS) ?: return null
         val candidate = readStoredCurve(KEY_CANDIDATE_VALUE) ?: return null
         val status = when (prefs.getString(KEY_CANDIDATE_STATUS, null)) {
             STATUS_APPLYING -> CalibrationValidationStatus.APPLYING
@@ -145,7 +148,7 @@ class ProfileStore private constructor(
         }
         return CalibrationCandidateTransaction(
             candidateId = candidateId,
-            previous = previous,
+            previous = preCandidateLiveState,
             candidate = candidate,
             validationStatus = status,
             beforeDb = before,
@@ -180,12 +183,14 @@ class ProfileStore private constructor(
             writeTransaction(editor, transaction.copy(validationStatus = CalibrationValidationStatus.IMPORTED), STATUS_IMPORTED)
         }.commit()
 
+    /** Commits the supplied calibration state and resolves the candidate transaction. */
     internal fun saveActiveCalibrationAndClearCandidate(curve: CalibrationCurveState): Boolean =
         prefs.edit().also { editor ->
             if (curve.active) writeActiveCalibration(editor, curve) else clearActiveCalibration(editor)
             clearTransaction(editor)
         }.commit()
 
+    /** Applies the supplied pre-candidate state while retaining its persisted outcome. */
     internal fun saveActiveCalibrationPreservingCandidate(curve: CalibrationCurveState): Boolean =
         prefs.edit().also { editor ->
             if (curve.active) writeActiveCalibration(editor, curve) else clearActiveCalibration(editor)

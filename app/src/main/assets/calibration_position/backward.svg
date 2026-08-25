@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="700" viewBox="0 0 900 700" style="background: transparent;">
+  <g fill="none" stroke="#111" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <!-- TV -->
+    <rect x="240" y="70" width="420" height="210" rx="18"/>
+    <line x1="400" y1="280" x2="385" y2="330"/>
+    <line x1="500" y1="280" x2="515" y2="330"/>
+    <line x1="350" y1="330" x2="550" y2="330"/>
+  </g>
+
+  <g fill="#111" font-family="Arial, Helvetica, sans-serif" text-anchor="middle">
+    <text x="450" y="395" font-size="42" font-weight="700">BACK</text>
+    <text x="450" y="440" font-size="26">About 35 cm away from the TV</text>
+  </g>
+
+  <g>
+    <circle cx="450" cy="560" r="15" fill="none" stroke="#777" stroke-width="4" opacity="0.55"/>
+    <circle cx="450" cy="620" r="24" fill="#111"/>
+    <text x="450" y="608" fill="#777" font-family="Arial, Helvetica, sans-serif" font-size="20" text-anchor="middle">center</text>
+  </g>
+  <g fill="#111" font-family="Arial, Helvetica, sans-serif" text-anchor="middle">
+    <text x="450" y="665" font-size="22">+ about 10 cm lower than center</text>
+  </g>
+</svg>

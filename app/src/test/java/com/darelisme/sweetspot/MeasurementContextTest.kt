@@ -1,9 +1,19 @@
 package com.darelisme.sweetspot
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class MeasurementContextTest {
+    private fun target(positionId: String): Triple<Double, Double, Double> = when (positionId) {
+        "center" -> Triple(0.0, 0.0, 0.0)
+        "left" -> Triple(-35.0, 0.0, 0.0)
+        "right" -> Triple(35.0, 0.0, 0.0)
+        "forward" -> Triple(0.0, 10.0, 35.0)
+        "backward" -> Triple(0.0, -10.0, -35.0)
+        else -> Triple(Double.NaN, Double.NaN, Double.NaN)
+    }
+
     private fun context(
         positionId: String = "center",
         positionIndex: Int = 0,
@@ -11,17 +21,25 @@ class MeasurementContextTest {
         repairChannel: String = "both",
         attemptIndex: Int = 0,
         attemptCount: Int = 2,
-    ) = MeasurementContext(
-        positionId = positionId,
-        positionIndex = positionIndex,
-        positionCount = positionCount,
-        channel = "both",
-        captureKind = "position-composite",
-        repairChannel = repairChannel,
-        attemptIndex = attemptIndex,
-        attemptCount = attemptCount,
-        phase = "measurement",
-    )
+        phase: String = "measurement",
+    ): MeasurementContext {
+        val (xCm, yCm, zCm) = target(positionId)
+        return MeasurementContext(
+            positionId = positionId,
+            reference = "center",
+            xCm = xCm,
+            yCm = yCm,
+            zCm = zCm,
+            positionIndex = positionIndex,
+            positionCount = positionCount,
+            channel = "both",
+            captureKind = "position-composite",
+            repairChannel = repairChannel,
+            attemptIndex = attemptIndex,
+            attemptCount = attemptCount,
+            phase = phase,
+        )
+    }
 
     @Test
     fun parsesAndLabelsAValidCompositePosition() {
@@ -42,8 +60,8 @@ class MeasurementContextTest {
 
         assertEquals(
             "Position 2 of 3\n" +
-                "Move the iPhone about 30–40 cm left. Keep the bottom edge pointed toward the center of the TV.\n" +
-                "Keep this orientation, then press Continue on the TV.",
+                "Position ready. Keep the phone still.\n" +
+                "Press Continue on the TV.",
             value.readyStatus(),
         )
     }
@@ -52,7 +70,7 @@ class MeasurementContextTest {
     fun centerReadyStatusDoesNotAskForASecondConfirmation() {
         val value = context()
 
-        assertEquals(true, value.readyStatus().contains("while the TV starts the measurement"))
+        assertEquals(true, value.readyStatus().contains("The TV will start the measurement"))
         assertEquals(false, value.readyStatus().contains("Continue"))
     }
 
@@ -83,5 +101,65 @@ class MeasurementContextTest {
     @Test
     fun rejectsAChannelSpecificWireRouteForACompositeCapture() {
         assertEquals(false, context().copy(channel = "left").isValid())
+    }
+
+    @Test
+    fun positionInstructionsUseTheOriginalCenterAsTheirReference() {
+        val left = context(positionId = "left")
+        val right = context(positionId = "right")
+        val forward = context(positionId = "forward")
+        val backward = context(positionId = "backward")
+
+        assertEquals(true, left.instruction().contains("original center"))
+        assertEquals(true, right.instruction().contains("original center"))
+        assertEquals(true, right.instruction().contains("70 cm"))
+        assertEquals(true, forward.instruction().contains("TOWARD THE TV"))
+        assertEquals(true, forward.instruction().contains("original center"))
+        assertEquals(true, forward.instruction().contains("10 cm"))
+        assertEquals(true, backward.instruction().contains("AWAY FROM THE TV"))
+        assertEquals(true, backward.instruction().contains("original center"))
+        assertEquals(true, backward.instruction().contains("10 cm"))
+    }
+
+    @Test
+    fun retryInstructionsTellTheUserToStayAtTheSamePosition() {
+        val retry = context(positionId = "right", attemptIndex = 1)
+
+        assertEquals(true, retry.instruction().contains("same right-side position"))
+        assertEquals(true, retry.instruction().contains("Do not move"))
+    }
+
+    @Test
+    fun validationInstructionNamesTheOriginalCenterListeningPosition() {
+        val validation = context(phase = "validation")
+
+        assertEquals(true, validation.instruction().contains("ORIGINAL CENTER"))
+        assertEquals(true, validation.instruction().contains("first measurement"))
+    }
+
+    @Test
+    fun positionIdsUseTheExplicitBundledSvgMapping() {
+        assertEquals("calibration_position/center.svg", context("center").assetPath())
+        assertEquals("calibration_position/left.svg", context("left").assetPath())
+        assertEquals("calibration_position/right.svg", context("right").assetPath())
+        assertEquals("calibration_position/forward.svg", context("forward").assetPath())
+        assertEquals("calibration_position/backward.svg", context("backward").assetPath())
+    }
+
+    @Test
+    fun missingOrBrokenPositionArtworkFallsBackWithoutABlockingLoad() {
+        assertNull(CalibrationPositionAssets.pathFor("unknown"))
+        assertNull(CalibrationPositionAssets.loadOrNull("right") { error("broken SVG") })
+    }
+
+    @Test
+    fun targetGeometryIsRequiredForAValidContext() {
+        val original = context(positionId = "forward")
+
+        assertEquals(0.0, original.xCm, 0.0)
+        assertEquals(10.0, original.yCm, 0.0)
+        assertEquals(35.0, original.zCm, 0.0)
+        assertEquals(false, original.copy(reference = "previous").isValid())
+        assertEquals(false, original.copy(xCm = 35.0).isValid())
     }
 }

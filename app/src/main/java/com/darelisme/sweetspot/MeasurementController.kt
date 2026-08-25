@@ -162,6 +162,7 @@ class MeasurementController(
     private val rollbackCandidate: (String) -> Boolean = { false },
     private val stateSnapshotProvider: () -> JSONObject = { JSONObject() },
     private val finalStateVerifier: () -> Boolean = { true },
+    private val rollbackTargetActiveProvider: (String) -> Boolean? = { null },
 ) {
     companion object {
         private const val TAG = "SweetSpotMeasurement"
@@ -199,6 +200,7 @@ class MeasurementController(
         val candidateId: String?,
         var emit: (String, org.json.JSONObject, String?) -> Unit,
         var replyTo: String?,
+        val rollbackTargetActive: Boolean? = null,
         var continuedPositionContext: MeasurementContext? = null,
         var validationFinalizationBlocked: Boolean = false,
         var validationFatal: Boolean = false,
@@ -268,7 +270,24 @@ class MeasurementController(
                 return@submit
             }
 
-            val session = Session(sessionId, channel, phase, candidateId, emit, replyTo)
+            val rollbackTargetActive = if (phase == "validation" && candidateId != null) {
+                try {
+                    rollbackTargetActiveProvider(candidateId)
+                } catch (_: Throwable) {
+                    null
+                }
+            } else {
+                null
+            }
+            val session = Session(
+                sessionId,
+                channel,
+                phase,
+                candidateId,
+                emit,
+                replyTo,
+                rollbackTargetActive,
+            )
             activeSession = session
             state = SessionState.AwaitingUi(session)
             touchWatchdog()
@@ -456,6 +475,7 @@ class MeasurementController(
             val result = calibrationResultText(
                 finalOutcome,
                 if (finalOutcome == "error") session.validationAbortError?.second ?: reason else reason,
+                session.rollbackTargetActive,
             )
             CalibrationActivity.updateStatus(session.id, "${result.title}\n${result.body}")
             CalibrationActivity.updatePrimaryAction(session.id, "Done")
@@ -600,10 +620,25 @@ class MeasurementController(
                 is SessionState.Playing -> current.context?.label()
                 else -> null
             }
-            val instruction = message?.takeIf { stage == "position-pause" && it.isNotBlank() }
+            val activeContext = when (val current = state) {
+                is SessionState.Ready -> current.context
+                is SessionState.Playing -> current.context
+                else -> null
+            }
+            val instruction = message?.takeIf { stage != "position-pause" && it.isNotBlank() }
             val text = listOfNotNull(progress, stageLabel, contextLabel, estimate, instruction).joinToString("\n")
             CalibrationActivity.updateStatus(sessionId, text)
-            if (stage == "position-pause") CalibrationActivity.updatePrimaryAction(sessionId, "Continue")
+            when (stage) {
+                "position-pause" -> {
+                    activeContext?.let {
+                        CalibrationActivity.updatePositionGuide(sessionId, it, CalibrationGuideState.READY)
+                    }
+                    CalibrationActivity.updatePrimaryAction(sessionId, "Continue")
+                }
+                "recording" -> activeContext?.let {
+                    CalibrationActivity.updatePositionGuide(sessionId, it, CalibrationGuideState.MEASURING)
+                }
+            }
             touchWatchdog()
         }
     }
@@ -669,6 +704,7 @@ class MeasurementController(
                         }
                         state = SessionState.Ready(session, sweep, route, context)
                         emit("measurement.ready", JSONObjectPayload.ready(session, sweep, context), replyTo)
+                        CalibrationActivity.updatePositionGuide(sessionId, context, CalibrationGuideState.READY)
                         CalibrationActivity.updateStatus(sessionId, context?.readyStatus() ?: "TV ready. Follow the instructions shown here.")
                         CalibrationActivity.updatePrimaryAction(
                             sessionId,
@@ -724,6 +760,9 @@ class MeasurementController(
                     ?.takeUnless { it == "both" }
                     ?: current.channel
                 state = SessionState.Playing(session, current.sweep, current.channel, playbackContext)
+                playbackContext?.let {
+                    CalibrationActivity.updatePositionGuide(sessionId, it, CalibrationGuideState.MEASURING)
+                }
                 CalibrationActivity.updatePrimaryAction(sessionId, null)
                 emit("measurement.started", JSONObjectPayload.started(session, current.sweep, playbackContext), replyTo)
                 CalibrationActivity.updateStatus(sessionId, playbackContext?.let { "${it.label()}\nPlaying measurement sweep…" } ?: "Playing measurement sweep…")
@@ -1136,9 +1175,9 @@ class MeasurementController(
         if (recovery.finalStateVerified) return originalError
         val recoveryReason = when {
             !recovery.validationStateRestored ->
-                "The TV could not verify restoration of its previous audio state"
+                "The TV could not verify restoration of its pre-validation audio state"
             !recovery.candidateRolledBack ->
-                "The previous calibration could not be verified after rollback"
+                "The pre-candidate calibration state could not be verified after rollback"
             else ->
                 "The final calibration state could not be verified"
         }
@@ -1174,7 +1213,11 @@ class MeasurementController(
         } else {
             "error"
         }
-        val result = calibrationResultText(outcome, if (outcome == "error") original?.second else null)
+        val result = calibrationResultText(
+            outcome,
+            if (outcome == "error") original?.second else null,
+            session.rollbackTargetActive,
+        )
         session.validationFinalizationBlocked = false
         session.validationFatal = false
         state = SessionState.ValidationFinalized(session)

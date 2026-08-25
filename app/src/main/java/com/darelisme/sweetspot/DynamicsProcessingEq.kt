@@ -188,7 +188,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
                     reason = if (transaction.validationStatus == CalibrationValidationStatus.ROLLING_BACK) {
                         "Startup could not complete the pending calibration rollback"
                     } else {
-                        "Startup could not verify restoration of the previous calibration"
+                        "Startup could not verify restoration of the pre-candidate calibration"
                     },
                 ))
             }
@@ -544,7 +544,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
             recordCalibrationFailure("Positive calibration gains require verified input headroom")
             return false
         }
-        val previous = requestedCurveState()
+        val preCandidateLiveState = requestedCurveState()
         val candidate = CalibrationCurveState(
             common = gains.copyOf(),
             left = left?.copyOf(),
@@ -553,7 +553,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         )
         val transaction = CalibrationCandidateTransaction(
             candidateId = UUID.randomUUID().toString(),
-            previous = previous,
+            previous = preCandidateLiveState,
             candidate = candidate,
             validationStatus = CalibrationValidationStatus.APPLYING,
             beforeDb = null,
@@ -566,39 +566,39 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         }
         applyRequestedCurve(candidate)
         if (!applyAll(trackCalibrationStatus = true)) {
-            applyRequestedCurve(previous)
+            applyRequestedCurve(preCandidateLiveState)
             val restored = applyAll(trackCalibrationStatus = true)
             lastCalibrationApplyError = if (restored) {
-                profileStore.saveActiveCalibrationAndClearCandidate(previous)
+                profileStore.saveActiveCalibrationAndClearCandidate(preCandidateLiveState)
                 lastCalibrationApplyError ?: "Calibration candidate application failed"
             } else {
                 profileStore.saveCandidateValidation(transaction.copy(
                     validationStatus = CalibrationValidationStatus.FAILED,
-                    reason = "Calibration candidate failed and previous calibration could not be verified",
+                    reason = "Calibration candidate failed and the pre-candidate calibration could not be verified",
                 ))
-                "Calibration candidate failed and previous calibration could not be verified"
+                "Calibration candidate failed and the pre-candidate calibration could not be verified"
             }
             lastCalibrationApplySucceeded = false
             return false
         }
         if (!profileStore.saveCandidatePendingValidation(transaction)) {
-            applyRequestedCurve(previous)
+            applyRequestedCurve(preCandidateLiveState)
             val restored = applyAll(trackCalibrationStatus = true)
             if (restored) {
                 profileStore.saveCandidateValidation(transaction.copy(
                     validationStatus = CalibrationValidationStatus.FAILED,
-                    reason = "Could not persist the pending calibration candidate",
+                    reason = "Could not persist the pending calibration candidate after restoring the pre-candidate calibration",
                 ))
             } else {
                 profileStore.saveCandidateValidation(transaction.copy(
                     validationStatus = CalibrationValidationStatus.FAILED,
-                    reason = "Could not persist the pending candidate and previous calibration could not be verified",
+                    reason = "Could not persist the pending candidate and the pre-candidate calibration could not be verified",
                 ))
             }
             recordCalibrationFailure(if (restored) {
-                "Could not persist the pending calibration candidate"
+                "Could not persist the pending calibration candidate after restoring the pre-candidate calibration"
             } else {
-                "Could not persist the pending candidate and previous calibration could not be verified"
+                "Could not persist the pending candidate and the pre-candidate calibration could not be verified"
             })
             return false
         }
@@ -663,23 +663,23 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
             recordCalibrationFailure("Could not persist the calibration rollback before changing live DSP")
             return false
         }
-        val current = requestedCurveState()
+        val candidateLiveState = requestedCurveState()
         applyRequestedCurve(transaction.previous)
         if (!applyAll(trackCalibrationStatus = true)) {
-            applyRequestedCurve(current)
+            applyRequestedCurve(candidateLiveState)
             applyAll(trackCalibrationStatus = true)
             profileStore.saveCandidateValidation(transaction.copy(
                 validationStatus = CalibrationValidationStatus.FAILED,
-                reason = "Calibration rollback could not be verified",
+                reason = "The pre-candidate calibration could not be verified after rollback",
             ))
             return false
         }
         if (profileStore.saveActiveCalibrationAndClearCandidate(transaction.previous)) return true
         profileStore.saveCandidateValidation(transaction.copy(
             validationStatus = CalibrationValidationStatus.FAILED,
-            reason = "Calibration rollback was applied but could not be persisted",
+            reason = "The pre-candidate calibration was restored but could not be committed",
         ))
-        recordCalibrationFailure("Calibration rollback was applied but could not be persisted")
+        recordCalibrationFailure("The pre-candidate calibration was restored but could not be committed")
         return false
     }
 
@@ -703,17 +703,17 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         if (!profileStore.saveCandidateValidation(updated)) return false
         if (normalized.status != CalibrationValidationStatus.WORSE) return true
 
-        val current = requestedCurveState()
+        val candidateLiveState = requestedCurveState()
         applyRequestedCurve(transaction.previous)
         val restored = applyAll(trackCalibrationStatus = true)
         if (restored && profileStore.saveActiveCalibrationPreservingCandidate(transaction.previous)) return true
 
-        applyRequestedCurve(current)
+        applyRequestedCurve(candidateLiveState)
         applyAll(trackCalibrationStatus = true)
         val restoreError = if (restored) {
             "Measured-worse candidate could not persist its safe rollback"
         } else {
-            "Measured-worse candidate could not restore the previous calibration"
+            "Measured-worse candidate could not restore the pre-candidate calibration"
         }
         profileStore.saveCandidateValidation(updated.copy(reason = restoreError))
         lastCalibrationApplySucceeded = false
@@ -1097,6 +1097,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         active = calibrationActive,
     )
 
+    /** Applies only the calibration layer and leaves the separate user EQ state unchanged. */
     private fun applyRequestedCurve(curve: CalibrationCurveState) {
         calibration = curve.common.copyOf()
         calibrationLeft = if (INDEPENDENT_ROUTING_VERIFIED) curve.left?.copyOf() else null

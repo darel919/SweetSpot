@@ -13,27 +13,34 @@ class CalibrationResultTest {
         assertEquals(
             CalibrationResultText(
                 "Calibration inconclusive",
-                "The result could not be proven better. Previous settings were restored.",
+                "The candidate could not be proven better. It was removed, and calibration remains off. Your pre-calibration audio settings are unchanged.",
             ),
-            calibrationResultText("inconclusive"),
+            calibrationResultText("inconclusive", rollbackTargetActive = false),
         )
         assertEquals(
             CalibrationResultText(
                 "Calibration rejected",
-                "The candidate measured worse. Previous settings were restored.",
+                "The candidate did not improve the measured result. It was removed, and calibration remains off. Your pre-calibration audio settings are unchanged.",
             ),
-            calibrationResultText("worse"),
+            calibrationResultText("worse", rollbackTargetActive = false),
         )
         assertEquals(
-            CalibrationResultText("Calibration cancelled", "Previous settings were restored."),
-            calibrationResultText("cancelled"),
+            CalibrationResultText("Calibration cancelled", "It was removed, and calibration remains off. Your pre-calibration audio settings are unchanged."),
+            calibrationResultText("cancelled", rollbackTargetActive = false),
         )
         assertEquals(
             CalibrationResultText(
                 "Calibration could not be validated",
-                "Previous settings were restored.\nReason: signal_too_low",
+                "It was removed, and calibration remains off. Your pre-calibration audio settings are unchanged.\nReason: signal_too_low",
             ),
-            calibrationResultText("error", "signal_too_low"),
+            calibrationResultText("error", "signal_too_low", rollbackTargetActive = false),
+        )
+        assertEquals(
+            CalibrationResultText(
+                "Calibration rejected",
+                "The candidate did not improve the measured result. The previously active calibration was restored.",
+            ),
+            calibrationResultText("worse", rollbackTargetActive = true),
         )
     }
 }

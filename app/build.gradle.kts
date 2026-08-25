@@ -13,6 +13,8 @@ android {
 
         versionCode = 1
         versionName = "0.1.0"
+
+        buildConfigField("String", "SWEETSPOT_BUILD_ID", "\"${providers.environmentVariable("SWEETSPOT_BUILD_ID").orElse(providers.exec { commandLine("git", "rev-parse", "HEAD") }.standardOutput.asText.get().trim()).get()}\"")
     }
 
     buildTypes {
@@ -32,7 +34,7 @@ android {
 
     buildFeatures {
         aidl = false
-        buildConfig = false
+        buildConfig = true
         compose = false
         shaders = false
     }

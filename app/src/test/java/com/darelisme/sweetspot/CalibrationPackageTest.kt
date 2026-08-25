@@ -20,6 +20,7 @@ class CalibrationPackageTest {
         assertTrue(value.effectiveBandsDb!!.contentEquals(FloatArray(64) { -it / 128f }))
         assertTrue(value.leftBandsDb == null)
         assertTrue(value.rightBandsDb == null)
+        assertEquals("tv-build-1", value.sourceDevice.buildId)
     }
 
     @Test
@@ -63,7 +64,7 @@ class CalibrationPackageTest {
 
     private fun packageValue() = CalibrationPackage(
         exportedAt = 1_700_000_000_000.0,
-        sourceDevice = CalibrationPackageSourceDevice("tv_source", "Living Room TV", "0.1.0"),
+        sourceDevice = CalibrationPackageSourceDevice("tv_source", "Living Room TV", "0.1.0", "tv-build-1"),
         active = true,
         frequenciesHz = EXPECTED_FREQUENCIES.map { it.toDouble() }.toDoubleArray(),
         bandsDb = FloatArray(64) { -it / 64f },

@@ -7,6 +7,7 @@ internal data class CalibrationPackageSourceDevice(
     val id: String,
     val name: String,
     val appVersion: String,
+    val buildId: String? = null,
 )
 
 internal data class CalibrationPackage(
@@ -196,6 +197,7 @@ internal object CalibrationPackageCodec {
                 put("id", value.sourceDevice.id)
                 put("name", value.sourceDevice.name)
                 put("appVersion", value.sourceDevice.appVersion)
+                value.sourceDevice.buildId?.let { put("buildId", it) }
             })
             put("active", value.active)
             put("frequenciesHz", JSONArray().apply { value.frequenciesHz.forEach { put(it) } })

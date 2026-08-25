@@ -185,6 +185,8 @@ class SweetSpotService : Service(), ServiceActions {
             measurementController = createdMeasurementController
             runtimeStarted = true
 
+            Log.i(TAG, "Service runtime started (buildId=${BuildConfig.SWEETSPOT_BUILD_ID})")
+
             createdWebServer.start()
             createdRelay.start()
             Log.i(TAG, "Service runtime started (engine + web server + overlay + relay)")
@@ -441,6 +443,7 @@ class SweetSpotService : Service(), ServiceActions {
                             id = DeviceIdentity.get(this@SweetSpotService),
                             name = DeviceIdentity.getName(this@SweetSpotService),
                             appVersion = "0.1.0",
+                            buildId = BuildConfig.SWEETSPOT_BUILD_ID,
                         ),
                     )
                     commandOk = packageValue != null
@@ -1043,6 +1046,7 @@ class SweetSpotService : Service(), ServiceActions {
                 put("id", DeviceIdentity.get(this@SweetSpotService))
                 put("name", DeviceIdentity.getName(this@SweetSpotService))
                 put("appVersion", "0.1.0")
+                put("buildId", BuildConfig.SWEETSPOT_BUILD_ID)
             })
             put("engine", JSONObject().apply {
                 put("enabled", engine.isEnabled())

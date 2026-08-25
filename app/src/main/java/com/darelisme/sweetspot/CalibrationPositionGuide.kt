@@ -15,6 +15,16 @@ internal enum class CalibrationGuideState {
     MEASURING,
 }
 
+internal fun calibrationGuideTitle(
+    measurementContext: MeasurementContext,
+    state: CalibrationGuideState,
+): String = buildString {
+    if (measurementContext.phase == "validation") append("VALIDATION • ")
+    if (measurementContext.attemptIndex > 0) append("RETRY • ")
+    if (state == CalibrationGuideState.MEASURING) append("MEASURING • ")
+    append(measurementContext.positionTitle())
+}
+
 internal object CalibrationPositionAssets {
     fun pathFor(positionId: String): String? = when (positionId) {
         "center" -> "calibration_position/center.svg"
@@ -95,14 +105,7 @@ internal class CalibrationPositionGuideView(context: Context) : LinearLayout(con
 
     fun show(measurementContext: MeasurementContext, state: CalibrationGuideState) {
         progressView.text = measurementContext.label()
-        titleView.text = when {
-            measurementContext.phase == "validation" && measurementContext.attemptIndex > 0 -> "VALIDATION • RETRY • ${measurementContext.positionTitle()}"
-            measurementContext.phase == "validation" && state == CalibrationGuideState.MEASURING -> "VALIDATION • MEASURING • ${measurementContext.positionTitle()}"
-            measurementContext.phase == "validation" -> "VALIDATION • ${measurementContext.positionTitle()}"
-            measurementContext.attemptIndex > 0 -> "RETRY • ${measurementContext.positionTitle()}"
-            state == CalibrationGuideState.MEASURING -> "MEASURING • ${measurementContext.positionTitle()}"
-            else -> measurementContext.positionTitle()
-        }
+        titleView.text = calibrationGuideTitle(measurementContext, state)
         instructionView.text = measurementContext.instruction()
 
         val drawable = if (artworkCache.containsKey(measurementContext.positionId)) {

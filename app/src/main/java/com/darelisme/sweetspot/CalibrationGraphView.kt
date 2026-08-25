@@ -82,8 +82,8 @@ class CalibrationGraphView @JvmOverloads constructor(
 
         val plotLeft = 52f * density
         val plotRight = width.toFloat() - 24f * density
-        val plotTop = 18f * density
-        val plotBottom = height.toFloat() - 38f * density
+        val plotTop = 12f * density
+        val plotBottom = height.toFloat() - 32f * density
         if (plotRight <= plotLeft || plotBottom <= plotTop) return
 
         gridPaint.strokeWidth = max(1f, density)

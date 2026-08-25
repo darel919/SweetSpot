@@ -12,6 +12,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import java.lang.ref.WeakReference
+import kotlin.math.roundToInt
 
 class CalibrationActivity : Activity() {
     companion object {
@@ -111,10 +112,13 @@ class CalibrationActivity : Activity() {
     }
 
     private fun buildContent(): View {
+        val density = resources.displayMetrics.density
+        val horizontalPadding = (36f * density).roundToInt()
+        val verticalPadding = (20f * density).roundToInt()
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = android.view.Gravity.CENTER
-            setPadding(64, 48, 64, 48)
+            setPadding(horizontalPadding, verticalPadding, horizontalPadding, verticalPadding)
             setBackgroundColor(0xFF0A0A0B.toInt())
         }
         val title = TextView(this).apply {
@@ -128,7 +132,7 @@ class CalibrationActivity : Activity() {
             text = "Preparing measurement…"
             textSize = 25f
             setTextColor(0xFFE8E8EA.toInt())
-            setPadding(0, 28, 0, 32)
+            setPadding(0, (10f * density).roundToInt(), 0, (12f * density).roundToInt())
             gravity = android.view.Gravity.CENTER
         }
         root.addView(statusView, centeredParams())
@@ -143,7 +147,7 @@ class CalibrationActivity : Activity() {
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT,
         ).apply {
-            setMargins(0, 0, 0, 20)
+            setMargins(0, 0, 0, (8f * density).roundToInt())
         })
 
         val graph = CalibrationGraphView(this)
@@ -153,16 +157,16 @@ class CalibrationActivity : Activity() {
             0,
             1f
         ).apply {
-            setMargins(0, 0, 0, 24)
+            setMargins(0, 0, 0, (12f * density).roundToInt())
         })
 
         val hint = TextView(this).apply {
             text = "Keep the iPhone at ear height.\n" +
                 "Point the bottom / USB-C edge toward the speakers.\n" +
                 "Keep the same orientation and do not cover the bottom microphone."
-            textSize = 18f
+            textSize = 16f
             setTextColor(0xFFB8B8BC.toInt())
-            setPadding(0, 0, 0, 32)
+            setPadding(0, 0, 0, (12f * density).roundToInt())
             gravity = android.view.Gravity.CENTER
         }
         root.addView(hint, centeredParams())

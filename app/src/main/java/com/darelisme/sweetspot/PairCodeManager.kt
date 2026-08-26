@@ -5,6 +5,11 @@ import java.security.SecureRandom
 class PairCodeManager {
 
     data class Session(val code: String, val expiresAt: Long)
+    data class RotationResult(val session: Session, val rotated: Boolean)
+    enum class RotationDecision {
+        ROTATE_NOW,
+        DEFER,
+    }
 
     companion object {
         private const val ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
@@ -16,6 +21,15 @@ class PairCodeManager {
 
         internal fun connectUrl(code: String): String =
             "${Config.DASHBOARD_URL}/connect/${normalize(code)}"
+
+        internal fun rotationDecision(
+            clientConnected: Boolean,
+            calibrationCritical: Boolean,
+        ): RotationDecision = if (clientConnected || calibrationCritical) {
+            RotationDecision.DEFER
+        } else {
+            RotationDecision.ROTATE_NOW
+        }
     }
 
     private val random = SecureRandom()

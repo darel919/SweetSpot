@@ -20,4 +20,20 @@ class PairCodeManagerTest {
     fun pairCodeNormalizationRemovesSeparatorsWithoutChangingMeaning() {
         assertEquals("ABCD2345", PairCodeManager.normalize(" ab-cd-2345 "))
     }
+
+    @Test
+    fun rotationDefersWhileAClientOrCalibrationCriticalOperationIsActive() {
+        assertEquals(
+            PairCodeManager.RotationDecision.ROTATE_NOW,
+            PairCodeManager.rotationDecision(clientConnected = false, calibrationCritical = false),
+        )
+        assertEquals(
+            PairCodeManager.RotationDecision.DEFER,
+            PairCodeManager.rotationDecision(clientConnected = true, calibrationCritical = false),
+        )
+        assertEquals(
+            PairCodeManager.RotationDecision.DEFER,
+            PairCodeManager.rotationDecision(clientConnected = false, calibrationCritical = true),
+        )
+    }
 }

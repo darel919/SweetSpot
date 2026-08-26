@@ -46,6 +46,8 @@ class MailboxClient(
     interface Listener {
         fun onDeviceOnline(online: Boolean)
 
+        fun onRoomConnected(room: String) {}
+
         /** True while a dashboard is actively connected or posting to the room. */
         fun onClientPresence(present: Boolean)
     }
@@ -109,6 +111,7 @@ class MailboxClient(
                     }
                     socket = webSocket
                     reconnectDelayMs = WS_RECONNECT_MIN_MS
+                    listener?.onRoomConnected(room)
                     listener?.onDeviceOnline(true)
                     Log.i(TAG, "Connected to room WebSocket (device online)")
                 }

@@ -95,6 +95,53 @@ class DynamicsProcessingCalibrationSafetyTest {
     }
 
     @Test
+    fun explicitFailedStatusIsPreservedWithoutMetricsOrReasonLoss() {
+        val result = DynamicsProcessingEq.normalizeValidationResult(
+            requestedStatus = CalibrationValidationStatus.FAILED,
+            beforeDb = null,
+            afterDb = null,
+            reason = "marker timing failed",
+        )
+
+        assertEquals(CalibrationValidationStatus.FAILED, result.status)
+        assertEquals("marker timing failed", result.reason)
+        assertNull(result.beforeDb)
+        assertNull(result.afterDb)
+    }
+
+    @Test
+    fun explicitInconclusiveStatusDoesNotRequireMetrics() {
+        val result = DynamicsProcessingEq.normalizeValidationResult(
+            requestedStatus = CalibrationValidationStatus.INCONCLUSIVE,
+            beforeDb = null,
+            afterDb = null,
+            reason = "change was within tolerance",
+        )
+
+        assertEquals(CalibrationValidationStatus.INCONCLUSIVE, result.status)
+        assertEquals("change was within tolerance", result.reason)
+    }
+
+    @Test
+    fun resetFailureTelemetryNamesTheFailureAndRollbackOutcome() {
+        val restored = DynamicsProcessingEq.calibrationResetFailureMessage(
+            DynamicsProcessingEq.ResetFailureStage.APPLY,
+            "input gain rejected",
+            restored = true,
+        )
+        val notRestored = DynamicsProcessingEq.calibrationResetFailureMessage(
+            DynamicsProcessingEq.ResetFailureStage.PERSIST,
+            "preferences unavailable",
+            restored = false,
+        )
+
+        assertTrue(restored.contains("reset application failed"))
+        assertTrue(restored.contains("previous calibration was restored and verified"))
+        assertTrue(notRestored.contains("reset persistence failed"))
+        assertTrue(notRestored.contains("previous calibration could not be verified"))
+    }
+
+    @Test
     fun theVerifiedTargetTvAllowsCalibrationCandidates() {
         assertTrue(DynamicsProcessingEq.BAND_TRANSFER_CHARACTERIZED)
         assertNull(DynamicsProcessingEq.calibrationTransferCharacterizationError())

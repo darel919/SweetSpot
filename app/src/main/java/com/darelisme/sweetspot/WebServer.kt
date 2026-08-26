@@ -58,6 +58,7 @@ interface ServiceActions {
     fun applyPersistentBands(common: FloatArray, left: FloatArray? = null, right: FloatArray? = null): Boolean
     fun getPersistentProbeCurve(): String?
     fun getPersistentProbeCurveSummary(channel: Int = 0): DynamicsProcessingProbe.CurveSummary?
+    fun getPersistentProbeError(): String?
 
     /** Audio effect chain diagnostics (effect inventory + session-0 probes). */
     fun runEffectDiagnostics()
@@ -88,7 +89,7 @@ class WebServer(
     private val eqAppliedNotifier: ((String) -> Unit)? = null,
     private val authTokenProvider: () -> String,
     private val pairCodeProvider: () -> String,
-    private val pairCodeRotateProvider: () -> String,
+    private val pairCodeRotateProvider: () -> PairCodeManager.RotationResult,
 ) {
     companion object {
         private const val TAG = "SweetSpotWeb"
@@ -508,10 +509,10 @@ class WebServer(
             }
 
             method == "POST" && path == "/api/paircode/rotate" -> {
-                val code = pairCodeRotateProvider()
+                val result = pairCodeRotateProvider()
                 sendJson(client, JSONObject().apply {
-                    put("pairCode", code)
-                    put("rotated", true)
+                    put("pairCode", result.session.code)
+                    put("rotated", result.rotated)
                 }.toString())
             }
 
@@ -591,6 +592,7 @@ class WebServer(
         val active = serviceActions?.isPersistentProbeActive() ?: false
         val bands = serviceActions?.getPersistentProbeBands() ?: 0
         val curve = serviceActions?.getPersistentProbeCurve()
+        val error = serviceActions?.getPersistentProbeError()
         val sum = serviceActions?.getPersistentProbeCurveSummary()
         val leftSum = serviceActions?.getPersistentProbeCurveSummary(0)
         val rightSum = serviceActions?.getPersistentProbeCurveSummary(1)
@@ -598,6 +600,7 @@ class WebServer(
             put("active", active)
             put("bands", bands)
             put("curve", curve ?: JSONObject.NULL)
+            put("error", error ?: JSONObject.NULL)
             if (sum != null) {
                 put("curveSummary", JSONObject().apply {
                     put("bandsTotal", sum.bandsTotal)

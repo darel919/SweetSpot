@@ -22,6 +22,11 @@ import kotlin.math.*
  */
 class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine {
 
+    enum class ResetFailureStage {
+        APPLY,
+        PERSIST,
+    }
+
     companion object {
         const val INTERNAL_BANDS = 64
         const val USER_BANDS = 24
@@ -72,12 +77,45 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
             val reason: String?,
         )
 
+        internal fun calibrationResetFailureMessage(
+            stage: ResetFailureStage,
+            originalError: String?,
+            restored: Boolean,
+        ): String {
+            val failure = when (stage) {
+                ResetFailureStage.APPLY -> "reset application failed"
+                ResetFailureStage.PERSIST -> "reset persistence failed"
+            }
+            val outcome = if (restored) {
+                "previous calibration was restored and verified"
+            } else {
+                "previous calibration could not be verified"
+            }
+            return "$failure: ${originalError ?: "unknown error"}; $outcome"
+        }
+
         internal fun normalizeValidationResult(
             requestedStatus: CalibrationValidationStatus,
             beforeDb: Float?,
             afterDb: Float?,
             reason: String?,
         ): NormalizedValidationResult {
+            if (requestedStatus == CalibrationValidationStatus.FAILED) {
+                return NormalizedValidationResult(
+                    status = CalibrationValidationStatus.FAILED,
+                    beforeDb = beforeDb?.takeIf { it.isFinite() },
+                    afterDb = afterDb?.takeIf { it.isFinite() },
+                    reason = reason ?: "Validation failed",
+                )
+            }
+            if (requestedStatus == CalibrationValidationStatus.INCONCLUSIVE) {
+                return NormalizedValidationResult(
+                    status = CalibrationValidationStatus.INCONCLUSIVE,
+                    beforeDb = beforeDb?.takeIf { it.isFinite() },
+                    afterDb = afterDb?.takeIf { it.isFinite() },
+                    reason = reason ?: "Validation was inconclusive",
+                )
+            }
             if (beforeDb == null || afterDb == null || !beforeDb.isFinite() || !afterDb.isFinite()) {
                 return NormalizedValidationResult(
                     status = CalibrationValidationStatus.INCONCLUSIVE,
@@ -788,18 +826,27 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         calibrationActive = false
         val applied = applyAll(trackCalibrationStatus = true)
         if (!applied) {
-            restoreCalibrationAfterReset(previous)
+            val resetError = lastCalibrationApplyError
+            val restored = restoreCalibrationAfterReset(previous)
+            lastCalibrationApplySucceeded = false
+            lastCalibrationApplyError = calibrationResetFailureMessage(
+                ResetFailureStage.APPLY,
+                resetError,
+                restored,
+            )
+            Log.w(TAG, lastCalibrationApplyError ?: "Calibration reset failed")
             return false
         }
         if (profileStore.clearCalibration()) return true
 
+        val resetError = "Calibration was applied but could not be saved on the TV"
         val restored = restoreCalibrationAfterReset(previous)
         lastCalibrationApplySucceeded = false
-        lastCalibrationApplyError = if (restored) {
-            "Calibration reset could not be persisted; previous calibration was restored"
-        } else {
-            "Calibration reset could not be persisted and previous calibration could not be verified"
-        }
+        lastCalibrationApplyError = calibrationResetFailureMessage(
+            ResetFailureStage.PERSIST,
+            resetError,
+            restored,
+        )
         Log.w(TAG, lastCalibrationApplyError ?: "Calibration reset failed")
         return false
     }
@@ -809,12 +856,15 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         calibrationLeft = previous.left?.copyOf()
         calibrationRight = previous.right?.copyOf()
         calibrationActive = previous.active
-        return applyAll(trackCalibrationStatus = true)
+        return applyAll(trackCalibrationStatus = false)
     }
 
     @Synchronized
     override fun beginMeasurementBypass(): MeasurementAudioOverrideResult {
         measurementBypassState?.let { return MeasurementAudioOverrideResult.Applied(copyMeasurementState(it)) }
+        if (diagnosticProbeCurve != null) {
+            return MeasurementAudioOverrideResult.Failed("Persistent diagnostic probe is active", true)
+        }
         if (calibrationValidationState != null) {
             return MeasurementAudioOverrideResult.Failed("Calibration validation is already active", true)
         }
@@ -857,6 +907,9 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     @Synchronized
     override fun beginCalibrationValidation(candidateId: String?): MeasurementAudioOverrideResult {
         calibrationValidationState?.let { return MeasurementAudioOverrideResult.Applied(copyMeasurementState(it)) }
+        if (diagnosticProbeCurve != null) {
+            return MeasurementAudioOverrideResult.Failed("Persistent diagnostic probe is active", true)
+        }
         if (measurementBypassState != null) {
             return MeasurementAudioOverrideResult.Failed("Measurement bypass is already active", true)
         }

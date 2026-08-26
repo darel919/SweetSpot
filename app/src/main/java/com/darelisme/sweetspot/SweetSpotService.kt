@@ -19,6 +19,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
 import kotlin.math.pow
@@ -100,6 +101,10 @@ class SweetSpotService : Service(), ServiceActions {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val pairCodes = PairCodeManager()
     private val pairingRotation = Runnable { rotatePairingSession() }
+    @Volatile
+    private var pairingRotationPending = false
+    @Volatile
+    private var relayClientPresent = false
     private val clientDisconnectGrace = Runnable {
         measurementController?.clientPresenceChanged(false)
     }
@@ -107,13 +112,17 @@ class SweetSpotService : Service(), ServiceActions {
 
     /** Serializes probe runs so a burst of broadcasts cannot overlap probes. */
     private val probeExecutor = Executors.newSingleThreadExecutor()
-    private val audioOperationRunning = AtomicBoolean(false)
+    private val audioOperationGate = AudioOperationGate()
 
     /** Last capacity-probe results surfaced to the web UI. */
     private var lastProbeResults: List<DynamicsProcessingProbe.ProbeResult>? = null
     private val probeRunning = AtomicBoolean(false)
     private var persistentBands: Int = 0
     private var persistentCurveName: String? = null
+    @Volatile
+    private var persistentProbeLeaseHeld = false
+    @Volatile
+    private var persistentProbeError: String? = null
 
     /** Persistent global-mix Virtualizer for spatial-widening A/B tests. */
     private var persistentVirtualizer: Virtualizer? = null
@@ -153,7 +162,7 @@ class SweetSpotService : Service(), ServiceActions {
                 eqAppliedNotifier = ::showEqAppliedToast,
                 authTokenProvider = { DeviceIdentity.getLanApiToken(this) },
                 pairCodeProvider = { pairCodes.current() },
-                pairCodeRotateProvider = ::rotatePairingSession,
+                pairCodeRotateProvider = { rotatePairingSession(force = true) },
             )
             createdRelay = MailboxClient(
                 roomProvider = { pairCodes.current() },
@@ -168,7 +177,12 @@ class SweetSpotService : Service(), ServiceActions {
                         )
                     }
 
+                    override fun onRoomConnected(room: String) {
+                        if (room == pairCodes.current()) overlay?.updatePairInfo(room)
+                    }
+
                     override fun onClientPresence(present: Boolean) {
+                        relayClientPresent = present
                         if (present) {
                             mainHandler.removeCallbacks(clientDisconnectGrace)
                         } else {
@@ -179,6 +193,7 @@ class SweetSpotService : Service(), ServiceActions {
                             if (present) OverlayController.RELAY_CONNECTED else OverlayController.RELAY_WAITING
                         )
                         if (present) measurementController?.clientPresenceChanged(true)
+                        if (!present) rotatePairingSession()
                     }
                 }
             }
@@ -189,8 +204,8 @@ class SweetSpotService : Service(), ServiceActions {
                 ::stateSnapshotJson,
                 ::isCalibrationStateVerified,
                 ::calibrationRollbackTargetActive,
-                acquireAudioOperation = { audioOperationRunning.compareAndSet(false, true) },
-                releaseAudioOperation = { audioOperationRunning.set(false) },
+                acquireAudioOperation = { audioOperationGate.tryAcquireTransient() },
+                releaseAudioOperation = { audioOperationGate.releaseTransient() },
             )
 
             engine = createdEngine
@@ -220,25 +235,45 @@ class SweetSpotService : Service(), ServiceActions {
             try { createdWebServer?.stop() } catch (_: Throwable) {}
             try { createdOverlay?.hide() } catch (_: Throwable) {}
             try { createdEngine?.release() } catch (_: Throwable) {}
-            audioOperationRunning.set(false)
+            audioOperationGate.forceRelease()
             throw error
         }
     }
 
     @Synchronized
-    private fun rotatePairingSession(): String {
+    private fun rotatePairingSession(force: Boolean = false): PairCodeManager.RotationResult {
+        val now = System.currentTimeMillis()
+        val due = pairingRotationPending || pairCodes.isExpired(now) ||
+            now >= pairCodes.currentSession().expiresAt - PairCodeManager.ROTATION_MARGIN_MS
+        if (!force && !due) {
+            schedulePairingRotation()
+            return PairCodeManager.RotationResult(pairCodes.currentSession(), rotated = false)
+        }
+        val decision = PairCodeManager.rotationDecision(
+            clientConnected = relayClientPresent,
+            calibrationCritical = measurementController?.isActive() == true || audioOperationGate.isHeld(),
+        )
+        if (decision == PairCodeManager.RotationDecision.DEFER) {
+            pairingRotationPending = true
+            schedulePairingRotation()
+            return PairCodeManager.RotationResult(pairCodes.currentSession(), rotated = false)
+        }
+        pairingRotationPending = false
         val session = pairCodes.rotate()
-        overlay?.updatePairInfo(session.code)
         relay?.reconnectForPairingRotation()
         schedulePairingRotation()
-        return session.code
+        return PairCodeManager.RotationResult(session, rotated = true)
     }
 
     private fun schedulePairingRotation() {
         mainHandler.removeCallbacks(pairingRotation)
         val session = pairCodes.currentSession()
-        val delay = (session.expiresAt - System.currentTimeMillis() - PairCodeManager.ROTATION_MARGIN_MS)
-            .coerceAtLeast(1_000L)
+        val delay = if (pairingRotationPending) {
+            1_000L
+        } else {
+            (session.expiresAt - System.currentTimeMillis() - PairCodeManager.ROTATION_MARGIN_MS)
+                .coerceAtLeast(1_000L)
+        }
         mainHandler.postDelayed(pairingRotation, delay)
     }
 
@@ -330,6 +365,7 @@ class SweetSpotService : Service(), ServiceActions {
         mainHandler.removeCallbacks(clientDisconnectGrace)
         measurementController?.shutdown()
         measurementController = null
+        releasePersistentProbeBlocking()
         stopForeground(STOP_FOREGROUND_REMOVE)
         relay?.stop()
         relay = null
@@ -341,6 +377,11 @@ class SweetSpotService : Service(), ServiceActions {
             engine?.release()
             engine = null
         }
+        persistentProbeLeaseHeld = false
+        persistentBands = 0
+        persistentCurveName = null
+        persistentProbeError = null
+        audioOperationGate.forceRelease()
         try { persistentVirtualizer?.release() } catch (_: Throwable) {}
         persistentVirtualizer = null
         probeExecutor.shutdownNow()
@@ -359,13 +400,16 @@ class SweetSpotService : Service(), ServiceActions {
             return
         }
         probeExecutor.submit {
+            var keepLease = false
             try {
+                persistentProbeError = null
                 persistentCurveName = null
                 val eq = dpEq() ?: throw IllegalStateException("Production DynamicsProcessing is not initialized")
                 if (!eq.clearDiagnosticProbe()) throw IllegalStateException("Could not restore production EQ before starting the diagnostic overlay")
                 if (bands != DynamicsProcessingEq.INTERNAL_BANDS) {
                     Log.w(TAG, "Diagnostic transfer probe requires ${DynamicsProcessingEq.INTERNAL_BANDS} bands; requested $bands")
                     persistentBands = 0
+                    persistentProbeError = "Diagnostic transfer probe requires exactly ${DynamicsProcessingEq.INTERNAL_BANDS} bands"
                     return@submit
                 }
                 if (eq.getChannelCount() < 1) throw IllegalStateException("Production DynamicsProcessing has no channels")
@@ -374,6 +418,11 @@ class SweetSpotService : Service(), ServiceActions {
                     throw IllegalStateException("Production DynamicsProcessing rejected the flat diagnostic overlay")
                 }
                 persistentCurveName = "flat"
+                if (!audioOperationGate.promoteToPersistent()) {
+                    throw IllegalStateException("Persistent diagnostic probe could not retain the audio-operation lease")
+                }
+                persistentProbeLeaseHeld = true
+                keepLease = true
                 Log.i(TAG, "=== Persistent DynamicsProcessing ACTIVE ===")
                 Log.i(TAG, "Bands: $persistentBands | Channels: ${eq.getChannelCount()} | Session: 0 (production owner)")
                 Log.i(TAG, "Diagnostic overlay is ready; it is not persisted and must be released after the experiment.")
@@ -381,32 +430,63 @@ class SweetSpotService : Service(), ServiceActions {
                 Log.e(TAG, "Persistent probe failed for $bands bands", e)
                 persistentBands = 0
                 persistentCurveName = null
+                persistentProbeError = e.message ?: "Persistent diagnostic probe failed"
             } finally {
-                releaseDiagnosticOperation()
+                if (!keepLease) {
+                    persistentProbeLeaseHeld = false
+                    releaseDiagnosticOperation()
+                }
             }
         }
     }
 
     /** Removes the temporary diagnostic overlay and restores production EQ. */
     override fun releasePersistentProbe() {
-        probeExecutor.submit {
-            try {
-                if (dpEq()?.clearDiagnosticProbe() != true) {
-                    throw IllegalStateException("Production DynamicsProcessing rejected diagnostic overlay removal")
-                }
-                persistentBands = 0
-                persistentCurveName = null
-                Log.i(TAG, "Diagnostic DynamicsProcessing probe released")
-            } catch (e: Throwable) {
-                Log.e(TAG, "Failed to release persistent instance", e)
+        probeExecutor.submit { releasePersistentProbeInternal() }
+    }
+
+    private fun releasePersistentProbeInternal() {
+        if (!persistentProbeLeaseHeld && dpEq()?.isDiagnosticProbeActive() != true) return
+        try {
+            val eq = dpEq() ?: throw IllegalStateException("Production DynamicsProcessing is not initialized")
+            if (!eq.clearDiagnosticProbe() || eq.isDiagnosticProbeActive() || !eq.isLiveDspVerified()) {
+                throw IllegalStateException("Production DynamicsProcessing restoration could not be verified")
             }
+            persistentProbeLeaseHeld = false
+            persistentBands = 0
+            persistentCurveName = null
+            persistentProbeError = null
+            audioOperationGate.releasePersistent()
+            Log.i(TAG, "Diagnostic DynamicsProcessing probe released")
+        } catch (e: Throwable) {
+            persistentProbeError = e.message ?: "Persistent diagnostic probe release failed"
+            Log.e(TAG, "Failed to release persistent instance", e)
+        }
+    }
+
+    private fun releasePersistentProbeBlocking() {
+        if (!audioOperationGate.isHeld() && dpEq()?.isDiagnosticProbeActive() != true) return
+        val done = CountDownLatch(1)
+        try {
+            probeExecutor.submit {
+                try {
+                    releasePersistentProbeInternal()
+                } finally {
+                    done.countDown()
+                }
+            }
+            done.await(2, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to schedule persistent probe release during shutdown", e)
         }
     }
 
     override fun getLastProbeResults(): List<DynamicsProcessingProbe.ProbeResult>? = lastProbeResults
     override fun isProbeRunning(): Boolean = probeRunning.get()
-    override fun isPersistentProbeActive(): Boolean = dpEq()?.isDiagnosticProbeActive() == true
+    override fun isPersistentProbeActive(): Boolean =
+        persistentProbeLeaseHeld || dpEq()?.isDiagnosticProbeActive() == true
     override fun getPersistentProbeBands(): Int = if (isPersistentProbeActive()) persistentBands else 0
+    override fun getPersistentProbeError(): String? = persistentProbeError
 
     /**
      * Dispatches dashboard control commands arriving via the mailbox. Runs on
@@ -845,6 +925,7 @@ class SweetSpotService : Service(), ServiceActions {
                     })
                 }
             } else JSONObject().put("active", false).put("bands", 0)
+            persistent.put("error", persistentProbeError ?: JSONObject.NULL)
             replyTo("probe.status", JSONObject().apply {
                 put("running", probeRunning.get())
                 put("available", lastProbeResults != null)
@@ -861,9 +942,19 @@ class SweetSpotService : Service(), ServiceActions {
         val rt = Runtime.getRuntime()
         val memInfo = Debug.MemoryInfo()
         Debug.getMemoryInfo(memInfo)
-        val appCpu = cpuPercentFor(android.os.Process.myPid())
         val asPid = findProcessPid("audioserver") ?: findProcessPid("audioserver64")
-        val asCpu = asPid?.let { cpuPercentFor(it) }
+        val appPid = android.os.Process.myPid()
+        val appStartTicks = cpuTicks(appPid)
+        val audioStartTicks = asPid?.let(::cpuTicks)
+        val start = System.nanoTime()
+        try { Thread.sleep(400) } catch (_: InterruptedException) {}
+        val wallSecs = (System.nanoTime() - start) / 1e9
+        val appCpu = cpuPercent(appStartTicks, cpuTicks(appPid), wallSecs)
+        val asCpu = if (asPid != null && audioStartTicks != null) {
+            cpuPercent(audioStartTicks, cpuTicks(asPid), wallSecs)
+        } else {
+            0.0
+        }
         return JSONObject().apply {
             put("javaHeapMax", rt.maxMemory())
             put("javaHeapTotal", rt.totalMemory())
@@ -873,29 +964,24 @@ class SweetSpotService : Service(), ServiceActions {
             put("pssTotalKb", memInfo.totalPss)
             put("privateDirtyKb", memInfo.totalPrivateDirty)
             put("cpuPercent", appCpu)
-            put("audioserverCpuPercent", asCpu ?: 0.0)
+            put("audioserverCpuPercent", asCpu)
             put("audioserverPid", asPid ?: JSONObject.NULL)
             put("persistentProbeActive", isPersistentProbeActive())
             put("persistentProbeBands", getPersistentProbeBands())
         }
     }
 
-    /** Samples utime+stime over a ~400ms window and returns percent of one core. */
-    private fun cpuPercentFor(pid: Int): Double {
-        fun ticks(): Long = try {
+    private fun cpuTicks(pid: Int): Long = try {
             val stat = File("/proc/$pid/stat").readText()
             val parts = stat.substring(stat.lastIndexOf(')') + 1).trim().split("\\s+".toRegex())
             (parts.getOrNull(12)?.toLongOrNull() ?: 0L) + (parts.getOrNull(13)?.toLongOrNull() ?: 0L)
-        } catch (_: Throwable) { 0L }
-        val t0 = ticks()
-        val start = System.nanoTime()
-        try { Thread.sleep(400) } catch (_: InterruptedException) {}
-        val t1 = ticks()
-        val wallSecs = (System.nanoTime() - start) / 1e9
+    } catch (_: Throwable) { 0L }
+
+    private fun cpuPercent(startTicks: Long, endTicks: Long, wallSecs: Double): Double {
         val clk = try {
             Os.sysconf(OsConstants._SC_CLK_TCK).toDouble()
         } catch (_: Throwable) { 100.0 }
-        return if (wallSecs > 0) ((t1 - t0) / clk / wallSecs) * 100.0 else 0.0
+        return if (wallSecs > 0) ((endTicks - startTicks) / clk / wallSecs) * 100.0 else 0.0
     }
 
     /** Finds a process PID by its comm name via /proc; null when SELinux hides it. */
@@ -1047,16 +1133,16 @@ class SweetSpotService : Service(), ServiceActions {
     override fun resetCalibration(): Boolean = dpEq()?.resetCalibration() ?: false
 
     private fun tryAcquireDiagnosticOperation(): Boolean {
-        if (!audioOperationRunning.compareAndSet(false, true)) return false
+        if (!audioOperationGate.tryAcquireTransient()) return false
         if (measurementController?.isActive() == true || dpEq()?.isDiagnosticProbeActive() == true) {
-            audioOperationRunning.set(false)
+            audioOperationGate.releaseTransient()
             return false
         }
         return true
     }
 
     private fun releaseDiagnosticOperation() {
-        audioOperationRunning.set(false)
+        audioOperationGate.releaseTransient()
     }
 
     /** Release the production engine so a diagnostic DynamicsProcessing can own session 0. */

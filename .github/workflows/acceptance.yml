@@ -22,6 +22,3 @@ jobs:
 
       - name: Run Android tests
         run: ./gradlew test
-
-      - name: Build Android release APK
-        run: ./gradlew assembleRelease

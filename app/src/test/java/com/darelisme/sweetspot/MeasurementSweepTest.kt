@@ -25,7 +25,8 @@ class MeasurementSweepTest {
         assertEquals(50, sweep.interSweepGapMs)
         assertEquals(20f, sweep.startHz, 0f)
         assertEquals(20_000f, sweep.endHz, 0f)
-        assertEquals(-12f, sweep.levelDbfs, 0f)
+        assertEquals(-12f, sweep.sweepLevelDbfs, 0f)
+        assertEquals(-12f, sweep.markerLevelDbfs, 0f)
         assertEquals(20, sweep.fadeInMs)
         assertEquals(20, sweep.fadeOutMs)
     }
@@ -109,6 +110,25 @@ class MeasurementSweepTest {
     }
 
     @Test
+    fun markerOnlySweepContainsOnlyTheTwoSharedMarkers() {
+        val sweep = MeasurementSweep(8_000, captureKind = "marker-only")
+        val pcm = MeasurementSweepGenerator.generateStereoPcm(sweep)
+        val parts = sweep.parts()
+        val leadingEnd = parts.sweepStartFrame
+        val trailingStart = parts.trailingMarkerStartFrame
+        val trailingEnd = trailingStart + parts.endMarkerFrames
+
+        assertEquals("marker-only", sweep.captureKind)
+        assertTrue((leadingEnd until trailingStart).all { frame ->
+            pcm[frame * 2].toInt() == 0 && pcm[frame * 2 + 1].toInt() == 0
+        })
+        assertTrue((parts.leadingMarkerStartFrame until leadingEnd).any { frame -> pcm[frame * 2].toInt() != 0 })
+        assertTrue((trailingStart until trailingEnd).any { frame -> pcm[frame * 2].toInt() != 0 })
+        assertTrue((trailingEnd until parts.totalFrames).all { frame ->
+            pcm[frame * 2].toInt() == 0 && pcm[frame * 2 + 1].toInt() == 0
+        })
+    }
+    @Test
     fun generatedSweepMatchesTheCrossLanguageGoldenVector() {
         val fixture = javaClass.classLoader
             ?.getResourceAsStream("measurement-sweep-golden.json")
@@ -138,7 +158,8 @@ class MeasurementSweepTest {
             endMarkerEndHz = number("endMarkerEndHz").toFloat(),
             endMarkerDurationMs = number("endMarkerDurationMs").toInt(),
             interSweepGapMs = number("interSweepGapMs").toInt(),
-            levelDbfs = number("levelDbfs").toFloat(),
+            sweepLevelDbfs = number("sweepLevelDbfs").toFloat(),
+            markerLevelDbfs = number("markerLevelDbfs").toFloat(),
             fadeInMs = number("fadeInMs").toInt(),
             fadeOutMs = number("fadeOutMs").toInt(),
         )

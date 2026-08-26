@@ -1,5 +1,6 @@
 {
   "sweep": {
+    "sweepRevision": "android-sweep-v2",
     "algorithm": "exponential-sine-v1",
     "captureKind": "position-composite",
     "sampleRate": 8000,
@@ -16,7 +17,8 @@
     "endMarkerEndHz": 1200,
     "endMarkerDurationMs": 4,
     "interSweepGapMs": 1,
-    "levelDbfs": -12,
+    "sweepLevelDbfs": -12,
+    "markerLevelDbfs": -12,
     "fadeInMs": 0,
     "fadeOutMs": 0
   },

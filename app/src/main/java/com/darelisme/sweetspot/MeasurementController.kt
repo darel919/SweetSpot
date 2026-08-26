@@ -707,7 +707,7 @@ class MeasurementController(
                         return@submit
                     }
                     try {
-                        val sweep = prepareSweep(route)
+                        val sweep = prepareSweep(route, context?.captureKind ?: "position-composite")
                         if (context == null || !context.sameCapture(session.continuedPositionContext)) {
                             session.continuedPositionContext = null
                         }
@@ -929,9 +929,10 @@ class MeasurementController(
         return resources
     }
 
-    private fun prepareSweep(channel: String): MeasurementSweep {
+    private fun prepareSweep(channel: String, captureKind: String = "position-composite"): MeasurementSweep {
         preparedSweep?.let { sweep ->
-            if (playbackResources != null) return sweep
+            if (playbackResources != null && sweep.captureKind == captureKind) return sweep
+            if (playbackResources != null && sweep.captureKind != captureKind) stopAudioTrack()
         }
         val nativeRate = AudioTrack.getNativeOutputSampleRate(AudioManager.STREAM_MUSIC)
         val candidateRates = listOf(48_000, nativeRate).filter { it > 0 }.distinct()
@@ -945,7 +946,7 @@ class MeasurementController(
                     AudioFormat.ENCODING_PCM_16BIT
                 )
                 if (minBuffer == AudioTrack.ERROR_BAD_VALUE || minBuffer == AudioTrack.ERROR) continue
-                val sweep = MeasurementSweep(sampleRate)
+                val sweep = MeasurementSweep(sampleRate, captureKind = captureKind)
                 val format = AudioFormat.Builder()
                     .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                     .setSampleRate(sampleRate)
@@ -1407,6 +1408,7 @@ class MeasurementController(
         private fun sweep(sweep: MeasurementSweep): org.json.JSONObject =
             org.json.JSONObject()
                 .put("algorithm", sweep.algorithm)
+                .put("sweepRevision", sweep.sweepRevision)
                 .put("sampleRate", sweep.sampleRate)
                 .put("startHz", sweep.startHz)
                 .put("endHz", sweep.endHz)
@@ -1421,7 +1423,8 @@ class MeasurementController(
                 .put("endMarkerEndHz", sweep.endMarkerEndHz)
                 .put("endMarkerDurationMs", sweep.endMarkerDurationMs)
                 .put("interSweepGapMs", sweep.interSweepGapMs)
-                .put("levelDbfs", sweep.levelDbfs)
+                .put("sweepLevelDbfs", sweep.sweepLevelDbfs)
+                .put("markerLevelDbfs", sweep.markerLevelDbfs)
                 .put("fadeInMs", sweep.fadeInMs)
                 .put("fadeOutMs", sweep.fadeOutMs)
                 .put("captureKind", sweep.captureKind)

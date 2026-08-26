@@ -30,16 +30,19 @@ data class MeasurementSweep(
     val endMarkerEndHz: Float = 1_500f,
     val endMarkerDurationMs: Int = 150,
     val interSweepGapMs: Int = 50,
-    val levelDbfs: Float = -12f,
+    val sweepLevelDbfs: Float = -12f,
+    val markerLevelDbfs: Float = -12f,
     val fadeInMs: Int = 20,
     val fadeOutMs: Int = 20,
     val algorithm: String = "exponential-sine-v1",
     val captureKind: String = "position-composite",
+    val sweepRevision: String = "android-sweep-v2",
 ) {
     val totalFrames: Int
         get() = parts().totalFrames
 
     internal data class Parts(
+        val captureKind: String,
         val preRollFrames: Int,
         val syncMarkerFrames: Int,
         val syncMarkerGapFrames: Int,
@@ -55,12 +58,17 @@ data class MeasurementSweep(
         val rightSweepStartFrame: Int
             get() = sweepStartFrame + sweepFrames + interSweepGapFrames
         val trailingMarkerStartFrame: Int
-            get() = rightSweepStartFrame + sweepFrames + syncMarkerGapFrames
+            get() = if (captureKind == "marker-only") {
+                leadingMarkerStartFrame + syncMarkerFrames + syncMarkerGapFrames
+            } else {
+                rightSweepStartFrame + sweepFrames + syncMarkerGapFrames
+            }
         val totalFrames: Int
             get() = trailingMarkerStartFrame + endMarkerFrames + postRollFrames
     }
 
     internal fun parts(): Parts = Parts(
+        captureKind = captureKind,
         preRollFrames = (preRollMs * sampleRate / 1000f).roundToInt(),
         syncMarkerFrames = (syncMarkerDurationMs * sampleRate / 1000f).roundToInt().coerceAtLeast(1),
         syncMarkerGapFrames = (syncMarkerGapMs * sampleRate / 1000f).roundToInt(),
@@ -102,7 +110,7 @@ object MeasurementSweepGenerator {
         val sweepFrames = parts.sweepFrames
         val fadeInFrames = (sweep.fadeInMs * sweep.sampleRate / 1000f).roundToInt()
         val fadeOutFrames = (sweep.fadeOutMs * sweep.sampleRate / 1000f).roundToInt()
-        val amplitude = 10.0.pow(sweep.levelDbfs / 20.0)
+        val amplitude = 10.0.pow(sweep.sweepLevelDbfs / 20.0)
         val logarithmicRate = ln(sweep.endHz / sweep.startHz) / (sweep.durationMs / 1000.0)
         val phaseScale = 2.0 * PI * sweep.startHz / logarithmicRate
         val leftEnabled = channel == "both" || channel == "left"
@@ -119,7 +127,7 @@ object MeasurementSweepGenerator {
             }
             val leftSweepFrame = frame - parts.sweepStartFrame
             val rightSweepFrame = frame - parts.rightSweepStartFrame
-            val leftValue = marker ?: sweepValue(
+            val leftValue = marker ?: if (sweep.captureKind == "marker-only") null else sweepValue(
                 sweep = sweep,
                 frame = leftSweepFrame,
                 frameCount = sweepFrames,
@@ -129,7 +137,7 @@ object MeasurementSweepGenerator {
                 phaseScale = phaseScale,
                 logarithmicRate = logarithmicRate,
             ).takeIf { leftEnabled }
-            val rightValue = marker ?: sweepValue(
+            val rightValue = marker ?: if (sweep.captureKind == "marker-only") null else sweepValue(
                 sweep = sweep,
                 frame = rightSweepFrame,
                 frameCount = sweepFrames,
@@ -180,7 +188,7 @@ object MeasurementSweepGenerator {
         val rate = (endHz - startHz) / (durationMs / 1000.0)
         val phase = 2.0 * PI * (startHz * time + 0.5 * rate * time * time)
         val window = if (frameCount <= 1) 1.0 else sin(PI * progress)
-        return 10.0.pow(sweep.levelDbfs / 20.0) * window * sin(phase)
+        return 10.0.pow(sweep.markerLevelDbfs / 20.0) * window * sin(phase)
     }
 
     private fun pcmSample(value: Double): Short =

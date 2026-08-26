@@ -53,7 +53,7 @@ data class MeasurementContext(
             positionCount in 1..16 &&
             positionIndex in 0 until positionCount &&
             channel == COMPOSITE_CHANNEL &&
-            (captureKind == CAPTURE_KIND || captureKind == MARKER_ONLY_CAPTURE_KIND) &&
+            captureKind in CAPTURE_KINDS &&
             repairChannel in CHANNELS &&
             attemptIndex in 0 until attemptCount &&
             attemptCount in 1..2 &&
@@ -182,8 +182,11 @@ data class MeasurementContext(
         private val CHANNELS = setOf("both", "left", "right")
         private val PHASES = setOf("measurement", "validation")
         private const val REFERENCE_CENTER = "center"
-        private const val CAPTURE_KIND = "position-composite"
-        private const val MARKER_ONLY_CAPTURE_KIND = "marker-only"
+        private val CAPTURE_KINDS = setOf(
+            "position-composite",
+            "marker-only",
+            "marker-production-spacing",
+        )
         private const val COMPOSITE_CHANNEL = "both"
 
         fun fromJson(value: JSONObject?): MeasurementContext? {

@@ -128,6 +128,23 @@ class MeasurementSweepTest {
             pcm[frame * 2].toInt() == 0 && pcm[frame * 2 + 1].toInt() == 0
         })
     }
+
+    @Test
+    fun productionSpacingMarkerSweepPreservesProductionSeparationWithoutSweeps() {
+        val sweep = MeasurementSweep(48_000, captureKind = "marker-production-spacing")
+        val pcm = MeasurementSweepGenerator.generateStereoPcm(sweep)
+        val parts = sweep.parts()
+
+        assertEquals("marker-production-spacing", sweep.captureKind)
+        assertEquals(158_400, parts.trailingMarkerStartFrame - parts.leadingMarkerStartFrame)
+        assertTrue((parts.sweepStartFrame until parts.trailingMarkerStartFrame).all { frame ->
+            pcm[frame * 2].toInt() == 0 && pcm[frame * 2 + 1].toInt() == 0
+        })
+        assertTrue((parts.leadingMarkerStartFrame until parts.sweepStartFrame).any { frame -> pcm[frame * 2].toInt() != 0 })
+        assertTrue((parts.trailingMarkerStartFrame until parts.trailingMarkerStartFrame + parts.endMarkerFrames)
+            .any { frame -> pcm[frame * 2].toInt() != 0 })
+    }
+
     @Test
     fun generatedSweepMatchesTheCrossLanguageGoldenVector() {
         val fixture = javaClass.classLoader

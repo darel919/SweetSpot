@@ -127,7 +127,7 @@ object MeasurementSweepGenerator {
             }
             val leftSweepFrame = frame - parts.sweepStartFrame
             val rightSweepFrame = frame - parts.rightSweepStartFrame
-            val leftValue = marker ?: if (sweep.captureKind == "marker-only") null else sweepValue(
+            val leftValue = marker ?: if (sweep.captureKind != "position-composite") null else sweepValue(
                 sweep = sweep,
                 frame = leftSweepFrame,
                 frameCount = sweepFrames,
@@ -137,7 +137,7 @@ object MeasurementSweepGenerator {
                 phaseScale = phaseScale,
                 logarithmicRate = logarithmicRate,
             ).takeIf { leftEnabled }
-            val rightValue = marker ?: if (sweep.captureKind == "marker-only") null else sweepValue(
+            val rightValue = marker ?: if (sweep.captureKind != "position-composite") null else sweepValue(
                 sweep = sweep,
                 frame = rightSweepFrame,
                 frameCount = sweepFrames,

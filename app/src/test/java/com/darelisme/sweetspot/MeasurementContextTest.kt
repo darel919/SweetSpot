@@ -22,6 +22,7 @@ class MeasurementContextTest {
         attemptIndex: Int = 0,
         attemptCount: Int = 2,
         phase: String = "measurement",
+        captureKind: String = "position-composite",
     ): MeasurementContext {
         val (xCm, yCm, zCm) = target(positionId)
         return MeasurementContext(
@@ -33,7 +34,7 @@ class MeasurementContextTest {
             positionIndex = positionIndex,
             positionCount = positionCount,
             channel = "both",
-            captureKind = "position-composite",
+            captureKind = captureKind,
             repairChannel = repairChannel,
             attemptIndex = attemptIndex,
             attemptCount = attemptCount,
@@ -47,6 +48,11 @@ class MeasurementContextTest {
 
         assertEquals(true, value.isValid())
         assertEquals("Position 3 of 5", value.label())
+    }
+
+    @Test
+    fun acceptsTheProductionSpacingMarkerDiagnosticCaptureKind() {
+        assertEquals(true, context(captureKind = "marker-production-spacing").isValid())
     }
 
     @Test

@@ -23,7 +23,6 @@ internal val CALIBRATION_ERROR_CODES: Set<String> = setOf(
     "capture_clipped",
     "capture_too_short",
     "capture_sample_rate_changed",
-    "sweep_not_found",
     "sync_marker_not_found",
     "clock_drift_unreliable",
     "signal_too_low",

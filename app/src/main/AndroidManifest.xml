@@ -54,7 +54,7 @@
 
         <receiver
             android:name=".SweetSpotCommandReceiver"
-            android:exported="true">
+            android:exported="false">
             <intent-filter>
                 <action android:name="com.darelisme.sweetspot.START" />
                 <action android:name="com.darelisme.sweetspot.PRESET" />

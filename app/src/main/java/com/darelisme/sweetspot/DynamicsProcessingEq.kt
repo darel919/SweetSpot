@@ -78,30 +78,28 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
             afterDb: Float?,
             reason: String?,
         ): NormalizedValidationResult {
-            if (requestedStatus == CalibrationValidationStatus.PASSED
-                || requestedStatus == CalibrationValidationStatus.WORSE
-            ) {
-                if (beforeDb == null || afterDb == null || !beforeDb.isFinite() || !afterDb.isFinite()) {
-                    return NormalizedValidationResult(
-                        status = CalibrationValidationStatus.INCONCLUSIVE,
-                        beforeDb = null,
-                        afterDb = null,
-                        reason = reason ?: "Validation metrics were unavailable",
-                    )
-                }
-                val normalizedStatus = if (afterDb > beforeDb + VALIDATION_WORSE_TOLERANCE_DB) {
-                    CalibrationValidationStatus.WORSE
-                } else {
-                    CalibrationValidationStatus.PASSED
-                }
-                return NormalizedValidationResult(normalizedStatus, beforeDb, afterDb, reason)
+            if (beforeDb == null || afterDb == null || !beforeDb.isFinite() || !afterDb.isFinite()) {
+                return NormalizedValidationResult(
+                    status = CalibrationValidationStatus.INCONCLUSIVE,
+                    beforeDb = null,
+                    afterDb = null,
+                    reason = reason ?: "Validation metrics were unavailable",
+                )
             }
-            return NormalizedValidationResult(
-                status = requestedStatus,
-                beforeDb = null,
-                afterDb = null,
-                reason = reason,
-            )
+            val normalizedStatus = when {
+                afterDb < beforeDb - VALIDATION_WORSE_TOLERANCE_DB -> CalibrationValidationStatus.PASSED
+                afterDb > beforeDb + VALIDATION_WORSE_TOLERANCE_DB -> CalibrationValidationStatus.WORSE
+                else -> CalibrationValidationStatus.INCONCLUSIVE
+            }
+            val consistencyReason = if (requestedStatus != normalizedStatus
+                && requestedStatus != CalibrationValidationStatus.INCONCLUSIVE
+                && reason == null
+            ) {
+                "Validation status was derived from the reported metrics"
+            } else {
+                reason
+            }
+            return NormalizedValidationResult(normalizedStatus, beforeDb, afterDb, consistencyReason)
         }
     }
 
@@ -305,7 +303,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
 
     @Synchronized
     override fun saveCurrentProfile(name: String) {
-        if (measurementBypassState != null) return
+        if (isAudioStateOverrideActive()) return
         val levels = IntArray(USER_BANDS) { (userGains[it] * 100).roundToInt() }
         profileStore.saveNamed(name, isEnabled(), activePreset, levels)
         save()
@@ -474,6 +472,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
      */
     @Synchronized
     fun applyDiagnosticProbe(common: FloatArray, left: FloatArray? = null, right: FloatArray? = null): Boolean {
+        if (measurementBypassState != null || calibrationValidationState != null) return false
         if (!isValidDiagnosticProbeCurve(common)) return false
         if ((left == null) != (right == null)) return false
         if (left != null && (right == null || !isValidDiagnosticProbeCurve(left) || !isValidDiagnosticProbeCurve(right))) return false
@@ -491,6 +490,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
 
     @Synchronized
     fun clearDiagnosticProbe(): Boolean {
+        if (measurementBypassState != null || calibrationValidationState != null) return false
         val current = diagnosticProbeCurve ?: return true
         diagnosticProbeCurve = null
         if (applyAll()) return true
@@ -781,14 +781,35 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     @Synchronized
     fun resetCalibration(): Boolean {
         if (isAudioStateOverrideActive()) return false
+        val previous = requestedCalibrationState()
         calibration = FloatArray(INTERNAL_BANDS)
         calibrationLeft = null
         calibrationRight = null
         calibrationActive = false
         val applied = applyAll(trackCalibrationStatus = true)
-        val persisted = profileStore.clearCalibration()
-        if (!applied || !persisted) Log.w(TAG, "Calibration reset could not be fully verified")
-        return applied && persisted
+        if (!applied) {
+            restoreCalibrationAfterReset(previous)
+            return false
+        }
+        if (profileStore.clearCalibration()) return true
+
+        val restored = restoreCalibrationAfterReset(previous)
+        lastCalibrationApplySucceeded = false
+        lastCalibrationApplyError = if (restored) {
+            "Calibration reset could not be persisted; previous calibration was restored"
+        } else {
+            "Calibration reset could not be persisted and previous calibration could not be verified"
+        }
+        Log.w(TAG, lastCalibrationApplyError ?: "Calibration reset failed")
+        return false
+    }
+
+    private fun restoreCalibrationAfterReset(previous: RequestedCalibrationState): Boolean {
+        calibration = previous.common.copyOf()
+        calibrationLeft = previous.left?.copyOf()
+        calibrationRight = previous.right?.copyOf()
+        calibrationActive = previous.active
+        return applyAll(trackCalibrationStatus = true)
     }
 
     @Synchronized
@@ -943,12 +964,14 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         if (!headroomVerified) return 0f
         var maximum = 0f
         val probe = diagnosticProbeCurve
-        if (measurementBypassState != null) {
-            if (probe == null) return 0f
+        if (probe != null) {
             maximum = max(maximum, probe.common.maxOrNull()?.toDouble()?.toFloat() ?: 0f)
             maximum = max(maximum, probe.left?.maxOrNull()?.toDouble()?.toFloat() ?: 0f)
             maximum = max(maximum, probe.right?.maxOrNull()?.toDouble()?.toFloat() ?: 0f)
             return if (maximum > 0f) -(maximum + 0.5f) else 0f
+        }
+        if (measurementBypassState != null) {
+            return 0f
         }
         val channelCount = dp?.channelCount ?: 0
         for (ch in 0 until maxOf(1, channelCount)) {
@@ -961,11 +984,6 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
                 val userGain = if (calibrationValidationState == null) userGains[userBandForInternal[i]] else 0f
                 maximum = max(maximum, channelCalibration[i] + userGain)
             }
-        }
-        if (probe != null) {
-            maximum = max(maximum, probe.common.maxOrNull()?.toDouble()?.toFloat() ?: 0f)
-            maximum = max(maximum, probe.left?.maxOrNull()?.toDouble()?.toFloat() ?: 0f)
-            maximum = max(maximum, probe.right?.maxOrNull()?.toDouble()?.toFloat() ?: 0f)
         }
         return if (maximum > 0f) -(maximum + 0.5f) else 0f
     }
@@ -1242,5 +1260,8 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     }
 
     private fun isAudioStateOverrideActive(): Boolean =
-        measurementBypassState != null || calibrationValidationState != null
+        dp == null ||
+            diagnosticProbeCurve != null ||
+            measurementBypassState != null ||
+            calibrationValidationState != null
 }

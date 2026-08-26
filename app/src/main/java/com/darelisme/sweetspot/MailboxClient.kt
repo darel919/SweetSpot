@@ -79,6 +79,17 @@ class MailboxClient(
         executor.shutdownNow()
     }
 
+    fun reconnectForPairingRotation() {
+        if (!running.get()) return
+        executor.execute {
+            reconnectScheduled.set(false)
+            socket?.close(1000, "pairing session rotated")
+            socket = null
+            reconnectDelayMs = WS_RECONNECT_MIN_MS
+            connectWebSocket()
+        }
+    }
+
     private fun connectWebSocket() {
         if (!running.get() || socket != null) return
         val room = PairCodeManager.normalize(roomProvider())
@@ -192,7 +203,11 @@ class MailboxClient(
                     postToDevice(env, "diagnostics.effects", effectsDiagnosticsProvider())
                 } catch (e: Exception) {
                     Log.e(TAG, "diagnostics.effects failed", e)
-                    postToDevice(env, "diagnostics.effects", JSONObject().put("error", "${e.javaClass.simpleName}: ${e.message}"))
+                    postToDevice(
+                        env,
+                        "state.snapshot",
+                        snapshotProvider().put("ok", false).put("error", "${e.javaClass.simpleName}: ${e.message}"),
+                    )
                 }
             }
             else -> {

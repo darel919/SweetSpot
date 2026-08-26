@@ -163,6 +163,8 @@ class MeasurementController(
     private val stateSnapshotProvider: () -> JSONObject = { JSONObject() },
     private val finalStateVerifier: () -> Boolean = { true },
     private val rollbackTargetActiveProvider: (String) -> Boolean? = { null },
+    private val acquireAudioOperation: () -> Boolean = { true },
+    private val releaseAudioOperation: () -> Unit = {},
 ) {
     companion object {
         private const val TAG = "SweetSpotMeasurement"
@@ -212,6 +214,7 @@ class MeasurementController(
         var endedEventPublished: Boolean = false,
         var validationAbortError: Pair<String, String>? = null,
         var cancellationRequested: Boolean = false,
+        var audioOperationHeld: Boolean = false,
     )
 
     private class PlaybackResources(val track: AudioTrack) {
@@ -269,6 +272,11 @@ class MeasurementController(
                 emitError(emit, replyTo, sessionId, "already_measuring", "Another calibration session is active")
                 return@submit
             }
+            if (!acquireAudioOperation()) {
+                sessionFence.terminate(sessionId)
+                emitError(emit, replyTo, sessionId, "already_measuring", "Another audio operation is active")
+                return@submit
+            }
 
             val rollbackTargetActive = if (phase == "validation" && candidateId != null) {
                 try {
@@ -288,6 +296,7 @@ class MeasurementController(
                 replyTo,
                 rollbackTargetActive,
             )
+            session.audioOperationHeld = true
             activeSession = session
             state = SessionState.AwaitingUi(session)
             touchWatchdog()
@@ -801,6 +810,7 @@ class MeasurementController(
             stopAudioTrack()
         } finally {
             stopAudioTrack()
+            activeSession?.let(::releaseSessionAudioOperation)
             executor.shutdownNow()
         }
     }
@@ -1138,6 +1148,7 @@ class MeasurementController(
         sessionFence.terminate(session.id)
         activeSession = null
         state = SessionState.Idle
+        releaseSessionAudioOperation(session)
         val outcome = if (session.cancellationRequested) "cancelled" else "error=${finalError?.first}"
         Log.i(TAG, "Calibration session ended: ${session.id}, outcome=$outcome")
     }
@@ -1276,6 +1287,13 @@ class MeasurementController(
         sessionFence.terminate(session.id)
         activeSession = null
         state = SessionState.Idle
+        releaseSessionAudioOperation(session)
+    }
+
+    private fun releaseSessionAudioOperation(session: Session) {
+        if (!session.audioOperationHeld) return
+        session.audioOperationHeld = false
+        releaseAudioOperation()
     }
 
     private fun stopAudioTrack() {

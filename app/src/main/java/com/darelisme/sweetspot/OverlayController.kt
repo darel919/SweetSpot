@@ -234,17 +234,6 @@ class OverlayController(private val context: Context) {
             }
         }
 
-        val lanIp = NetworkUtils.getLanIpAddress()
-        if (lanIp != null) {
-            val lan = TextView(context).apply {
-                textSize = 13f
-                setTextColor(0xFF77777C.toInt())
-                text = "LAN debug: http://$lanIp:${Config.WEB_PORT}"
-                setPadding(0, 12, 0, 0)
-            }
-            container.addView(lan)
-        }
-
         val hideBtn = TextView(context).apply {
             text = "Hide"
             textSize = 18f

@@ -12,6 +12,7 @@ internal data class CalibrationPackageSourceDevice(
 
 internal data class CalibrationPackage(
     val exportedAt: Double,
+    val analysisRevision: String = CalibrationPackageCodec.ANALYSIS_REVISION,
     val sourceDevice: CalibrationPackageSourceDevice,
     val active: Boolean,
     val frequenciesHz: DoubleArray,
@@ -31,11 +32,13 @@ internal sealed interface CalibrationPackageParseResult {
 internal object CalibrationPackageCodec {
     const val FORMAT = "sweetspot.calibration"
     const val VERSION = 1
+    const val ANALYSIS_REVISION = "response-direct-arrival-v3"
 
     private const val MAX_GAIN_DB = 12f
     private const val MAX_SOURCE_ID_LENGTH = 256
     private const val MAX_SOURCE_NAME_LENGTH = 256
     private const val MAX_SOURCE_APP_VERSION_LENGTH = 64
+    private const val MAX_SOURCE_BUILD_ID_LENGTH = 128
 
     fun parse(
         payload: JSONObject,
@@ -54,6 +57,9 @@ internal object CalibrationPackageCodec {
 
         val exportedAt = finiteNumber(payload.opt("exportedAt"))
         if (exportedAt == null || exportedAt <= 0.0) return rejected("exportedAt must be a positive finite number")
+
+        val analysisRevision = payload.opt("analysisRevision") as? String
+        if (analysisRevision != ANALYSIS_REVISION) return rejected("Unsupported calibration analysis revision")
 
         val sourceDevice = parseSourceDevice(payload.opt("sourceDevice"))
             ?: return rejected("sourceDevice metadata is invalid")
@@ -122,6 +128,7 @@ internal object CalibrationPackageCodec {
 
         val value = CalibrationPackage(
             exportedAt = exportedAt,
+            analysisRevision = analysisRevision,
             sourceDevice = sourceDevice,
             active = active,
             frequenciesHz = frequenciesHz,
@@ -151,6 +158,7 @@ internal object CalibrationPackageCodec {
         independentRoutingVerified: Boolean,
     ): String? {
         if (!value.active) return "Inactive calibration packages cannot be imported"
+        if (value.analysisRevision != ANALYSIS_REVISION) return "Unsupported calibration analysis revision"
         if (expectedFrequenciesHz.size != DynamicsProcessingEq.INTERNAL_BANDS
             || !value.frequenciesHz.contentEquals(expectedFrequenciesHz.map(Int::toDouble).toDoubleArray())
         ) {
@@ -193,6 +201,7 @@ internal object CalibrationPackageCodec {
             put("format", FORMAT)
             put("version", VERSION)
             put("exportedAt", value.exportedAt)
+            put("analysisRevision", value.analysisRevision)
             put("sourceDevice", JSONObject().apply {
                 put("id", value.sourceDevice.id)
                 put("name", value.sourceDevice.name)
@@ -215,10 +224,12 @@ internal object CalibrationPackageCodec {
         val id = source.opt("id") as? String ?: return null
         val name = source.opt("name") as? String ?: return null
         val appVersion = source.opt("appVersion") as? String ?: return null
+        val buildId = source.opt("buildId") as? String
         if (id.isBlank() || id.length > MAX_SOURCE_ID_LENGTH) return null
         if (name.isBlank() || name.length > MAX_SOURCE_NAME_LENGTH) return null
         if (appVersion.isBlank() || appVersion.length > MAX_SOURCE_APP_VERSION_LENGTH) return null
-        return CalibrationPackageSourceDevice(id, name, appVersion)
+        if (buildId != null && (buildId.isBlank() || buildId.length > MAX_SOURCE_BUILD_ID_LENGTH)) return null
+        return CalibrationPackageSourceDevice(id, name, appVersion, buildId)
     }
 
     private fun parseFrequencyArray(value: Any?): DoubleArray? {

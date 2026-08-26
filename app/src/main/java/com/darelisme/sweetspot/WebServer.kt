@@ -4,15 +4,15 @@ import android.os.Debug
 import android.system.Os
 import android.system.OsConstants
 import android.util.Log
-import java.io.BufferedReader
 import java.io.File
-import java.io.InputStreamReader
+import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
@@ -86,6 +86,7 @@ class WebServer(
     private val serviceActions: ServiceActions? = null,
     private val port: Int = Config.WEB_PORT,
     private val eqAppliedNotifier: ((String) -> Unit)? = null,
+    private val authTokenProvider: () -> String,
     private val pairCodeProvider: () -> String,
     private val pairCodeRotateProvider: () -> String,
 ) {
@@ -95,12 +96,23 @@ class WebServer(
         private const val MAX_HEADER_LINE_CHARS = 8 * 1024
         private const val MAX_HEADER_CHARS = 32 * 1024
         private const val MAX_HEADER_COUNT = 32
-        private const val MAX_REQUEST_BODY_CHARS = 64 * 1024
+        private const val MAX_REQUEST_BODY_BYTES = 64 * 1024
         private const val HTTP_WORKER_COUNT = 2
         private const val HTTP_QUEUE_CAPACITY = 16
 
         internal fun rootRedirectResponse(pairCodeProvider: () -> String): HttpResponse =
             redirectResponse(PairCodeManager.connectUrl(pairCodeProvider()))
+
+        internal fun isAuthorized(headers: Map<String, String>, expectedToken: String): Boolean {
+            if (expectedToken.isBlank()) return false
+            val authorization = headers["authorization"] ?: return false
+            val prefix = "Bearer "
+            if (!authorization.startsWith(prefix)) return false
+            return MessageDigest.isEqual(
+                authorization.removePrefix(prefix).toByteArray(StandardCharsets.UTF_8),
+                expectedToken.toByteArray(StandardCharsets.UTF_8),
+            )
+        }
 
         internal fun redirectResponse(location: String): HttpResponse =
             HttpResponse(
@@ -110,6 +122,9 @@ class WebServer(
             )
 
         internal fun serializeResponse(response: HttpResponse): ByteArray {
+            require('\r' !in response.reasonPhrase && '\n' !in response.reasonPhrase) {
+                "HTTP reason phrase contains CR or LF"
+            }
             response.headers.forEach { (name, value) ->
                 require('\r' !in name && '\n' !in name && '\r' !in value && '\n' !in value) {
                     "HTTP header contains CR or LF"
@@ -130,7 +145,6 @@ class WebServer(
                 append("Content-Length: ${response.body.size}\r\n")
                 append("Connection: close\r\n")
                 append("Cache-Control: no-store\r\n")
-                append("Access-Control-Allow-Origin: *\r\n")
                 append("\r\n")
             }.toByteArray(StandardCharsets.UTF_8)
 
@@ -169,11 +183,11 @@ class WebServer(
 
     fun start() {
         if (running.get()) return
+        val ss = ServerSocket(port, 0, InetAddress.getByName("0.0.0.0"))
+        serverSocket = ss
         running.set(true)
         acceptThread = Thread({
             try {
-                val ss = ServerSocket(port, 0, InetAddress.getByName("0.0.0.0"))
-                serverSocket = ss
                 Log.i(TAG, "Listening on 0.0.0.0:$port")
                 while (running.get()) {
                     try {
@@ -210,7 +224,7 @@ class WebServer(
     private fun handle(client: Socket) {
         try {
             client.soTimeout = 5000
-            val input = BufferedReader(InputStreamReader(client.getInputStream(), StandardCharsets.UTF_8))
+            val input = client.getInputStream()
             val requestLine = readBoundedLine(input, MAX_REQUEST_LINE_CHARS) ?: return
             val parts = requestLine.split(" ")
             if (parts.size < 2) {
@@ -224,7 +238,11 @@ class WebServer(
             var headerChars = 0
             var headerCount = 0
             while (true) {
-                val line = readBoundedLine(input, MAX_HEADER_LINE_CHARS) ?: break
+                val line = readBoundedLine(input, MAX_HEADER_LINE_CHARS)
+                    ?: run {
+                        sendError(client, 400, "Incomplete request headers")
+                        return
+                    }
                 if (line.isEmpty()) break
                 headerCount++
                 headerChars += line.length
@@ -232,39 +250,41 @@ class WebServer(
                     throw RequestTooLargeException()
                 }
                 val idx = line.indexOf(':')
-                if (idx > 0) {
-                    headers[line.substring(0, idx).trim().lowercase()] =
-                        line.substring(idx + 1).trim()
+                if (idx <= 0) {
+                    sendError(client, 400, "Malformed request header")
+                    return
                 }
+                headers[line.substring(0, idx).trim().lowercase()] =
+                    line.substring(idx + 1).trim()
+            }
+
+            if (path != "/api/health" && !isAuthorized(headers, authTokenProvider())) {
+                sendError(client, 401, "Unauthorized")
+                return
             }
 
             var body = ""
-            val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
-            if (contentLength > 0 && method == "POST") {
-                if (contentLength > MAX_REQUEST_BODY_CHARS) {
+            if (method == "POST") {
+                if (headers["transfer-encoding"] != null) {
+                    sendError(client, 411, "Chunked transfer encoding is not supported")
+                    return
+                }
+                val contentLengthHeader = headers["content-length"]
+                val contentLength = contentLengthHeader?.toLongOrNull()
+                if (contentLength == null || contentLength < 0) {
+                    sendError(client, 411, "Content-Length is required")
+                    return
+                }
+                if (contentLength > MAX_REQUEST_BODY_BYTES) {
                     sendError(client, 413, "Request body too large")
                     return
                 }
-                val buf = CharArray(contentLength)
-                var read = 0
-                while (read < contentLength) {
-                    val n = input.read(buf, read, contentLength - read)
-                    if (n < 0) break
-                    read += n
-                }
-                body = String(buf, 0, read)
-            } else if (method == "POST") {
-                val sb = StringBuilder()
-                while (input.ready() && sb.length < MAX_REQUEST_BODY_CHARS) {
-                    val ch = input.read()
-                    if (ch == -1) break
-                    sb.append(ch.toChar())
-                }
-                if (sb.length >= MAX_REQUEST_BODY_CHARS) {
-                    sendError(client, 413, "Request body too large")
-                    return
-                }
-                body = sb.toString()
+                val bytes = readExactly(input, contentLength.toInt())
+                    ?: run {
+                        sendError(client, 400, "Incomplete request body")
+                        return
+                    }
+                body = bytes.toString(StandardCharsets.UTF_8)
             }
 
             route(client, method, path, body)
@@ -277,20 +297,30 @@ class WebServer(
         }
     }
 
-    private fun readBoundedLine(input: BufferedReader, maxChars: Int): String? {
-        val line = StringBuilder(minOf(maxChars, 128))
-        var sawCharacter = false
+    private fun readBoundedLine(input: InputStream, maxBytes: Int): String? {
+        val line = ByteArray(maxBytes)
+        var length = 0
         while (true) {
             val codePoint = input.read()
-            if (codePoint < 0) return if (sawCharacter) line.toString() else null
-            sawCharacter = true
+            if (codePoint < 0) return if (length > 0) String(line, 0, length, StandardCharsets.ISO_8859_1) else null
             if (codePoint == '\n'.code) {
-                if (line.isNotEmpty() && line.last() == '\r') line.setLength(line.length - 1)
-                return line.toString()
+                val contentLength = if (length > 0 && line[length - 1].toInt() == '\r'.code) length - 1 else length
+                return String(line, 0, contentLength, StandardCharsets.ISO_8859_1)
             }
-            if (line.length >= maxChars) throw RequestTooLargeException()
-            line.append(codePoint.toChar())
+            if (length >= maxBytes) throw RequestTooLargeException()
+            line[length++] = codePoint.toByte()
         }
+    }
+
+    private fun readExactly(input: InputStream, length: Int): ByteArray? {
+        val bytes = ByteArray(length)
+        var offset = 0
+        while (offset < length) {
+            val read = input.read(bytes, offset, length - offset)
+            if (read < 0) return null
+            offset += read
+        }
+        return bytes
     }
 
     private class RequestTooLargeException : RuntimeException()
@@ -301,13 +331,15 @@ class WebServer(
                 sendResponse(client, rootRedirectResponse(pairCodeProvider))
 
             method == "GET" && path == "/api/health" ->
-                sendJson(client, """{"ok":true,"service":"SweetSpot","apiVersion":1}""")
+                sendJson(client, JSONObject().put("ok", true).put("service", "SweetSpot").put("apiVersion", 1).toString())
 
             method == "GET" && path == "/api/state" ->
                 sendJson(client, stateJson())
 
             method == "GET" && path == "/api/profiles" ->
-                sendJson(client, """{"profiles":[${engine.listProfiles().joinToString(",") { """"$it"""" }}]}""")
+                sendJson(client, JSONObject().apply {
+                    put("profiles", JSONArray().apply { engine.listProfiles().forEach { put(it) } })
+                }.toString())
 
             method == "POST" && path == "/api/preset" -> {
                 val preset = parseIntField(body, "preset") ?: 1
@@ -382,7 +414,7 @@ class WebServer(
 
             method == "POST" && path == "/api/probe" -> {
                 serviceActions?.runProbe()
-                sendJson(client, """{"status":"started"}""")
+                sendJson(client, JSONObject().put("status", "started").toString())
             }
 
             method == "GET" && path == "/api/probe/status" ->
@@ -391,16 +423,20 @@ class WebServer(
             method == "POST" && path == "/api/probe/persist" -> {
                 val bands = parseIntField(body, "bands") ?: 128
                 if (bands != DynamicsProcessingEq.INTERNAL_BANDS) {
-                    sendJson(client, """{"status":"rejected","error":"The diagnostic overlay requires exactly 64 bands","bands":$bands}""")
+                    sendJson(client, JSONObject().apply {
+                        put("status", "rejected")
+                        put("error", "The diagnostic overlay requires exactly 64 bands")
+                        put("bands", bands)
+                    }.toString())
                 } else {
                     serviceActions?.runPersistentProbe(bands)
-                    sendJson(client, """{"status":"persistent_started","bands":$bands}""")
+                    sendJson(client, JSONObject().put("status", "persistent_started").put("bands", bands).toString())
                 }
             }
 
             method == "POST" && path == "/api/probe/release" -> {
                 serviceActions?.releasePersistentProbe()
-                sendJson(client, """{"status":"released"}""")
+                sendJson(client, JSONObject().put("status", "released").toString())
             }
 
             method == "POST" && path == "/api/probe/apply-curve" -> {
@@ -413,7 +449,7 @@ class WebServer(
                 } else {
                     "unknown-curve"
                 }
-                sendJson(client, """{"status":"$msg","curve":"$curve"}""")
+                sendJson(client, JSONObject().put("status", msg).put("curve", curve).toString())
             }
 
             method == "POST" && path == "/api/probe/apply-bands" -> {
@@ -438,7 +474,7 @@ class WebServer(
 
             method == "POST" && path == "/api/effects/diagnose" -> {
                 serviceActions?.runEffectDiagnostics()
-                sendJson(client, """{"status":"started"}""")
+                sendJson(client, JSONObject().put("status", "started").toString())
             }
 
             method == "GET" && path == "/api/effects/diagnostics" ->
@@ -465,12 +501,18 @@ class WebServer(
 
             method == "GET" && path == "/api/paircode" -> {
                 val code = pairCodeProvider()
-                sendJson(client, """{"pairCode":"$code","url":"${PairCodeManager.connectUrl(code)}"}""")
+                sendJson(client, JSONObject().apply {
+                    put("pairCode", code)
+                    put("url", PairCodeManager.connectUrl(code))
+                }.toString())
             }
 
             method == "POST" && path == "/api/paircode/rotate" -> {
                 val code = pairCodeRotateProvider()
-                sendJson(client, """{"pairCode":"$code","rotated":true}""")
+                sendJson(client, JSONObject().apply {
+                    put("pairCode", code)
+                    put("rotated", true)
+                }.toString())
             }
 
             else -> sendError(client, 404, "Not Found")
@@ -480,37 +522,41 @@ class WebServer(
         val caps = engine.getCapabilities()
         val levels = engine.getBandLevels()
         val ip = NetworkUtils.getLanIpAddress() ?: "unknown"
-        val bands = levels.joinToString(",") { it.toString() }
-        val centers = caps.centerFrequenciesHz.joinToString(",")
         val range = caps.bandLevelRange
         val presetMap = caps.presets
         val presetName = presetMap[engine.getActivePreset()] ?: "Custom"
-        val presetsJson = presetMap.entries.sortedBy { it.key }
-            .joinToString(",") { """{"id": ${it.key}, "name": "${it.value}"}""" }
-        val profilesJson = engine.listProfiles().joinToString(",") { """"$it"""" }
         val calBands = serviceActions?.getCalibrationBands()
         val calFreqs = serviceActions?.getCalibrationFrequenciesHz()
         val calActive = serviceActions?.isCalibrationActive() ?: false
-        val calJson = if (calBands != null && calFreqs != null) {
-            """{"active":$calActive,"bands":[${calBands.joinToString(",")}],"frequenciesHz":[${calFreqs.joinToString(",")}]}"""
-        } else "null"
-        val outcome = if (ok == null) "" else "\"ok\":$ok,${if (error == null) "" else "\"error\":${JSONObject.quote(error)},"}"
-        return """{
-  $outcome
-  "enabled": ${engine.isEnabled()},
-  "hasControl": ${engine.hasControl()},
-  "activePreset": ${engine.getActivePreset()},
-  "presetName": "$presetName",
-  "ip": "$ip",
-  "port": $port,
-  "bands": [$bands],
-  "centerFrequenciesHz": [$centers],
-  "bandLevelRange": [${range[0]}, ${range[1]}],
-  "overlayVisible": ${overlay?.isShown() ?: false},
-  "presets": [$presetsJson],
-  "profiles": [$profilesJson],
-  "calibration": $calJson
-}"""
+        return JSONObject().apply {
+            if (ok != null) put("ok", ok)
+            if (error != null) put("error", error)
+            put("enabled", engine.isEnabled())
+            put("hasControl", engine.hasControl())
+            put("activePreset", engine.getActivePreset())
+            put("presetName", presetName)
+            put("ip", ip)
+            put("port", port)
+            put("bands", JSONArray().apply { levels.forEach { put(it) } })
+            put("centerFrequenciesHz", JSONArray().apply { caps.centerFrequenciesHz.forEach { put(it) } })
+            put("bandLevelRange", JSONArray().apply { range.forEach { put(it) } })
+            put("overlayVisible", overlay?.isShown() ?: false)
+            put("presets", JSONArray().apply {
+                presetMap.entries.sortedBy { it.key }.forEach { (id, name) ->
+                    put(JSONObject().put("id", id).put("name", name))
+                }
+            })
+            put("profiles", JSONArray().apply { engine.listProfiles().forEach { put(it) } })
+            if (calBands != null && calFreqs != null) {
+                put("calibration", JSONObject().apply {
+                    put("active", calActive)
+                    put("bands", JSONArray().apply { calBands.forEach { put(it) } })
+                    put("frequenciesHz", JSONArray().apply { calFreqs.forEach { put(it) } })
+                })
+            } else {
+                put("calibration", JSONObject.NULL)
+            }
+        }.toString()
     }
 
     private fun probeStatusJson(): String {
@@ -575,7 +621,7 @@ class WebServer(
     private fun effectDiagnosticsJson(): String {
         val inv = serviceActions?.getEffectInventory()
         val probes = serviceActions?.getSessionProbes()
-        if (inv == null || probes == null) return """{"error":"not_run_yet"}"""
+        if (inv == null || probes == null) return JSONObject().put("error", "not_run_yet").toString()
         return AudioEffectDiagnostics.payloadJson(inv, probes).put("available", true).toString()
     }
 
@@ -691,19 +737,19 @@ class WebServer(
     }
 
     private fun parseIntField(json: String, key: String): Int? {
-        val regex = """"$key"\s*:\s*(-?\d+)""".toRegex()
-        return regex.find(json)?.groupValues?.get(1)?.toIntOrNull()
+        return try { JSONObject(json).optInt(key, Int.MIN_VALUE).takeIf { it != Int.MIN_VALUE } } catch (_: Exception) { null }
     }
 
     private fun parseStringField(json: String, key: String): String? {
-        val regex = """"$key"\s*:\s*"([^"]*)"""".toRegex()
-        return regex.find(json)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
+        return try { JSONObject(json).optString(key).takeIf { it.isNotBlank() } } catch (_: Exception) { null }
     }
 
     private fun parseIntArrayField(json: String, key: String): IntArray? {
-        val regex = """"$key"\s*:\s*\[([-\d\s,]+)\]""".toRegex()
-        val m = regex.find(json) ?: return null
-        return m.groupValues[1].split(',').mapNotNull { it.trim().toIntOrNull() }.toIntArray()
+        return try {
+            val array = JSONObject(json).optJSONArray(key) ?: return null
+            IntArray(array.length()) { index -> array.optInt(index, Int.MIN_VALUE) }
+                .takeIf { values -> values.all { it != Int.MIN_VALUE } }
+        } catch (_: Exception) { null }
     }
 
     private fun calibrationJson(ok: Boolean? = null, error: String? = null): String {
@@ -726,12 +772,14 @@ class WebServer(
                 (serviceActions.getCalibrationLiveDspVerificationError()
                     ?: serviceActions.getLastCalibrationApplyError())?.let { put("applicationError", it) }
             }.toString()
-        } else """{"active":false,"bands":[],"frequenciesHz":[]}"""
+        } else JSONObject().put("active", false).put("bands", JSONArray()).put("frequenciesHz", JSONArray()).toString()
     }
 
     private fun parseFloatArrayField(json: String, key: String): FloatArray? {
-        val regex = """"$key"\s*:\s*\[([-\d.eE\s,]+)\]""".toRegex()
-        val m = regex.find(json) ?: return null
-        return m.groupValues[1].split(',').mapNotNull { it.trim().toFloatOrNull() }.toFloatArray()
+        return try {
+            val array = JSONObject(json).optJSONArray(key) ?: return null
+            FloatArray(array.length()) { index -> array.optDouble(index, Double.NaN).toFloat() }
+                .takeIf { values -> values.all { it.isFinite() } }
+        } catch (_: Exception) { null }
     }
 }

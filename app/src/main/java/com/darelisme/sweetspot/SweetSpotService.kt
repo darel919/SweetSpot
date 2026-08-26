@@ -87,6 +87,7 @@ class SweetSpotService : Service(), ServiceActions {
 
         private const val CHANNEL_ID = "sweetspot"
         private const val NOTIFICATION_ID = 1
+        private const val CLIENT_DISCONNECT_GRACE_MS = 10_000L
     }
 
     private var engine: AudioEngine? = null
@@ -95,12 +96,18 @@ class SweetSpotService : Service(), ServiceActions {
     private var relay: MailboxClient? = null
     private var measurementController: MeasurementController? = null
     private var runtimeStarted = false
+    private val runtimeLock = Any()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val pairCodes = PairCodeManager()
+    private val pairingRotation = Runnable { rotatePairingSession() }
+    private val clientDisconnectGrace = Runnable {
+        measurementController?.clientPresenceChanged(false)
+    }
     private lateinit var profileStore: ProfileStore
 
     /** Serializes probe runs so a burst of broadcasts cannot overlap probes. */
     private val probeExecutor = Executors.newSingleThreadExecutor()
+    private val audioOperationRunning = AtomicBoolean(false)
 
     /** Last capacity-probe results surfaced to the web UI. */
     private var lastProbeResults: List<DynamicsProcessingProbe.ProbeResult>? = null
@@ -127,6 +134,7 @@ class SweetSpotService : Service(), ServiceActions {
     @Synchronized
     private fun ensureRuntimeStarted() {
         if (runtimeStarted) return
+        pairCodes.ensureActive()
 
         var createdEngine: AudioEngine? = null
         var createdOverlay: OverlayController? = null
@@ -143,10 +151,9 @@ class SweetSpotService : Service(), ServiceActions {
                 createdOverlay,
                 this,
                 eqAppliedNotifier = ::showEqAppliedToast,
+                authTokenProvider = { DeviceIdentity.getLanApiToken(this) },
                 pairCodeProvider = { pairCodes.current() },
-                pairCodeRotateProvider = {
-                    pairCodes.rotate().also { code -> overlay?.updatePairInfo(code) }
-                }
+                pairCodeRotateProvider = ::rotatePairingSession,
             )
             createdRelay = MailboxClient(
                 roomProvider = { pairCodes.current() },
@@ -162,10 +169,16 @@ class SweetSpotService : Service(), ServiceActions {
                     }
 
                     override fun onClientPresence(present: Boolean) {
+                        if (present) {
+                            mainHandler.removeCallbacks(clientDisconnectGrace)
+                        } else {
+                            mainHandler.removeCallbacks(clientDisconnectGrace)
+                            mainHandler.postDelayed(clientDisconnectGrace, CLIENT_DISCONNECT_GRACE_MS)
+                        }
                         overlay?.updateRelayState(
                             if (present) OverlayController.RELAY_CONNECTED else OverlayController.RELAY_WAITING
                         )
-                        measurementController?.clientPresenceChanged(present)
+                        if (present) measurementController?.clientPresenceChanged(true)
                     }
                 }
             }
@@ -176,6 +189,8 @@ class SweetSpotService : Service(), ServiceActions {
                 ::stateSnapshotJson,
                 ::isCalibrationStateVerified,
                 ::calibrationRollbackTargetActive,
+                acquireAudioOperation = { audioOperationRunning.compareAndSet(false, true) },
+                releaseAudioOperation = { audioOperationRunning.set(false) },
             )
 
             engine = createdEngine
@@ -183,12 +198,15 @@ class SweetSpotService : Service(), ServiceActions {
             webServer = createdWebServer
             relay = createdRelay
             measurementController = createdMeasurementController
-            runtimeStarted = true
+            synchronized(runtimeLock) {
+                runtimeStarted = true
+            }
 
             Log.i(TAG, "Service runtime started (buildId=${BuildConfig.SWEETSPOT_BUILD_ID})")
 
             createdWebServer.start()
             createdRelay.start()
+            schedulePairingRotation()
             Log.i(TAG, "Service runtime started (engine + web server + overlay + relay)")
         } catch (error: Throwable) {
             measurementController = null
@@ -202,8 +220,26 @@ class SweetSpotService : Service(), ServiceActions {
             try { createdWebServer?.stop() } catch (_: Throwable) {}
             try { createdOverlay?.hide() } catch (_: Throwable) {}
             try { createdEngine?.release() } catch (_: Throwable) {}
+            audioOperationRunning.set(false)
             throw error
         }
+    }
+
+    @Synchronized
+    private fun rotatePairingSession(): String {
+        val session = pairCodes.rotate()
+        overlay?.updatePairInfo(session.code)
+        relay?.reconnectForPairingRotation()
+        schedulePairingRotation()
+        return session.code
+    }
+
+    private fun schedulePairingRotation() {
+        mainHandler.removeCallbacks(pairingRotation)
+        val session = pairCodes.currentSession()
+        val delay = (session.expiresAt - System.currentTimeMillis() - PairCodeManager.ROTATION_MARGIN_MS)
+            .coerceAtLeast(1_000L)
+        mainHandler.postDelayed(pairingRotation, delay)
     }
 
     private fun startReason(intent: Intent?): SweetSpotStartReason = when {
@@ -266,9 +302,13 @@ class SweetSpotService : Service(), ServiceActions {
      */
     override fun runProbe() {
         Log.i(TAG, "DynamicsProcessing probe requested")
-        suspendProduction()
+        if (!tryAcquireDiagnosticOperation()) {
+            Log.w(TAG, "Rejecting overlapping or calibration-active DynamicsProcessing probe")
+            return
+        }
         probeExecutor.submit {
             try {
+                suspendProduction()
                 probeRunning.set(true)
                 lastProbeResults = DynamicsProcessingProbe().run()
             } catch (e: Throwable) {
@@ -276,13 +316,18 @@ class SweetSpotService : Service(), ServiceActions {
             } finally {
                 probeRunning.set(false)
                 resumeProduction()
+                releaseDiagnosticOperation()
             }
         }
     }
 
     override fun onDestroy() {
         Log.i(TAG, "Service onDestroy — hiding overlay, stopping web server, releasing engine, closing relay")
-        runtimeStarted = false
+        synchronized(runtimeLock) {
+            runtimeStarted = false
+        }
+        mainHandler.removeCallbacks(pairingRotation)
+        mainHandler.removeCallbacks(clientDisconnectGrace)
         measurementController?.shutdown()
         measurementController = null
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -292,8 +337,10 @@ class SweetSpotService : Service(), ServiceActions {
         webServer = null
         overlay?.hide()
         overlay = null
-        engine?.release()
-        engine = null
+        synchronized(runtimeLock) {
+            engine?.release()
+            engine = null
+        }
         try { persistentVirtualizer?.release() } catch (_: Throwable) {}
         persistentVirtualizer = null
         probeExecutor.shutdownNow()
@@ -307,6 +354,10 @@ class SweetSpotService : Service(), ServiceActions {
      */
     override fun runPersistentProbe(bands: Int) {
         Log.i(TAG, "Persistent DynamicsProcessing probe requested: $bands bands")
+        if (!tryAcquireDiagnosticOperation()) {
+            Log.w(TAG, "Rejecting persistent probe while another audio operation is active")
+            return
+        }
         probeExecutor.submit {
             try {
                 persistentCurveName = null
@@ -330,6 +381,8 @@ class SweetSpotService : Service(), ServiceActions {
                 Log.e(TAG, "Persistent probe failed for $bands bands", e)
                 persistentBands = 0
                 persistentCurveName = null
+            } finally {
+                releaseDiagnosticOperation()
             }
         }
     }
@@ -366,6 +419,12 @@ class SweetSpotService : Service(), ServiceActions {
             var commandOk = true
             var commandError: String? = null
             when (type) {
+                "state.get",
+                "profile.list",
+                "calibration.get" -> {
+                    replyTo("state.snapshot", stateSnapshotJson())
+                    return
+                }
                 "engine.enable" -> {
                     commandOk = engine?.setEnabled(true) == true
                     if (!commandOk) commandError = "Live DSP rejected enable"
@@ -679,9 +738,13 @@ class SweetSpotService : Service(), ServiceActions {
                 }
                 "probe.run" -> {
                     val bands = payload.optInt("bands", 128)
-                    suspendProduction()
+                    if (!tryAcquireDiagnosticOperation()) {
+                        replyTo("state.snapshot", stateSnapshotJson().put("ok", false).put("error", "Probe is unavailable while calibration is active"))
+                        return
+                    }
                     probeExecutor.submit {
                         try {
+                            suspendProduction()
                             probeRunning.set(true)
                             lastProbeResults = DynamicsProcessingProbe().runFor(bands)
                         } catch (e: Throwable) {
@@ -689,6 +752,7 @@ class SweetSpotService : Service(), ServiceActions {
                         } finally {
                             probeRunning.set(false)
                             resumeProduction()
+                            releaseDiagnosticOperation()
                         }
                         postProbeStatus(replyTo)
                     }
@@ -723,6 +787,16 @@ class SweetSpotService : Service(), ServiceActions {
                 "diagnostics.deviceInfo" -> {
                     replyTo("diagnostics.deviceInfo", deviceInfoJson())
                     return
+                }
+                "diagnostics.effects" -> {
+                    val diagnostics = runEffectDiagnosticsBlocking()
+                    if (diagnostics.has("error")) {
+                        commandOk = false
+                        commandError = diagnostics.optString("error")
+                    } else {
+                        replyTo("diagnostics.effects", diagnostics)
+                        return
+                    }
                 }
                 else -> {
                     Log.d(TAG, "mailbox: unknown command $type")
@@ -891,22 +965,30 @@ class SweetSpotService : Service(), ServiceActions {
 
     /** Runs diagnostics synchronously; called from the mailbox worker thread. */
     fun runEffectDiagnosticsBlocking(): JSONObject {
-        suspendProduction()
+        if (!tryAcquireDiagnosticOperation()) {
+            return JSONObject().put("error", "Diagnostics are unavailable while calibration is active")
+        }
         try {
+            suspendProduction()
             val (inv, probes) = AudioEffectDiagnostics().runAll()
             effectInventory = inv
             sessionProbes = probes
             return AudioEffectDiagnostics.payloadJson(inv, probes)
         } finally {
             resumeProduction()
+            releaseDiagnosticOperation()
         }
     }
 
     override fun runEffectDiagnostics() {
         Log.i(TAG, "Audio effect diagnostics requested")
-        suspendProduction()
+        if (!tryAcquireDiagnosticOperation()) {
+            Log.w(TAG, "Rejecting diagnostics while another audio operation is active")
+            return
+        }
         probeExecutor.submit {
             try {
+                suspendProduction()
                 val (inv, probes) = AudioEffectDiagnostics().runAll()
                 effectInventory = inv
                 sessionProbes = probes
@@ -914,6 +996,7 @@ class SweetSpotService : Service(), ServiceActions {
                 Log.e(TAG, "Effect diagnostics error", e)
             } finally {
                 resumeProduction()
+                releaseDiagnosticOperation()
             }
         }
     }
@@ -963,14 +1046,31 @@ class SweetSpotService : Service(), ServiceActions {
         dpEq()?.setCalibrationBandsByChannel(left, right) ?: false
     override fun resetCalibration(): Boolean = dpEq()?.resetCalibration() ?: false
 
+    private fun tryAcquireDiagnosticOperation(): Boolean {
+        if (!audioOperationRunning.compareAndSet(false, true)) return false
+        if (measurementController?.isActive() == true || dpEq()?.isDiagnosticProbeActive() == true) {
+            audioOperationRunning.set(false)
+            return false
+        }
+        return true
+    }
+
+    private fun releaseDiagnosticOperation() {
+        audioOperationRunning.set(false)
+    }
+
     /** Release the production engine so a diagnostic DynamicsProcessing can own session 0. */
     private fun suspendProduction() {
-        engine?.release()
+        synchronized(runtimeLock) {
+            if (runtimeStarted) engine?.release()
+        }
     }
 
     /** Re-create and restore the production engine after diagnostics. */
     private fun resumeProduction() {
-        engine?.initialize()
+        synchronized(runtimeLock) {
+            if (runtimeStarted) engine?.initialize()
+        }
     }
 
     private fun applyPresetWithFeedback(preset: Int): Boolean {

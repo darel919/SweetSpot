@@ -82,9 +82,16 @@ class DynamicsProcessingCalibrationSafetyTest {
             afterDb = 4f + DynamicsProcessingEq.VALIDATION_WORSE_TOLERANCE_DB,
             reason = null,
         )
+        val improved = DynamicsProcessingEq.normalizeValidationResult(
+            requestedStatus = CalibrationValidationStatus.WORSE,
+            beforeDb = 4f,
+            afterDb = 4f - DynamicsProcessingEq.VALIDATION_WORSE_TOLERANCE_DB - 0.01f,
+            reason = null,
+        )
 
         assertEquals(CalibrationValidationStatus.WORSE, worse.status)
-        assertEquals(CalibrationValidationStatus.PASSED, passed.status)
+        assertEquals(CalibrationValidationStatus.INCONCLUSIVE, passed.status)
+        assertEquals(CalibrationValidationStatus.PASSED, improved.status)
     }
 
     @Test

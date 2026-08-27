@@ -123,6 +123,12 @@ class DynamicsProcessingCalibrationSafetyTest {
     }
 
     @Test
+    fun validationAllowsCutOnlyCandidatesWithoutVerifiedHeadroom() {
+        assertFalse(DynamicsProcessingEq.candidateRequiresHeadroom(candidateTransaction(CalibrationValidationStatus.PENDING)))
+        assertTrue(DynamicsProcessingEq.candidateRequiresHeadroom(candidateTransaction(CalibrationValidationStatus.PENDING, positive = true)))
+    }
+
+    @Test
     fun resetFailureTelemetryNamesTheFailureAndRollbackOutcome() {
         val restored = DynamicsProcessingEq.calibrationResetFailureMessage(
             DynamicsProcessingEq.ResetFailureStage.APPLY,
@@ -159,10 +165,10 @@ class DynamicsProcessingCalibrationSafetyTest {
         assertFalse(canAcceptCalibrationCandidate(imported, "candidate", liveDspVerified = false))
     }
 
-    private fun candidateTransaction(status: CalibrationValidationStatus) = CalibrationCandidateTransaction(
+    private fun candidateTransaction(status: CalibrationValidationStatus, positive: Boolean = false) = CalibrationCandidateTransaction(
         candidateId = "candidate",
         previous = CalibrationCurveState(FloatArray(64), null, null, true),
-        candidate = CalibrationCurveState(FloatArray(64) { 1f }, null, null, true),
+        candidate = CalibrationCurveState(FloatArray(64) { if (positive) 1f else -1f }, null, null, true),
         validationStatus = status,
         beforeDb = null,
         afterDb = null,

@@ -41,6 +41,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         private const val HEADROOM_PROBE_GAIN_DB = -3f
         private const val INPUT_GAIN_MIN_DB = -60f
         private const val DSP_READBACK_TOLERANCE_DB = 0.25f
+        private const val POSITIVE_HEADROOM_TOLERANCE_DB = 0.001f
         const val VALIDATION_WORSE_TOLERANCE_DB = 0.5f
         private const val PRESET_FLAT = 1
         private const val PRESET_NIGHT = 2
@@ -68,6 +69,16 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         ): Float {
             val requested = calibrationGainDb + userGainDb
             return if (headroomVerified) requested else min(0f, requested)
+        }
+
+        internal fun candidateRequiresHeadroom(transaction: CalibrationCandidateTransaction): Boolean {
+            val candidate = transaction.candidate
+            return if (candidate.left != null && candidate.right != null) {
+                candidate.left.any { it > POSITIVE_HEADROOM_TOLERANCE_DB }
+                    || candidate.right.any { it > POSITIVE_HEADROOM_TOLERANCE_DB }
+            } else {
+                candidate.common.any { it > POSITIVE_HEADROOM_TOLERANCE_DB }
+            }
         }
 
         internal data class NormalizedValidationResult(
@@ -514,9 +525,12 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         if (!isValidDiagnosticProbeCurve(common)) return false
         if ((left == null) != (right == null)) return false
         if (left != null && (right == null || !isValidDiagnosticProbeCurve(left) || !isValidDiagnosticProbeCurve(right))) return false
-        val hasPositiveGain = common.any { it > 0f }
-            || left?.any { it > 0f } == true
-            || right?.any { it > 0f } == true
+        val hasPositiveGain = if (left != null && right != null) {
+            left.any { it > POSITIVE_HEADROOM_TOLERANCE_DB }
+                || right.any { it > POSITIVE_HEADROOM_TOLERANCE_DB }
+        } else {
+            common.any { it > POSITIVE_HEADROOM_TOLERANCE_DB }
+        }
         if (hasPositiveGain && !headroomVerified) return false
         val current = diagnosticProbeCurve
         diagnosticProbeCurve = DiagnosticProbeCurve(common.copyOf(), left?.copyOf(), right?.copyOf())
@@ -578,7 +592,13 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
             recordCalibrationFailure("Independent calibration requires two valid channel curves on a stereo DSP")
             return false
         }
-        if (!headroomVerified && (gains.any { it > 0f } || left?.any { it > 0f } == true || right?.any { it > 0f } == true)) {
+        val candidateRequiresHeadroom = if (left != null && right != null) {
+            left.any { it > POSITIVE_HEADROOM_TOLERANCE_DB }
+                || right.any { it > POSITIVE_HEADROOM_TOLERANCE_DB }
+        } else {
+            gains.any { it > POSITIVE_HEADROOM_TOLERANCE_DB }
+        }
+        if (!headroomVerified && candidateRequiresHeadroom) {
             recordCalibrationFailure("Positive calibration gains require verified input headroom")
             return false
         }
@@ -769,7 +789,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
             recordCalibrationFailure("Calibration must contain $INTERNAL_BANDS finite gains within ±${MAX_CALIBRATION_GAIN_DB} dB")
             return false
         }
-        if (!headroomVerified && gains.any { it > 0f }) {
+        if (!headroomVerified && gains.any { it > POSITIVE_HEADROOM_TOLERANCE_DB }) {
             recordCalibrationFailure("Positive calibration gains require verified input headroom")
             return false
         }
@@ -796,7 +816,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
             recordCalibrationFailure("Each channel must contain $INTERNAL_BANDS finite gains within ±${MAX_CALIBRATION_GAIN_DB} dB")
             return false
         }
-        if (!headroomVerified && (left.any { it > 0f } || right.any { it > 0f })) {
+        if (!headroomVerified && (left.any { it > POSITIVE_HEADROOM_TOLERANCE_DB } || right.any { it > POSITIVE_HEADROOM_TOLERANCE_DB })) {
             recordCalibrationFailure("Positive calibration gains require verified input headroom")
             return false
         }
@@ -920,7 +940,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         ) {
             return MeasurementAudioOverrideResult.Failed("Validation requires the pending calibration candidate", true)
         }
-        if (!headroomVerified) {
+        if (candidateRequiresHeadroom(transaction) && !headroomVerified) {
             return MeasurementAudioOverrideResult.Failed("Validation requires verified input headroom", true)
         }
         if (!calibrationActive) return MeasurementAudioOverrideResult.Failed("No active calibration is available for validation", true)

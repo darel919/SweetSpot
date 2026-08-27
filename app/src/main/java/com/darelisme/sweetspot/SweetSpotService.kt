@@ -21,6 +21,7 @@ import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.roundToInt
 import kotlin.math.pow
 
@@ -89,6 +90,8 @@ class SweetSpotService : Service(), ServiceActions {
         private const val CHANNEL_ID = "sweetspot"
         private const val NOTIFICATION_ID = 1
         private const val CLIENT_DISCONNECT_GRACE_MS = 10_000L
+        private const val STATE_REVISION_PREFS = "state_revision"
+        private const val STATE_REVISION_KEY = "revision"
     }
 
     private var engine: AudioEngine? = null
@@ -98,6 +101,8 @@ class SweetSpotService : Service(), ServiceActions {
     private var measurementController: MeasurementController? = null
     private var runtimeStarted = false
     private val runtimeLock = Any()
+    private val stateRevision = AtomicLong(0)
+    private val stateRevisionLock = Any()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val pairCodes = PairCodeManager()
     private val pairingRotation = Runnable { rotatePairingSession() }
@@ -139,6 +144,7 @@ class SweetSpotService : Service(), ServiceActions {
      */
     override fun onCreate() {
         super.onCreate()
+        stateRevision.set(getSharedPreferences(STATE_REVISION_PREFS, MODE_PRIVATE).getLong(STATE_REVISION_KEY, 0L))
         Log.i(TAG, "Service onCreate")
         profileStore = ProfileStore(this)
         createNotificationChannel()
@@ -1223,6 +1229,15 @@ class SweetSpotService : Service(), ServiceActions {
      * Canonical state snapshot for the hosted dashboard (protocol v1).
      * Mirrors shared/types/protocol.ts StateSnapshot in sweetspot-web.
      */
+    private fun nextStateRevision(): Long = synchronized(stateRevisionLock) {
+        val next = stateRevision.incrementAndGet()
+        getSharedPreferences(STATE_REVISION_PREFS, MODE_PRIVATE)
+            .edit()
+            .putLong(STATE_REVISION_KEY, next)
+            .commit()
+        next
+    }
+
     private fun stateSnapshotJson(): JSONObject {
         val engine = engine ?: DynamicsProcessingEq(profileStore)
         val caps = engine.getCapabilities()
@@ -1240,6 +1255,7 @@ class SweetSpotService : Service(), ServiceActions {
         val calibrationTransaction = dpEq()?.getCalibrationTransaction()
         val userLevels = engine.getBandLevels()
         return JSONObject().apply {
+            put("stateRevision", nextStateRevision())
             put("device", JSONObject().apply {
                 put("id", DeviceIdentity.get(this@SweetSpotService))
                 put("name", DeviceIdentity.getName(this@SweetSpotService))

@@ -83,6 +83,71 @@ data class MeasurementSweep(
 object MeasurementSweepGenerator {
     private val MARKER_CHANNELS = setOf("left", "right")
 
+    /** Generates the unquantized ESS used by the TV-side analyzer. */
+    fun generateSweepSignal(sweep: MeasurementSweep, sampleRate: Int = sweep.sampleRate): FloatArray {
+        require(sampleRate > 0)
+        val analysisSweep = if (sampleRate == sweep.sampleRate) sweep else sweep.copy(sampleRate = sampleRate)
+        val parts = analysisSweep.parts()
+        val signal = FloatArray(parts.sweepFrames)
+        val fadeInFrames = (analysisSweep.fadeInMs * sampleRate / 1000f).roundToInt()
+        val fadeOutFrames = (analysisSweep.fadeOutMs * sampleRate / 1000f).roundToInt()
+        val amplitude = 10.0.pow(analysisSweep.sweepLevelDbfs / 20.0)
+        val logarithmicRate = ln(analysisSweep.endHz / analysisSweep.startHz) / (analysisSweep.durationMs / 1000.0)
+        val phaseScale = 2.0 * PI * analysisSweep.startHz / logarithmicRate
+        for (frame in signal.indices) {
+            signal[frame] = sweepValue(
+                sweep = analysisSweep,
+                frame = frame,
+                frameCount = parts.sweepFrames,
+                fadeInFrames = fadeInFrames,
+                fadeOutFrames = fadeOutFrames,
+                amplitude = amplitude,
+                phaseScale = phaseScale,
+                logarithmicRate = logarithmicRate,
+            ).toFloat()
+        }
+        return signal
+    }
+
+    /** Generates one synchronization marker using the same sweep definition as playback. */
+    fun generateSyncMarker(
+        sweep: MeasurementSweep,
+        sampleRate: Int = sweep.sampleRate,
+        kind: SyncMarkerKind = SyncMarkerKind.START,
+    ): FloatArray {
+        require(sampleRate > 0)
+        val analysisSweep = if (sampleRate == sweep.sampleRate) sweep else sweep.copy(sampleRate = sampleRate)
+        val parts = analysisSweep.parts()
+        val frameCount = if (kind == SyncMarkerKind.START) parts.syncMarkerFrames else parts.endMarkerFrames
+        val marker = FloatArray(frameCount)
+        val amplitude = 10.0.pow(analysisSweep.markerLevelDbfs / 20.0)
+        val durationMs = if (kind == SyncMarkerKind.START) {
+            analysisSweep.syncMarkerDurationMs
+        } else {
+            analysisSweep.endMarkerDurationMs
+        }
+        val startHz = if (kind == SyncMarkerKind.START) {
+            analysisSweep.syncMarkerStartHz
+        } else {
+            analysisSweep.endMarkerStartHz
+        }
+        val endHz = if (kind == SyncMarkerKind.START) {
+            analysisSweep.syncMarkerEndHz
+        } else {
+            analysisSweep.endMarkerEndHz
+        }
+        val durationSeconds = durationMs / 1000.0
+        val chirpRate = (endHz - startHz) / durationSeconds
+        for (frame in marker.indices) {
+            val progress = if (frameCount == 1) 0.0 else frame.toDouble() / (frameCount - 1)
+            val time = progress * durationSeconds
+            val phase = 2.0 * PI * (startHz * time + 0.5 * chirpRate * time * time)
+            val window = if (frameCount <= 1) 1.0 else sin(PI * progress)
+            marker[frame] = (amplitude * window * sin(phase)).toFloat()
+        }
+        return marker
+    }
+
     fun generateStereoPcm(sweep: MeasurementSweep, channel: String = "both"): ShortArray {
         val output = ShortArray(sweep.totalFrames * 2)
         writeStereoPcm(sweep, channel, 0, sweep.totalFrames, output)
@@ -200,4 +265,9 @@ object MeasurementSweepGenerator {
             .roundToInt()
             .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
             .toShort()
+}
+
+enum class SyncMarkerKind {
+    START,
+    END,
 }

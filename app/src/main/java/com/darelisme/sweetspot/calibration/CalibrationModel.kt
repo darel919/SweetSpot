@@ -192,6 +192,25 @@ class CalibrationSolution private constructor(
         require(score.isFinite())
     }
 
+    override fun equals(other: Any?): Boolean =
+        other is CalibrationSolution &&
+            id == other.id &&
+            sourcePositions == other.sourcePositions &&
+            correctionDb == other.correctionDb &&
+            confidence == other.confidence &&
+            score == other.score &&
+            correctionMode == other.correctionMode
+
+    override fun hashCode(): Int {
+        var result = id.hashCode()
+        result = 31 * result + sourcePositions.hashCode()
+        result = 31 * result + correctionDb.hashCode()
+        result = 31 * result + confidence.hashCode()
+        result = 31 * result + score.toBits()
+        result = 31 * result + correctionMode.hashCode()
+        return result
+    }
+
     companion object {
         fun fromCompletePositions(
             id: SolutionId,
@@ -299,6 +318,12 @@ data class CalibrationJob(
     val pendingEffect: PendingCalibrationEffect?,
     val lastError: CalibrationJobError?,
 ) {
+    val minimumViableCalibration: Boolean
+        get() = usability is CalibrationUsability.Usable
+
+    val bestSolution: CalibrationSolution?
+        get() = (usability as? CalibrationUsability.Usable)?.best
+
     companion object {
         fun new(
             id: CalibrationJobId,

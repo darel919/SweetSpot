@@ -256,6 +256,9 @@ object CalibrationPlanner {
         if (job.usability is CalibrationUsability.Usable) {
             return if (optionalMeasurementNeeded(job)) CalibrationPhase.Refining else CalibrationPhase.Usable
         }
+        if (job.ledger.containsAllMandatoryPositions()) {
+            return CalibrationPhase.Failed("Mandatory positions did not produce a trustworthy correction")
+        }
         if (mandatoryExhausted(job)) return CalibrationPhase.Failed("Three complete mandatory positions were not obtained")
         return if (job.ledger.complete(CalibrationPosition.CENTER) == null) {
             CalibrationPhase.CenterPreflight

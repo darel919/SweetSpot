@@ -91,5 +91,16 @@ data class PositionLedger private constructor(
         )
 
         fun empty(): PositionLedger = PositionLedger(emptyList(), emptyMap())
+
+        fun fromAttempts(attempts: List<CaptureAttempt>): PositionLedger {
+            var ledger = empty()
+            attempts.forEach { attempt ->
+                ledger = when (attempt) {
+                    is CaptureAttempt.Accepted -> ledger.recordAccepted(attempt.evidence)
+                    is CaptureAttempt.Rejected -> ledger.recordRejected(attempt.request, attempt.reason)
+                }
+            }
+            return ledger
+        }
     }
 }

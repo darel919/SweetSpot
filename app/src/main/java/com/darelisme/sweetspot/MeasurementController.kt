@@ -1428,5 +1428,6 @@ class MeasurementController(
                 .put("fadeInMs", sweep.fadeInMs)
                 .put("fadeOutMs", sweep.fadeOutMs)
                 .put("captureKind", sweep.captureKind)
+                .put("markerChannel", sweep.markerChannel)
     }
 }

@@ -36,7 +36,8 @@ data class MeasurementSweep(
     val fadeOutMs: Int = 20,
     val algorithm: String = "exponential-sine-v1",
     val captureKind: String = "position-composite",
-    val sweepRevision: String = "android-sweep-v2",
+    val sweepRevision: String = "android-sweep-v3",
+    val markerChannel: String = "left",
 ) {
     val totalFrames: Int
         get() = parts().totalFrames
@@ -80,6 +81,8 @@ data class MeasurementSweep(
 }
 
 object MeasurementSweepGenerator {
+    private val MARKER_CHANNELS = setOf("left", "right")
+
     fun generateStereoPcm(sweep: MeasurementSweep, channel: String = "both"): ShortArray {
         val output = ShortArray(sweep.totalFrames * 2)
         writeStereoPcm(sweep, channel, 0, sweep.totalFrames, output)
@@ -102,6 +105,7 @@ object MeasurementSweepGenerator {
         require(sweep.durationMs > 0)
         require(sweep.interSweepGapMs >= 0)
         require(channel == "both" || channel == "left" || channel == "right")
+        require(sweep.markerChannel in MARKER_CHANNELS)
         require(firstFrame in 0..sweep.totalFrames)
         require(frameCount in 0..(sweep.totalFrames - firstFrame))
         require(output.size >= frameCount * 2)
@@ -127,7 +131,7 @@ object MeasurementSweepGenerator {
             }
             val leftSweepFrame = frame - parts.sweepStartFrame
             val rightSweepFrame = frame - parts.rightSweepStartFrame
-            val leftValue = marker ?: if (sweep.captureKind != "position-composite") null else sweepValue(
+            val leftValue = marker?.takeIf { sweep.markerChannel == "left" } ?: if (sweep.captureKind != "position-composite") null else sweepValue(
                 sweep = sweep,
                 frame = leftSweepFrame,
                 frameCount = sweepFrames,
@@ -137,7 +141,7 @@ object MeasurementSweepGenerator {
                 phaseScale = phaseScale,
                 logarithmicRate = logarithmicRate,
             ).takeIf { leftEnabled }
-            val rightValue = marker ?: if (sweep.captureKind != "position-composite") null else sweepValue(
+            val rightValue = marker?.takeIf { sweep.markerChannel == "right" } ?: if (sweep.captureKind != "position-composite") null else sweepValue(
                 sweep = sweep,
                 frame = rightSweepFrame,
                 frameCount = sweepFrames,

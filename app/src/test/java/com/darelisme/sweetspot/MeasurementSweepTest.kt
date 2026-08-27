@@ -11,6 +11,8 @@ class MeasurementSweepTest {
         val sweep = MeasurementSweep(48_000)
 
         assertEquals("position-composite", sweep.captureKind)
+        assertEquals("android-sweep-v3", sweep.sweepRevision)
+        assertEquals("left", sweep.markerChannel)
         assertEquals(1_500, sweep.durationMs)
         assertEquals(500, sweep.preRollMs)
         assertEquals(500, sweep.postRollMs)
@@ -32,7 +34,7 @@ class MeasurementSweepTest {
     }
 
     @Test
-    fun defaultSweepHasDeterministicCompositeRoutingAndSilence() {
+    fun defaultSweepHasDeterministicSingleSpeakerMarkersAndStereoSweeps() {
         val sweep = MeasurementSweep(48_000)
         val pcm = MeasurementSweepGenerator.generateStereoPcm(sweep)
         val parts = sweep.parts()
@@ -43,8 +45,9 @@ class MeasurementSweepTest {
             assertEquals(0, pcm[frame * 2].toInt())
             assertEquals(0, pcm[frame * 2 + 1].toInt())
         }
-        assertTrue(pcm.slice(parts.leadingMarkerStartFrame * 2 until parts.sweepStartFrame * 2)
-            .chunked(2).all { it[0] == it[1] })
+        assertTrue((parts.leadingMarkerStartFrame until parts.sweepStartFrame).all { frame ->
+            pcm[frame * 2 + 1].toInt() == 0
+        })
         assertTrue(pcm.slice(parts.sweepStartFrame * 2 until parts.rightSweepStartFrame * 2)
             .any { it.toInt() != 0 })
         assertTrue((parts.sweepStartFrame until parts.rightSweepStartFrame).any { frame ->
@@ -53,8 +56,9 @@ class MeasurementSweepTest {
         assertTrue((parts.rightSweepStartFrame until parts.trailingMarkerStartFrame).any { frame ->
             pcm[frame * 2].toInt() == 0 && pcm[frame * 2 + 1].toInt() != 0
         })
-        assertTrue(pcm.slice(parts.trailingMarkerStartFrame * 2 until (parts.trailingMarkerStartFrame + parts.endMarkerFrames) * 2)
-            .chunked(2).all { it[0] == it[1] })
+        assertTrue((parts.trailingMarkerStartFrame until parts.trailingMarkerStartFrame + parts.endMarkerFrames).all { frame ->
+            pcm[frame * 2 + 1].toInt() == 0
+        })
         assertTrue(pcm.slice(parts.trailingMarkerStartFrame * 2 until (parts.totalFrames - 1) * 2)
             .any { it.toInt() != 0 })
         assertTrue(pcm.maxOf { kotlin.math.abs(it.toInt()) } <= 8_300)
@@ -81,6 +85,22 @@ class MeasurementSweepTest {
         assertEquals(0, left[firstLeftActiveFrame * 2 + 1].toInt())
         assertEquals(0, right[firstRightActiveFrame * 2].toInt())
         assertTrue(right[firstRightActiveFrame * 2 + 1].toInt() != 0)
+    }
+
+    @Test
+    fun markerChannelRoutesBothMarkersToTheConfiguredSpeaker() {
+        val sweep = MeasurementSweep(8_000, markerChannel = "right")
+        val pcm = MeasurementSweepGenerator.generateStereoPcm(sweep)
+        val parts = sweep.parts()
+        val markerFrames = listOf(
+            parts.leadingMarkerStartFrame + parts.syncMarkerFrames / 2,
+            parts.trailingMarkerStartFrame + parts.endMarkerFrames / 2,
+        )
+
+        markerFrames.forEach { frame ->
+            assertEquals(0, pcm[frame * 2].toInt())
+            assertTrue(pcm[frame * 2 + 1].toInt() != 0)
+        }
     }
 
     @Test
@@ -122,8 +142,12 @@ class MeasurementSweepTest {
         assertTrue((leadingEnd until trailingStart).all { frame ->
             pcm[frame * 2].toInt() == 0 && pcm[frame * 2 + 1].toInt() == 0
         })
-        assertTrue((parts.leadingMarkerStartFrame until leadingEnd).any { frame -> pcm[frame * 2].toInt() != 0 })
-        assertTrue((trailingStart until trailingEnd).any { frame -> pcm[frame * 2].toInt() != 0 })
+        assertTrue((parts.leadingMarkerStartFrame until leadingEnd).any { frame ->
+            pcm[frame * 2].toInt() != 0 && pcm[frame * 2 + 1].toInt() == 0
+        })
+        assertTrue((trailingStart until trailingEnd).any { frame ->
+            pcm[frame * 2].toInt() != 0 && pcm[frame * 2 + 1].toInt() == 0
+        })
         assertTrue((trailingEnd until parts.totalFrames).all { frame ->
             pcm[frame * 2].toInt() == 0 && pcm[frame * 2 + 1].toInt() == 0
         })
@@ -140,9 +164,11 @@ class MeasurementSweepTest {
         assertTrue((parts.sweepStartFrame until parts.trailingMarkerStartFrame).all { frame ->
             pcm[frame * 2].toInt() == 0 && pcm[frame * 2 + 1].toInt() == 0
         })
-        assertTrue((parts.leadingMarkerStartFrame until parts.sweepStartFrame).any { frame -> pcm[frame * 2].toInt() != 0 })
+        assertTrue((parts.leadingMarkerStartFrame until parts.sweepStartFrame).any { frame ->
+            pcm[frame * 2].toInt() != 0 && pcm[frame * 2 + 1].toInt() == 0
+        })
         assertTrue((parts.trailingMarkerStartFrame until parts.trailingMarkerStartFrame + parts.endMarkerFrames)
-            .any { frame -> pcm[frame * 2].toInt() != 0 })
+            .any { frame -> pcm[frame * 2].toInt() != 0 && pcm[frame * 2 + 1].toInt() == 0 })
     }
 
     @Test
@@ -157,6 +183,11 @@ class MeasurementSweepTest {
             ?.groupValues
             ?.get(1)
             ?.toDouble()
+            ?: error("Missing golden-vector field $name")
+        fun string(name: String): String = Regex("\"$name\"\\s*:\\s*\"([^\"]+)\"")
+            .find(fixture)
+            ?.groupValues
+            ?.get(1)
             ?: error("Missing golden-vector field $name")
         val pcmText = fixture.substringAfter("\"pcm16\": [").substringBefore(']')
         val expected = pcmText.split(',').filter { it.isNotBlank() }.map { it.trim().toInt() }
@@ -179,7 +210,10 @@ class MeasurementSweepTest {
             markerLevelDbfs = number("markerLevelDbfs").toFloat(),
             fadeInMs = number("fadeInMs").toInt(),
             fadeOutMs = number("fadeOutMs").toInt(),
+            markerChannel = string("markerChannel"),
         )
+        assertEquals("android-sweep-v3", string("sweepRevision"))
+        assertEquals("left", sweep.markerChannel)
         val actual = MeasurementSweepGenerator.generateStereoPcm(sweep)
 
         assertEquals(expected.size, actual.size)

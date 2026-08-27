@@ -123,6 +123,12 @@ class SweetSpotService : Service(), ServiceActions {
     private var persistentProbeLeaseHeld = false
     @Volatile
     private var persistentProbeError: String? = null
+    @Volatile
+    private var measurementRestorationState: String = "none"
+    @Volatile
+    private var measurementRestorationSessionId: String? = null
+    @Volatile
+    private var measurementRestorationError: String? = null
 
     /** Persistent global-mix Virtualizer for spatial-widening A/B tests. */
     private var persistentVirtualizer: Virtualizer? = null
@@ -206,6 +212,11 @@ class SweetSpotService : Service(), ServiceActions {
                 ::calibrationRollbackTargetActive,
                 acquireAudioOperation = { audioOperationGate.tryAcquireTransient() },
                 releaseAudioOperation = { audioOperationGate.releaseTransient() },
+                onMeasurementRestorationState = { state, sessionId, error ->
+                    measurementRestorationState = state
+                    measurementRestorationSessionId = sessionId
+                    measurementRestorationError = error
+                },
             )
 
             engine = createdEngine
@@ -697,6 +708,7 @@ class SweetSpotService : Service(), ServiceActions {
                 "calibrationSession.end" -> {
                     measurementController?.end(
                         payload.optString("sessionId"),
+                        payload.optString("outcome").takeIf { it.isNotBlank() },
                         null,
                         emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
                     )
@@ -1267,11 +1279,21 @@ class SweetSpotService : Service(), ServiceActions {
                 put("inputAttenuationDb", maxOf(0f, -headroomDb))
                 put("headroomVerified", headroomVerified)
                 val eq = dpEq()
-                val liveDspError = eq?.getLiveDspVerificationError()
-                put("applicationVerified", eq != null && liveDspError == null)
-                put("liveDspStatus", if (eq != null && liveDspError == null) "verified" else "degraded")
+                val liveDspError = measurementRestorationError ?: eq?.getLiveDspVerificationError()
+                val restorationPending = measurementRestorationState == "restoring"
+                put("applicationVerified", !restorationPending && eq != null && liveDspError == null)
+                put("liveDspStatus", if (!restorationPending && eq != null && liveDspError == null) "verified" else "degraded")
                 (liveDspError ?: eq?.getLastCalibrationApplyError())?.let { put("applicationError", it) }
-                put("transaction", calibrationTransactionJson(calibrationTransaction))
+                put(
+                    "transaction",
+                    if (restorationPending) {
+                        JSONObject()
+                            .put("state", "restoring")
+                            .put("sessionId", measurementRestorationSessionId ?: JSONObject.NULL)
+                    } else {
+                        calibrationTransactionJson(calibrationTransaction)
+                    },
+                )
             })
             put("profiles", JSONArray(engine.listProfiles().map { name ->
                 JSONObject().put("id", name).put("name", name)

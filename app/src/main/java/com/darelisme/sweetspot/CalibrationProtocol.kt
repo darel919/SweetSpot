@@ -36,6 +36,14 @@ internal val CALIBRATION_ERROR_CODES: Set<String> = setOf(
     "calibration_aborted",
 )
 
+internal val CALIBRATION_SESSION_OUTCOMES: Set<String> = setOf(
+    "sufficient",
+    "bounded",
+    "insufficient",
+    "cancelled",
+    "error",
+)
+
 internal data class CalibrationSessionAbort(
     val sessionId: String,
     val code: String,
@@ -43,6 +51,8 @@ internal data class CalibrationSessionAbort(
 )
 
 internal fun isCalibrationErrorCode(value: String): Boolean = value in CALIBRATION_ERROR_CODES
+
+internal fun isCalibrationSessionOutcome(value: String): Boolean = value in CALIBRATION_SESSION_OUTCOMES
 
 internal fun parseCalibrationSessionAbortValues(
     sessionId: String,

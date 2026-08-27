@@ -165,6 +165,7 @@ class MeasurementController(
     private val rollbackTargetActiveProvider: (String) -> Boolean? = { null },
     private val acquireAudioOperation: () -> Boolean = { true },
     private val releaseAudioOperation: () -> Unit = {},
+    private val onMeasurementRestorationState: (String, String?, String?) -> Unit = { _, _, _ -> },
 ) {
     companion object {
         private const val TAG = "SweetSpotMeasurement"
@@ -215,6 +216,7 @@ class MeasurementController(
         var validationAbortError: Pair<String, String>? = null,
         var cancellationRequested: Boolean = false,
         var audioOperationHeld: Boolean = false,
+        var finalOutcome: String? = null,
     )
 
     private class PlaybackResources(val track: AudioTrack) {
@@ -393,6 +395,7 @@ class MeasurementController(
         replyTo: String?,
         emit: (String, org.json.JSONObject, String?) -> Unit,
     ) {
+        markMeasurementRestorationIfActive(sessionId)
         submit {
             val session = activeSession
             if (sessionFence.shouldIgnore(sessionId)) return@submit
@@ -414,6 +417,7 @@ class MeasurementController(
     }
 
     fun cancelFromActivity(sessionId: String) {
+        markMeasurementRestorationIfActive(sessionId)
         submit {
             activeSession?.let { session ->
                 if (session.id != sessionId) return@let
@@ -501,7 +505,19 @@ class MeasurementController(
         }
     }
 
-    fun end(sessionId: String, replyTo: String?, emit: (String, org.json.JSONObject, String?) -> Unit) {
+    fun end(
+        sessionId: String,
+        outcome: String?,
+        replyTo: String?,
+        emit: (String, org.json.JSONObject, String?) -> Unit,
+    ) {
+        if (outcome == null || !isCalibrationSessionOutcome(outcome)) {
+            submit {
+                emitError(emit, replyTo, sessionId, "invalid_session", "Calibration session end requires a valid final outcome")
+            }
+            return
+        }
+        markMeasurementRestorationIfActive(sessionId)
         submit {
             val session = activeSession
             if (session == null || session.id != sessionId) {
@@ -510,6 +526,7 @@ class MeasurementController(
             }
             session.emit = emit
             session.replyTo = replyTo
+            session.finalOutcome = outcome
             finishSession(session, null)
         }
     }
@@ -1060,6 +1077,13 @@ class MeasurementController(
         finishSession(session, code to message)
     }
 
+    private fun markMeasurementRestorationIfActive(sessionId: String) {
+        val session = activeSession
+        if (session?.id == sessionId && session.phase == "measurement") {
+            onMeasurementRestorationState("restoring", session.id, null)
+        }
+    }
+
     private fun finishCancelled(session: Session, code: String, message: String) {
         session.cancellationRequested = true
         finishSession(session, code to message)
@@ -1082,6 +1106,8 @@ class MeasurementController(
 
         state = SessionState.Finishing(session)
         var finalError = error
+        if (session.cancellationRequested) session.finalOutcome = "cancelled"
+        else if (error != null) session.finalOutcome = "error"
         watchdog?.cancel(false)
         watchdog = null
         stopAudioTrack()
@@ -1137,12 +1163,19 @@ class MeasurementController(
             return
         }
 
-        if (!restoreMeasurementState()) {
+        onMeasurementRestorationState("restoring", session.id, null)
+        val restored = restoreMeasurementState()
+        if (restored) {
+            onMeasurementRestorationState("none", null, null)
+        } else {
+            val restoreMessage = "The TV could not verify restoration of its previous audio state"
+            onMeasurementRestorationState("failed", session.id, restoreMessage)
             finalError = if (finalError == null) {
-                "dsp_restore_failed" to "The TV could not verify restoration of its previous audio state"
+                "dsp_restore_failed" to restoreMessage
             } else {
-                finalError.first to "${finalError.second}. The TV could not verify restoration of its previous audio state."
+                finalError.first to "${finalError.second}. $restoreMessage"
             }
+            session.finalOutcome = "error"
         }
         publishSessionEvents(session, finalError)
         CalibrationActivity.finishForSession(session.id)
@@ -1169,7 +1202,7 @@ class MeasurementController(
     }
 
     private fun restoreMeasurementState(): Boolean {
-        val saved = bypassState ?: return true
+        val saved = bypassState ?: return verifyFinalState()
         val restored = try {
             engine.endMeasurementBypass(saved)
         } catch (restoreError: Throwable) {
@@ -1177,7 +1210,14 @@ class MeasurementController(
             false
         }
         bypassState = null
-        return restored
+        return restored && verifyFinalState()
+    }
+
+    private fun verifyFinalState(): Boolean = try {
+        finalStateVerifier()
+    } catch (error: Throwable) {
+        Log.e(TAG, "Failed to verify restored measurement DSP state", error)
+        false
     }
 
     private fun validationRecoveryError(
@@ -1367,6 +1407,8 @@ class MeasurementController(
                 .put("sessionId", session.id)
                 .put("channel", session.channel)
                 .put("phase", session.phase)
+                .put("outcome", session.finalOutcome ?: if (session.cancellationRequested) "cancelled" else "error")
+                .put("completedSessionId", session.id)
 
         fun ready(
             session: Session,

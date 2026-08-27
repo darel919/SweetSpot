@@ -39,4 +39,14 @@ class CalibrationProtocolTest {
             ),
         )
     }
+
+    @Test
+    fun sessionEndOutcomesAreClosedAndUnknownValuesAreRejected() {
+        assertEquals(true, isCalibrationSessionOutcome("sufficient"))
+        assertEquals(true, isCalibrationSessionOutcome("bounded"))
+        assertEquals(true, isCalibrationSessionOutcome("insufficient"))
+        assertEquals(true, isCalibrationSessionOutcome("cancelled"))
+        assertEquals(true, isCalibrationSessionOutcome("error"))
+        assertEquals(false, isCalibrationSessionOutcome("unknown"))
+    }
 }

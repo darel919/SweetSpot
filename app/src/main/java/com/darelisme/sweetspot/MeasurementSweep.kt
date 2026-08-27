@@ -83,7 +83,6 @@ data class MeasurementSweep(
 object MeasurementSweepGenerator {
     private val MARKER_CHANNELS = setOf("left", "right")
 
-    /** Generates the unquantized ESS used by the TV-side analyzer. */
     fun generateSweepSignal(sweep: MeasurementSweep, sampleRate: Int = sweep.sampleRate): FloatArray {
         require(sampleRate > 0)
         val analysisSweep = if (sampleRate == sweep.sampleRate) sweep else sweep.copy(sampleRate = sampleRate)

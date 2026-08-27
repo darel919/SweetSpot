@@ -134,6 +134,7 @@ data class MicrophoneCalibrationProfile(
 
 enum class AnalysisStatus {
     OK,
+    UNSUPPORTED_SAMPLE_RATE,
     CAPTURE_TOO_SHORT,
     CAPTURE_CLIPPED,
     SIGNAL_TOO_LOW,
@@ -181,6 +182,9 @@ class AndroidResponseV1Analyzer : CalibrationAnalyzer {
         val quality = quality(capture.samples, sweep, capture.sampleRateHz)
         val marker = MarkerDetector.detect(capture.samples, sweep, capture.sampleRateHz)
         if (quality.clippedSamples > 0) return emptyAnalysis(AnalysisStatus.CAPTURE_CLIPPED, marker, quality)
+        if (capture.sampleRateHz < 40_000) {
+            return emptyAnalysis(AnalysisStatus.UNSUPPORTED_SAMPLE_RATE, marker, quality)
+        }
         val expectedLength = scaledParts(sweep, capture.sampleRateHz).totalFrames
         if (capture.samples.size < expectedLength) {
             return emptyAnalysis(AnalysisStatus.CAPTURE_TOO_SHORT, marker, quality)
@@ -198,18 +202,19 @@ class AndroidResponseV1Analyzer : CalibrationAnalyzer {
         }
 
         val parts = scaledParts(sweep, capture.sampleRateHz)
+        val clockRatio = marker.clockRatio ?: 1f
         val left = if (capture.channel == AnalysisChannel.RIGHT) {
             emptyList()
         } else {
-            analyzeSweep(capture.samples, marker.startSample ?: 0, parts.sweepFrames, sweep, capture.sampleRateHz, microphoneProfile)
+            analyzeSweep(capture.samples, marker.startSample ?: 0, parts.sweepFrames, sweep, capture.sampleRateHz, microphoneProfile, clockRatio)
         }
         val right = if (capture.channel == AnalysisChannel.LEFT) {
             emptyList()
         } else {
-            analyzeSweep(capture.samples, marker.rightStartSample ?: 0, parts.sweepFrames, sweep, capture.sampleRateHz, microphoneProfile)
+            analyzeSweep(capture.samples, marker.rightStartSample ?: 0, parts.sweepFrames, sweep, capture.sampleRateHz, microphoneProfile, clockRatio)
         }
-        val leftImpulse = if (left.isNotEmpty()) deconvolveChannel(capture.samples, marker.startSample ?: 0, parts.sweepFrames, sweep, capture.sampleRateHz) else null
-        val rightImpulse = if (right.isNotEmpty()) deconvolveChannel(capture.samples, marker.rightStartSample ?: 0, parts.sweepFrames, sweep, capture.sampleRateHz) else null
+        val leftImpulse = if (left.isNotEmpty()) deconvolveChannel(capture.samples, marker.startSample ?: 0, parts.sweepFrames, sweep, capture.sampleRateHz, clockRatio) else null
+        val rightImpulse = if (right.isNotEmpty()) deconvolveChannel(capture.samples, marker.rightStartSample ?: 0, parts.sweepFrames, sweep, capture.sampleRateHz, clockRatio) else null
         val leftDirect = leftImpulse?.let(::directArrival)
         val rightDirect = rightImpulse?.let(::directArrival)
         val directFailure = listOfNotNull(
@@ -240,10 +245,10 @@ class AndroidResponseV1Analyzer : CalibrationAnalyzer {
         sweep: MeasurementSweep,
         sampleRate: Int,
         profile: MicrophoneCalibrationProfile?,
+        clockRatio: Float,
     ): List<ResponsePoint> {
-        if (start < 0 || start + length > samples.size) return emptyList()
+        val recorded = clockCorrectedSlice(samples, start, length, clockRatio) ?: return emptyList()
         val reference = MeasurementSweepGenerator.generateSweepSignal(sweep, sampleRate)
-        val recorded = samples.copyOfRange(start, start + length)
         val points = FrequencyResponse.extract(recorded, reference, sampleRate)
         return points.map { point ->
             point.copy(magnitudeDb = point.magnitudeDb + (profile?.compensationDbAt(point.frequencyHz) ?: 0f))
@@ -256,10 +261,30 @@ class AndroidResponseV1Analyzer : CalibrationAnalyzer {
         length: Int,
         sweep: MeasurementSweep,
         sampleRate: Int,
+        clockRatio: Float,
     ): FloatArray? {
-        if (start < 0 || start + length > samples.size) return null
+        val recorded = clockCorrectedSlice(samples, start, length, clockRatio) ?: return null
         val reference = MeasurementSweepGenerator.generateSweepSignal(sweep, sampleRate)
-        return EssDeconvolver.deconvolve(samples.copyOfRange(start, start + length), reference)
+        return EssDeconvolver.deconvolve(recorded, reference)
+    }
+
+    private fun clockCorrectedSlice(
+        samples: FloatArray,
+        start: Int,
+        targetLength: Int,
+        clockRatio: Float,
+    ): FloatArray? {
+        if (start < 0 || targetLength <= 0 || !clockRatio.isFinite() || clockRatio <= 0f) return null
+        val sourceLength = (targetLength * clockRatio).roundToInt().coerceAtLeast(1)
+        if (start + sourceLength > samples.size) return null
+        if (sourceLength == targetLength) return samples.copyOfRange(start, start + targetLength)
+        return FloatArray(targetLength) { index ->
+            val position = index.toFloat() * (sourceLength - 1) / (targetLength - 1).coerceAtLeast(1)
+            val lower = position.toInt().coerceIn(0, sourceLength - 1)
+            val upper = (lower + 1).coerceAtMost(sourceLength - 1)
+            val fraction = position - lower
+            samples[start + lower] * (1f - fraction) + samples[start + upper] * fraction
+        }
     }
 
     private fun quality(samples: FloatArray, sweep: MeasurementSweep, sampleRate: Int): CaptureSignalQuality {
@@ -371,8 +396,7 @@ object MarkerDetector {
             else -> null
         }
         val accepted = failure == null
-        val driftTrusted = selected != null && minimum >= 0.55f &&
-            (accepted || failure == MarkerFailure.CLOCK_DRIFT_UNRELIABLE)
+        val driftTrusted = selected != null && minimum >= 0.55f && accepted
         val start = if (accepted && selected != null) {
             selected.leading.sample + ((tvParts.sweepStartFrame - tvParts.leadingMarkerStartFrame) *
                 sampleRateHz / sweep.sampleRate.toFloat() * selected.clockRatio).roundToInt()
@@ -447,10 +471,10 @@ object MarkerDetector {
                 (index == correlation.lastIndex || correlation[index] >= correlation[index + 1])
         }.sortedByDescending { correlation[it] }
         val selected = mutableListOf<MarkerCandidate>()
-        peaks.forEach { index ->
+        for (index in peaks) {
             if (selected.none { abs(it.sample - index) < minimumDistance }) {
                 selected += MarkerCandidate(index, correlation[index])
-                if (selected.size == MAX_SEARCH_CANDIDATES) return@forEach
+                if (selected.size >= MAX_SEARCH_CANDIDATES) break
             }
         }
         return selected

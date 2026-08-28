@@ -286,6 +286,7 @@ class CalibrationEngineTest {
             )
             val result = submitted as CalibrationEngineResult.Updated
 
+            assertTrue(result.captureAccepted)
             assertEquals(CalibrationPosition.CENTER, result.job.ledger.attempts.first().request.position)
             assertEquals(2, analyzer.lastProfile?.frequenciesHz?.size)
             val evidence = (result.job.ledger.attempts.first() as CaptureAttempt.Accepted).evidence
@@ -320,7 +321,9 @@ class CalibrationEngineTest {
                 frame(jobId, validation.captureId, validation.position, CaptureChannel.BOTH, validation.attemptIndex),
                 attemptId,
             )
-            val completed = (result as CalibrationEngineResult.Updated).job
+            val completedResult = result as CalibrationEngineResult.Updated
+            assertTrue(completedResult.captureAccepted)
+            val completed = completedResult.job
             assertEquals(CalibrationPhase.Complete, completed.phase)
             assertEquals(null, completed.candidate)
             assertTrue(dsp.accepted)

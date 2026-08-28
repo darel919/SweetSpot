@@ -144,6 +144,11 @@ class CalibrationCaptureStreamReceiver(
     }
 
     private fun append(frame: CalibrationCaptureStreamFrame.Chunk): Completed? {
+        if (finalized.containsKey(StreamKey(frame.sessionId, frame.captureId, frame.captureAttemptId))) return null
+        val current = requireActive(frame.sessionId, frame.captureId, frame.captureAttemptId)
+        if (frame.sequence < 0L || frame.sequence >= MAX_CAPTURE_CHUNKS) {
+            abort("Calibration capture has too many chunks")
+        }
         if (frame.sampleCount <= 0) {
             abort("Calibration capture chunk sample count does not match PCM")
         }
@@ -155,8 +160,6 @@ class CalibrationCaptureStreamReceiver(
         if (declaredBytes != frame.pcm.size.toLong()) {
             abort("Calibration capture chunk sample count does not match PCM")
         }
-        if (finalized.containsKey(StreamKey(frame.sessionId, frame.captureId, frame.captureAttemptId))) return null
-        val current = requireActive(frame.sessionId, frame.captureId, frame.captureAttemptId)
         val expectedSequence = current.nextSequence
         if (frame.sequence < expectedSequence) {
             val previous = current.chunkDigests[frame.sequence]
@@ -184,12 +187,6 @@ class CalibrationCaptureStreamReceiver(
         current.sampleCount += frame.sampleCount
         current.nextSequence++
         current.chunkDigests[frame.sequence] = ChunkDigest(frame.sampleCount, digestHex(frame.pcm))
-        while (current.chunkDigests.size > MAX_REMEMBERED_CHUNKS) {
-            current.chunkDigests.entries.iterator().also { iterator ->
-                iterator.next()
-                iterator.remove()
-            }
-        }
         return null
     }
 
@@ -372,7 +369,7 @@ class CalibrationCaptureStreamReceiver(
     private companion object {
         const val Float32_BYTES = 4
         const val MAX_METADATA_BYTES = 64 * 1024
-        const val MAX_REMEMBERED_CHUNKS = 128
+        const val MAX_CAPTURE_CHUNKS = 8_192L
         const val MAX_FINALIZED_CAPTURES = 32
         const val PARTIAL_SUFFIX = ".stream.partial"
         const val READY_SUFFIX = ".stream.ready"

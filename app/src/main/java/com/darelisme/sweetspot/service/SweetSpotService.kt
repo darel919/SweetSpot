@@ -29,7 +29,6 @@ import com.darelisme.sweetspot.calibration.model.CalibrationJob
 import com.darelisme.sweetspot.calibration.model.CalibrationJobId
 import com.darelisme.sweetspot.calibration.model.CalibrationJobJson
 import com.darelisme.sweetspot.calibration.model.CalibrationPhase
-import com.darelisme.sweetspot.calibration.model.CaptureAttempt
 import com.darelisme.sweetspot.calibration.model.CaptureId
 import com.darelisme.sweetspot.calibration.dsp.TvCalibrationDsp
 import com.darelisme.sweetspot.calibration.persistence.CalibrationJobStore
@@ -256,7 +255,11 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
                 pairingSessionProvider = { pairCodes.currentSession() },
                 commandHandler = peerCommandHandler(),
                 onSessionConnected = pairCodes::markPeerConnected,
-                onSessionDisconnected = { generation -> pairCodes.markPeerDisconnected(generation) },
+                onSessionDisconnected = { generation ->
+                    if (pairCodes.markPeerDisconnected(generation) && synchronized(runtimeLock) { runtimeStarted }) {
+                        mainHandler.post { rotatePairingSession(force = true) }
+                    }
+                },
             ).also { transport ->
                 transport.listener = object : PeerTransport.Listener {
                     override fun onStateChanged(state: PeerTransportState, diagnostics: PeerTransportDiagnostics) {
@@ -541,14 +544,8 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
         val accepted = when {
             capture.duplicate -> false
             result is CalibrationEngineResult.Rejected -> false
-            result is CalibrationEngineResult.Updated -> if (metadata.optString("channel") == "both") {
-                true
-            } else {
-                val captureId = metadata.optString("captureId")
-                job?.ledger?.attempts?.any {
-                    it.request.captureId.value == captureId && it is CaptureAttempt.Accepted
-                } == true
-            }
+            result is CalibrationEngineResult.Updated -> result.captureAccepted
+            else -> false
         }
         peerTransport?.publish(
             "calibration.capture.uploaded",

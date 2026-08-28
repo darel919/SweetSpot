@@ -20,7 +20,10 @@ private val CAPTURE_ATTEMPT_ID_PATTERN = Regex("^[A-Za-z0-9_-]{1,128}$")
 sealed interface CalibrationEngineResult {
     val job: CalibrationJob?
 
-    data class Updated(override val job: CalibrationJob) : CalibrationEngineResult
+    data class Updated(
+        override val job: CalibrationJob,
+        val captureAccepted: Boolean = false,
+    ) : CalibrationEngineResult
 
     data class Rejected(
         override val job: CalibrationJob?,
@@ -370,7 +373,10 @@ class CalibrationEngine(
             } catch (error: CaptureStoreException) {
                 return@runOnWorker rejected("capture_store_failed", error.message ?: "Calibration capture could not be stored")
             }
-            return@runOnWorker CalibrationEngineResult.Updated(current)
+            return@runOnWorker CalibrationEngineResult.Updated(
+                current,
+                captureAccepted = priorAttempt is CaptureAttempt.Accepted,
+            )
         }
         val action = current.nextAction
         val captureAction = action as? CalibrationAction.Capture
@@ -565,7 +571,9 @@ class CalibrationEngine(
             )
             return autoStageWhenReady(commit(transition))
         }
-        if (validationAction != null) return finishValidation(current, analysis)
+        if (validationAction != null) {
+            return finishValidation(current, analysis).withCaptureAccepted(analysis.status == AnalysisStatus.OK)
+        }
         val request = requireNotNull(captureAction).request
         val response = when (request.channel) {
             CaptureChannel.LEFT -> analysis.leftResponse
@@ -594,7 +602,7 @@ class CalibrationEngine(
             microphoneProfileRevision = metadata.microphoneProfile.revision,
         )
         val transition = stateMachine.reduce(current, CalibrationEvent.ChannelAccepted(evidence))
-        return autoStageWhenReady(commit(transition))
+        return autoStageWhenReady(commit(transition)).withCaptureAccepted(true)
     }
 
     private fun finishValidation(
@@ -1022,6 +1030,11 @@ class CalibrationEngine(
 
     private fun rejected(code: String, message: String): CalibrationEngineResult.Rejected =
         CalibrationEngineResult.Rejected(job, code, message)
+
+    private fun CalibrationEngineResult.withCaptureAccepted(accepted: Boolean): CalibrationEngineResult = when (this) {
+        is CalibrationEngineResult.Updated -> copy(captureAccepted = accepted)
+        is CalibrationEngineResult.Rejected -> this
+    }
 
     private fun failPlayback(current: CalibrationJob, failure: CalibrationAudioResult.Failure): CalibrationEngineResult {
         val failed = current.copy(

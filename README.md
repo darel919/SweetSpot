@@ -45,7 +45,7 @@ See [`docs/tv-owned-calibration-architecture.md`](docs/tv-owned-calibration-arch
 - Capture chunks and partial files are bounded; successful temporary PCM is removed according to the existing retention policy.
 - Release builds keep R8/minification enabled. ABI and APK-size changes must be measured before release claims.
 
-The current measured unsigned release APK is 5,119,505 bytes with only `armeabi-v7a` WebRTC native code, versus the 665,359-byte pre-WebRTC baseline. PSS, heap, CPU, and post-disconnect recovery still require measurements on the target TCL hardware.
+The current measured unsigned release APK is 5,119,517 bytes with only `armeabi-v7a` WebRTC native code, versus the 665,359-byte pre-WebRTC baseline. PSS, heap, CPU, and post-disconnect recovery still require connected-session measurements on the target TCL hardware.
 
 ## Build and install
 

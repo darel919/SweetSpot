@@ -143,6 +143,58 @@ class CalibrationCaptureStreamTest {
     }
 
     @Test
+    fun malformedLateChunkFromFinalizedCaptureCannotAbortAnotherActiveCapture() {
+        withTempDirectory { root ->
+            val receiver = CalibrationCaptureStreamReceiver(root)
+            val pcm = floats(0.25f)
+            val hash = pcm.sha256()
+            val metadata = "{\"jobId\":\"job-1\",\"captureId\":\"capture-1\"}"
+            receiver.accept(CalibrationCaptureStreamFrame.Begin(
+                "session-1", "capture-1", metadata, null, null, "attempt-1",
+            ))
+            receiver.accept(CalibrationCaptureStreamFrame.Chunk(
+                "session-1", "capture-1", 0, 1, pcm, "attempt-1",
+            ))
+            val end = CalibrationCaptureStreamFrame.End(
+                "session-1", "capture-1", 1, 1, 4, hash, metadata, "attempt-1",
+            )
+            val completed = receiver.accept(end) ?: error("expected completed capture")
+            receiver.delete(completed)
+
+            receiver.accept(CalibrationCaptureStreamFrame.Begin(
+                "session-1", "capture-2", "{\"jobId\":\"job-1\",\"captureId\":\"capture-2\"}", null, null, "attempt-2",
+            ))
+            assertNull(receiver.accept(CalibrationCaptureStreamFrame.Chunk(
+                "session-1", "capture-1", -1, 0, byteArrayOf(), "attempt-1",
+            )))
+            assertNull(receiver.accept(CalibrationCaptureStreamFrame.Chunk(
+                "session-1", "capture-2", 0, 1, pcm, "attempt-2",
+            )))
+            receiver.cancel()
+        }
+    }
+
+    @Test
+    fun malformedUnknownCaptureCannotAbortTheActiveStream() {
+        withTempDirectory { root ->
+            val receiver = CalibrationCaptureStreamReceiver(root)
+            receiver.accept(CalibrationCaptureStreamFrame.Begin(
+                "session-1", "capture-current", "{\"jobId\":\"job-1\",\"captureId\":\"capture-current\"}", null, null, "attempt-current",
+            ))
+
+            assertThrows(java.io.IOException::class.java) {
+                receiver.accept(CalibrationCaptureStreamFrame.Chunk(
+                    "session-1", "capture-old", -1, 0, byteArrayOf(), "attempt-old",
+                ))
+            }
+            assertNull(receiver.accept(CalibrationCaptureStreamFrame.Chunk(
+                "session-1", "capture-current", 0, 1, floats(0.25f), "attempt-current",
+            )))
+            receiver.cancel()
+        }
+    }
+
+    @Test
     fun receiverRejectsAConflictingDuplicateChunk() {
         withTempDirectory { root ->
             val receiver = CalibrationCaptureStreamReceiver(root)

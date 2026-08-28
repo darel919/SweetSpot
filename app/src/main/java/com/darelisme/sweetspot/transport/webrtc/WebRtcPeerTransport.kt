@@ -19,6 +19,7 @@ import livekit.org.webrtc.SdpObserver
 import livekit.org.webrtc.SessionDescription
 import org.json.JSONObject
 import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.util.LinkedHashSet
 import java.util.concurrent.ArrayBlockingQueue
@@ -30,6 +31,7 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /** Direct, data-channel-only peer transport owned by the service. */
 class WebRtcPeerTransport(
@@ -55,7 +57,7 @@ class WebRtcPeerTransport(
         private const val CONTROL_FLUSH_DELAY_MS = 25L
         private const val MAX_PENDING_CANDIDATES = 64
         private const val MAX_SEEN_MESSAGES = 512
-        private const val RECONNECT_CLOSE_GRACE_MS = 30_000L
+        private const val RECONNECT_CLOSE_GRACE_MS = 90_000L
         private val GENERATION_PATTERN = Regex("[A-Za-z0-9_-]{1,128}")
         private val ATTEMPT_PATTERN = Regex("[A-Za-z0-9_-]{1,128}")
         private val NON_RETRYABLE_SIGNALING_ERRORS = setOf(
@@ -133,6 +135,7 @@ class WebRtcPeerTransport(
     private var localReady = false
     private var remoteReady = false
     private var reconnectCount = 0
+    private val messageCounter = AtomicLong(0L)
     private var bytesSent = 0L
     private var bytesReceived = 0L
     private var lastError: String? = null
@@ -219,11 +222,20 @@ class WebRtcPeerTransport(
                     synchronized(controlDispatchLock) { block() }
                 }
             } catch (_: RejectedExecutionException) {
+                if (!controlQueuePermits.tryAcquire()) {
+                    setError("The TV control queue is unavailable. Retry the connection.")
+                    return
+                }
                 try {
                     controlExecutor.execute {
-                        synchronized(controlDispatchLock) { block() }
+                        try {
+                            synchronized(controlDispatchLock) { block() }
+                        } finally {
+                            controlQueuePermits.release()
+                        }
                     }
                 } catch (_: RejectedExecutionException) {
+                    controlQueuePermits.release()
                     setError("The TV control queue is unavailable. Retry the connection.")
                 }
             }
@@ -645,7 +657,12 @@ class WebRtcPeerTransport(
             return
         }
         val value = try {
-            JSONObject(String(bytes, StandardCharsets.UTF_8))
+            val text = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(bytes))
+                .toString()
+            JSONObject(text)
         } catch (error: Throwable) {
             setError("The TV received invalid direct control data")
             return
@@ -848,7 +865,7 @@ class WebRtcPeerTransport(
     }
 
     private fun envelope(type: String, payload: JSONObject, replyTo: String? = null): JSONObject = JSONObject().apply {
-        val id = "dev_${System.currentTimeMillis().toString(36)}_${bytesSent.toString(36)}"
+        val id = "dev_${System.currentTimeMillis().toString(36)}_${messageCounter.getAndIncrement().toString(36)}"
         put("v", 1)
         put("id", id)
         put("type", type)
@@ -1031,6 +1048,7 @@ class WebRtcPeerTransport(
         if (reconnectCloseTask != null || currentGeneration == null) return
         val generation = currentGeneration ?: return
         reconnectCloseTask = controlExecutor.schedule({
+            reconnectCloseTask = null
             if (currentGeneration == generation && !directPresenceSent) {
                 closePeer(notify = false)
                 if (running.get()) setState(PeerTransportState.PAIRING)

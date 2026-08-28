@@ -118,7 +118,9 @@ object CalibrationCaptureStreamWire {
         if ((expectedSampleCount == null) != (expectedByteCount == null)) {
             throw IOException("Capture stream expected counts must be provided together")
         }
-        if (expectedSampleCount != null && expectedByteCount != sampleByteCount(expectedSampleCount)) {
+        if (expectedSampleCount != null && (expectedSampleCount <= 0L
+                || expectedByteCount != sampleByteCount(expectedSampleCount))
+        ) {
             throw IOException("Capture stream expected byte count does not match samples")
         }
         return CalibrationCaptureStreamFrame.Begin(
@@ -171,6 +173,9 @@ object CalibrationCaptureStreamWire {
         val finalSha256 = requiredString(value, "finalSha256")
         val metadata = value.getJSONObject("metadata")
         if ((metadata.opt("captureId") as? String) != captureId
+            || chunkCount <= 0L
+            || finalSampleCount <= 0L
+            || finalByteCount <= 0L
             || finalByteCount != sampleByteCount(finalSampleCount)
             || !finalSha256.matches(Regex("[a-fA-F0-9]{64}"))
             || (metadata.opt("sampleCount") as? Number)?.let(::exactCount) != finalSampleCount

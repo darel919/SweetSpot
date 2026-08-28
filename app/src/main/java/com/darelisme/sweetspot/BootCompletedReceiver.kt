@@ -14,8 +14,8 @@ class BootCompletedReceiver : BroadcastReceiver() {
         if (context == null) return
         if (intent?.action != Intent.ACTION_BOOT_COMPLETED) return
         val appContext = context.applicationContext
-        if (!ProfileStore(appContext).isEnabled()) {
-            Log.i(TAG, "Boot completed — SweetSpot is disabled; leaving service stopped")
+        if (!ProfileStore(appContext).isStartOnBootEnabled()) {
+            Log.i(TAG, "Boot completed — start on boot is disabled; leaving service stopped")
             return
         }
         Log.i(TAG, "Boot completed — starting SweetSpotService silently")

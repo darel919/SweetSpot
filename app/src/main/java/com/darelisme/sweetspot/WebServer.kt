@@ -65,7 +65,7 @@ interface ServiceActions {
     fun getEffectInventory(): List<AudioEffectDiagnostics.EffectInventoryEntry>
     fun getSessionProbes(): List<AudioEffectDiagnostics.SessionProbe>
 
-    /** Calibration is a 64-band read-only base curve managed by the wizard/API. */
+    /** Calibration is a 64-band read-only base curve managed by the TV engine. */
     fun getCalibrationBands(): FloatArray?
     fun getRequestedCalibrationBands(): FloatArray?
     fun getEffectiveCalibrationBands(): FloatArray?

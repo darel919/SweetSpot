@@ -42,6 +42,7 @@ data class CaptureUploadMetadata(
     val capturedAtMs: Long,
     val contentSha256: String,
     val byteCount: Long = pcmByteCount(sampleCount),
+    val microphoneProfile: CalibrationMicrophoneProfilePayload,
 ) {
     init {
         require(attemptIndex >= 0)
@@ -54,6 +55,8 @@ data class CaptureUploadMetadata(
         require(userAgent.isNotBlank() && userAgent.length <= MAX_METADATA_TEXT)
         require(microphoneProfileId.isNotBlank() && microphoneProfileId.length <= MAX_METADATA_TEXT)
         require(microphoneProfileRevision.isNotBlank() && microphoneProfileRevision.length <= MAX_METADATA_TEXT)
+        require(microphoneProfile.id == microphoneProfileId)
+        require(microphoneProfile.revision == microphoneProfileRevision)
         require(capturedAtMs >= 0)
         require(contentSha256.isSha256())
     }
@@ -61,6 +64,7 @@ data class CaptureUploadMetadata(
     fun normalized(): CaptureUploadMetadata = copy(
         browserCaptureSettings = browserCaptureSettings.toMap(),
         contentSha256 = contentSha256.lowercase(Locale.ROOT),
+        microphoneProfile = microphoneProfile.copyOf(),
     )
 
     private companion object {
@@ -89,7 +93,7 @@ class CaptureStorageLimitException(message: String) : CaptureStoreException(mess
 
 class CalibrationCaptureStore(
     private val rootDirectory: File,
-    private val maxBytesPerJob: Long = 8L * 1024L * 1024L,
+    private val maxBytesPerJob: Long = 16L * 1024L * 1024L,
     private val maxBytesPerCapture: Long = 2L * 1024L * 1024L,
 ) {
     init {
@@ -152,6 +156,7 @@ class CalibrationCaptureStore(
         }
     }
 
+    @Synchronized
     fun get(jobId: CalibrationJobId, captureId: CaptureId): StoredCalibrationCapture? {
         val directory = jobDirectory(jobId)
         if (!directory.exists()) return null
@@ -169,6 +174,9 @@ class CalibrationCaptureStore(
             require(metadata.jobId == jobId && metadata.captureId == captureId)
             require(paths.pcm.isFile && paths.pcm.length() == metadata.byteCount)
             validateFiniteFloat32(paths.pcm, metadata.sampleCount)
+            require(fileSha256(paths.pcm) == metadata.contentSha256) {
+                "PCM SHA-256 does not match capture metadata"
+            }
             StoredCalibrationCapture(metadata, paths.pcm)
         } catch (error: CaptureStoreException) {
             throw error
@@ -177,6 +185,7 @@ class CalibrationCaptureStore(
         }
     }
 
+    @Synchronized
     fun openPcm(capture: StoredCalibrationCapture): InputStream {
         val stored = get(capture.metadata.jobId, capture.metadata.captureId)
             ?: throw CaptureStoreException("Calibration capture is missing")
@@ -186,25 +195,37 @@ class CalibrationCaptureStore(
         return FileInputStream(stored.pcmFile)
     }
 
+    @Synchronized
     fun deleteJob(jobId: CalibrationJobId) {
         val directory = jobDirectory(jobId)
         if (!directory.exists()) return
         deleteTree(directory)
     }
 
+    @Synchronized
     fun cleanupPartialUploads(olderThanMs: Long = System.currentTimeMillis() - DEFAULT_PARTIAL_RETENTION_MS) {
         if (!rootDirectory.isDirectory) return
         rootDirectory.listFiles { file -> file.isDirectory }?.forEach { directory ->
-            directory.listFiles()?.forEach { file ->
-                if (!file.isFile || file.lastModified() > olderThanMs) return@forEach
-                if (file.name.endsWith(PARTIAL_SUFFIX)) {
-                    file.delete()
-                } else if (file.name.endsWith(PCM_SUFFIX)) {
-                    val token = file.name.removeSuffix(PCM_SUFFIX)
-                    val complete = File(directory, "$token$COMPLETE_SUFFIX")
-                    if (!complete.exists()) {
-                        file.delete()
-                        File(directory, "$token$METADATA_SUFFIX").delete()
+            val files = directory.listFiles()?.filter(File::isFile).orEmpty()
+            files.forEach { file ->
+                if (file.lastModified() > olderThanMs) return@forEach
+                when {
+                    file.name.endsWith(PARTIAL_SUFFIX) -> file.delete()
+                    else -> {
+                        val token = when {
+                            file.name.endsWith(PCM_SUFFIX) -> file.name.removeSuffix(PCM_SUFFIX)
+                            file.name.endsWith(METADATA_SUFFIX) -> file.name.removeSuffix(METADATA_SUFFIX)
+                            file.name.endsWith(COMPLETE_SUFFIX) -> file.name.removeSuffix(COMPLETE_SUFFIX)
+                            else -> return@forEach
+                        }
+                        val pcm = File(directory, "$token$PCM_SUFFIX")
+                        val metadata = File(directory, "$token$METADATA_SUFFIX")
+                        val complete = File(directory, "$token$COMPLETE_SUFFIX")
+                        if (!pcm.exists() || !metadata.exists() || !complete.exists()) {
+                            pcm.delete()
+                            metadata.delete()
+                            complete.delete()
+                        }
                     }
                 }
             }
@@ -220,6 +241,9 @@ class CalibrationCaptureStore(
             ?: throw CaptureStoreException("Calibration completion marker is corrupt")
         if (existing.metadata.contentSha256 != incoming.contentSha256) {
             throw CaptureUploadConflictException("Capture ID already contains different PCM")
+        }
+        if (!existing.metadata.sameCaptureIdentity(incoming)) {
+            throw CaptureUploadConflictException("Capture ID already contains different metadata")
         }
         return existing
     }
@@ -237,7 +261,9 @@ class CalibrationCaptureStore(
     private fun readMetadata(file: File): CaptureUploadMetadata {
         FileInputStream(file).use { fileInput ->
             DataInputStream(BufferedInputStream(fileInput)).use { input ->
-                return CaptureMetadataCodec.read(input)
+                val metadata = CaptureMetadataCodec.read(input)
+                if (input.available() != 0) throw IOException("Trailing calibration capture metadata")
+                return metadata
             }
         }
     }
@@ -267,6 +293,20 @@ class CalibrationCaptureStore(
                 remaining -= requested
             }
         }
+    }
+
+    private fun fileSha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileInputStream(file).use { input ->
+            val buffer = ByteArray(BUFFER_SIZE)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                if (count == 0) continue
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().toHex()
     }
 
     private fun storedBytes(directory: File): Long = directory.listFiles { file ->
@@ -328,7 +368,7 @@ class CalibrationCaptureStore(
 
 private object CaptureMetadataCodec {
     private const val MAGIC = 0x5353434D
-    private const val SCHEMA_VERSION = 1
+    private const val SCHEMA_VERSION = 3
     private const val MAX_STRING_BYTES = 16 * 1024
     private const val MAX_SETTINGS = 64
 
@@ -352,6 +392,7 @@ private object CaptureMetadataCodec {
         writeString(output, metadata.userAgent)
         writeString(output, metadata.microphoneProfileId)
         writeString(output, metadata.microphoneProfileRevision)
+        writeProfile(output, metadata.microphoneProfile)
         output.writeLong(metadata.capturedAtMs)
         writeString(output, metadata.contentSha256)
     }
@@ -373,6 +414,10 @@ private object CaptureMetadataCodec {
         val settings = buildMap {
             repeat(settingsCount) { put(readString(input), readString(input)) }
         }
+        val userAgent = readString(input)
+        val microphoneProfileId = readString(input)
+        val microphoneProfileRevision = readString(input)
+        val microphoneProfile = readProfile(input)
         val metadata = CaptureUploadMetadata(
             jobId = jobId,
             captureId = captureId,
@@ -383,9 +428,10 @@ private object CaptureMetadataCodec {
             channelCount = channelCount,
             sampleCount = sampleCount,
             browserCaptureSettings = settings,
-            userAgent = readString(input),
-            microphoneProfileId = readString(input),
-            microphoneProfileRevision = readString(input),
+            userAgent = userAgent,
+            microphoneProfileId = microphoneProfileId,
+            microphoneProfileRevision = microphoneProfileRevision,
+            microphoneProfile = microphoneProfile,
             capturedAtMs = input.readLong(),
             contentSha256 = readString(input),
             byteCount = byteCount,
@@ -399,6 +445,50 @@ private object CaptureMetadataCodec {
         require(bytes.size <= MAX_STRING_BYTES)
         output.writeInt(bytes.size)
         output.write(bytes)
+    }
+
+    private fun writeProfile(output: DataOutputStream, profile: CalibrationMicrophoneProfilePayload) {
+        writeString(output, profile.id)
+        writeString(output, profile.revision)
+        writeString(output, profile.capturePathStatus)
+        output.writeFloat(profile.normalizeAtHz)
+        output.writeFloat(profile.trustMinHz)
+        output.writeFloat(profile.trustFullMaxHz)
+        output.writeFloat(profile.trustTaperToHz)
+        output.writeInt(profile.frequenciesHz.size)
+        profile.frequenciesHz.forEach(output::writeFloat)
+        profile.responseDb.forEach(output::writeFloat)
+    }
+
+    private fun readProfile(input: DataInputStream): CalibrationMicrophoneProfilePayload {
+        val id = readString(input)
+        val revision = readString(input)
+        val capturePathStatus = readString(input)
+        val normalizeAtHz = input.readFloat()
+        val trustMinHz = input.readFloat()
+        val trustFullMaxHz = input.readFloat()
+        val trustTaperToHz = input.readFloat()
+        val pointCount = input.readInt()
+        if (pointCount !in CalibrationMicrophoneProfilePayload.MIN_POINTS..CalibrationMicrophoneProfilePayload.MAX_POINTS) {
+            throw IOException("Invalid microphone profile point count")
+        }
+        val frequencies = FloatArray(pointCount) { input.readFloat() }
+        val response = FloatArray(pointCount) { input.readFloat() }
+        return try {
+            CalibrationMicrophoneProfilePayload(
+                id = id,
+                revision = revision,
+                frequenciesHz = frequencies,
+                responseDb = response,
+                normalizeAtHz = normalizeAtHz,
+                trustMinHz = trustMinHz,
+                trustFullMaxHz = trustFullMaxHz,
+                trustTaperToHz = trustTaperToHz,
+                capturePathStatus = capturePathStatus,
+            )
+        } catch (error: IllegalArgumentException) {
+            throw IOException("Invalid microphone profile data", error)
+        }
     }
 
     private fun readString(input: DataInputStream): String {
@@ -447,6 +537,20 @@ private fun moveAtomically(from: File, to: File) {
 }
 
 private fun String.isSha256(): Boolean = length == 64 && all { it in "0123456789abcdefABCDEF" }
+
+private fun CaptureUploadMetadata.sameCaptureIdentity(other: CaptureUploadMetadata): Boolean =
+    jobId == other.jobId &&
+        captureId == other.captureId &&
+        position == other.position &&
+        attemptIndex == other.attemptIndex &&
+        channel == other.channel &&
+        sampleRateHz == other.sampleRateHz &&
+        channelCount == other.channelCount &&
+        sampleCount == other.sampleCount &&
+        byteCount == other.byteCount &&
+        microphoneProfileId == other.microphoneProfileId &&
+        microphoneProfileRevision == other.microphoneProfileRevision &&
+        microphoneProfile.sameCalibrationData(other.microphoneProfile)
 
 private fun ByteArray.toHex(): String = joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
 

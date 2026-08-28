@@ -1,11 +1,6 @@
 package com.darelisme.sweetspot
 
-/**
- * Audio abstraction owned by the service. The web server and command layer talk
- * to this interface only — they never touch [android.media.audiofx.Equalizer]
- * directly. This keeps the HTTP/UI code independent of the concrete DSP and
- * makes future effects (DynamicsProcessing, etc.) swappable.
- */
+/** Service-owned audio abstraction that keeps transport and UI code independent of DSP. */
 interface AudioEngine {
     fun initialize()
     fun release()
@@ -18,13 +13,9 @@ interface AudioEngine {
     fun getActivePreset(): Int
     fun getCapabilities(): EngineCapabilities
 
-    /** Persist the current state (enabled, preset, custom levels) under a name. */
     fun saveCurrentProfile(name: String)
-    /** Names of all saved profiles. */
     fun listProfiles(): List<String>
-    /** Load a named profile and apply it to the engine. */
     fun loadProfile(name: String): Boolean
-    /** Delete a named profile. */
     fun deleteProfile(name: String)
 
     fun beginMeasurementBypass(): MeasurementAudioOverrideResult

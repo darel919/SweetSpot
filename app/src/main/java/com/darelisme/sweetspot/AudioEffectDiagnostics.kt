@@ -11,19 +11,7 @@ import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 
-/**
- * Capability diagnostics for the TV's global audio effect chain.
- *
- * Answers, with real API calls on the target device:
- *   1. Which audio effects does the platform expose (queryEffects), including
- *      vendor implementations (name/connectMode/insert vs post-processing)?
- *   2. Can each stock effect type be instantiated on the global output mix
- *      (session 0) and what are its supported parameters?
- *
- * This is the "First Implementation Check" for stereo matrixing: arbitrary L/R
- * mixing needs either a cross-channel-capable effect here or a PCM-intercepting
- * architecture. The results decide which.
- */
+/** Capability diagnostics for the TV's global audio effect chain. */
 class AudioEffectDiagnostics {
 
     companion object {
@@ -164,7 +152,7 @@ class AudioEffectDiagnostics {
                 v = Virtualizer(PRIORITY, SESSION_ID)
                 var params = "strengthSupported=${v.strengthSupported}"
                 try {
-                    val can = v.canVirtualize(AudioFormat.CHANNEL_OUT_STEREO, Virtualizer.VIRTUALIZATION_MODE_AUTO)
+                    val can = v.canVirtualize(AudioFormat.CHANNEL_OUT_STEREO, Virtualizer.VIRTUALIZATION_MODE_BINAURAL)
                     params += ",canVirtualizeStereo=$can"
                 } catch (_: Throwable) {
                     params += ",canVirtualizeStereo=error"
@@ -259,8 +247,8 @@ class AudioEffectDiagnostics {
     private fun dynamicsProcessingProbe(): SessionProbe {
         var dp: DynamicsProcessing? = null
         return try {
-            dp = DynamicsProcessingProbe().createEnabled(DynamicsProcessingEq.INTERNAL_BANDS, 2)
-            val d = dp!!
+            val d = DynamicsProcessingProbe().createEnabled(DynamicsProcessingEq.INTERNAL_BANDS, 2)
+            dp = d
             var params = "channels=${d.channelCount}"
             try {
                 d.setLimiterAllChannelsTo(

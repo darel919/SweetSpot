@@ -613,7 +613,6 @@ class MeasurementController(
         }
     }
 
-    @Suppress("UNUSED_PARAMETER")
     fun updateProgress(
         sessionId: String,
         stage: String,
@@ -669,13 +668,12 @@ class MeasurementController(
         }
     }
 
-    @Suppress("UNUSED_PARAMETER")
     fun updateDiagnostics(
         sessionId: String,
         context: MeasurementContext?,
         current: Int,
         total: Int,
-        diagnostics: org.json.JSONObject
+        _diagnostics: org.json.JSONObject
     ) {
         submit {
             val session = activeSession ?: return@submit
@@ -1352,7 +1350,6 @@ class MeasurementController(
         }
     }
 
-    /** Stop and rewind the persistent measurement track without releasing it. */
     private fun pauseAudioTrack() {
         val resources = playbackResources ?: return
         synchronized(resources) {

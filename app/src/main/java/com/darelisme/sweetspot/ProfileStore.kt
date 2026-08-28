@@ -29,6 +29,11 @@ class ProfileStore private constructor(
 
     fun isEnabled(): Boolean = prefs.getBoolean(KEY_ENABLED, DEFAULT_ENABLED)
 
+    fun isStartOnBootEnabled(): Boolean = prefs.getBoolean(KEY_START_ON_BOOT, DEFAULT_START_ON_BOOT)
+
+    fun saveStartOnBootEnabled(enabled: Boolean): Boolean =
+        prefs.edit().putBoolean(KEY_START_ON_BOOT, enabled).commit()
+
     fun load(): SavedProfile {
         val enabled = isEnabled()
         val preset = prefs.getInt(KEY_PRESET, 1)
@@ -104,6 +109,16 @@ class ProfileStore private constructor(
         return if (left != null && right != null) left to right else null
     }
 
+    fun isCalibrationEnabled(): Boolean {
+        if (loadCalibration() == null && loadCalibrationChannels() == null) return false
+        return prefs.getBoolean(KEY_CALIBRATION_ACTIVE, true)
+    }
+
+    fun saveCalibrationEnabled(enabled: Boolean): Boolean {
+        if (loadCalibration() == null && loadCalibrationChannels() == null) return false
+        return prefs.edit().putBoolean(KEY_CALIBRATION_ACTIVE, enabled).commit()
+    }
+
     fun saveCalibrationChannels(left: FloatArray, right: FloatArray): Boolean {
         return prefs.edit().also { editor ->
             writeActiveCalibration(editor, CalibrationCurveState(
@@ -132,6 +147,7 @@ class ProfileStore private constructor(
             STATUS_ROLLING_BACK -> CalibrationValidationStatus.ROLLING_BACK
             STATUS_PENDING_VALIDATION -> CalibrationValidationStatus.PENDING
             STATUS_PASSED -> CalibrationValidationStatus.PASSED
+            STATUS_NEUTRAL -> CalibrationValidationStatus.NEUTRAL
             STATUS_WORSE -> CalibrationValidationStatus.WORSE
             STATUS_INCONCLUSIVE -> CalibrationValidationStatus.INCONCLUSIVE
             STATUS_FAILED -> CalibrationValidationStatus.FAILED
@@ -143,7 +159,7 @@ class ProfileStore private constructor(
         val before = beforeRaw?.toFloatOrNull()?.takeIf { it.isFinite() }
         val after = afterRaw?.toFloatOrNull()?.takeIf { it.isFinite() }
         if ((beforeRaw != null && before == null) || (afterRaw != null && after == null)) return null
-        if (status == CalibrationValidationStatus.PASSED || status == CalibrationValidationStatus.WORSE) {
+        if (status == CalibrationValidationStatus.PASSED || status == CalibrationValidationStatus.NEUTRAL || status == CalibrationValidationStatus.WORSE) {
             if (before == null || after == null) return null
         }
         return CalibrationCandidateTransaction(
@@ -219,10 +235,6 @@ class ProfileStore private constructor(
     internal fun clearCalibrationTransaction(): Boolean = prefs.edit().also { editor -> clearTransaction(editor) }.commit()
 
     private fun writeActiveCalibration(editor: SharedPreferences.Editor, curve: CalibrationCurveState) {
-        if (!curve.active) {
-            clearActiveCalibration(editor)
-            return
-        }
         if (curve.left != null && curve.right != null) {
             editor.remove(KEY_CALIBRATION)
                 .putString(KEY_CALIBRATION_LEFT, curve.left.joinToString(","))
@@ -232,12 +244,14 @@ class ProfileStore private constructor(
                 .remove(KEY_CALIBRATION_LEFT)
                 .remove(KEY_CALIBRATION_RIGHT)
         }
+        editor.putBoolean(KEY_CALIBRATION_ACTIVE, curve.active)
     }
 
     private fun clearActiveCalibration(editor: SharedPreferences.Editor) {
         editor.remove(KEY_CALIBRATION)
             .remove(KEY_CALIBRATION_LEFT)
             .remove(KEY_CALIBRATION_RIGHT)
+            .remove(KEY_CALIBRATION_ACTIVE)
     }
 
     private fun writeTransaction(editor: SharedPreferences.Editor, transaction: CalibrationCandidateTransaction, status: String) {
@@ -287,6 +301,7 @@ class ProfileStore private constructor(
         CalibrationValidationStatus.APPLYING -> STATUS_APPLYING
         CalibrationValidationStatus.ROLLING_BACK -> STATUS_ROLLING_BACK
         CalibrationValidationStatus.PASSED -> STATUS_PASSED
+        CalibrationValidationStatus.NEUTRAL -> STATUS_NEUTRAL
         CalibrationValidationStatus.WORSE -> STATUS_WORSE
         CalibrationValidationStatus.INCONCLUSIVE -> STATUS_INCONCLUSIVE
         CalibrationValidationStatus.FAILED -> STATUS_FAILED
@@ -306,7 +321,9 @@ class ProfileStore private constructor(
     companion object {
         private const val PREFS_NAME = "sweetspot"
         private const val DEFAULT_ENABLED = true
+        private const val DEFAULT_START_ON_BOOT = true
         private const val KEY_ENABLED = "enabled"
+        private const val KEY_START_ON_BOOT = "start_on_boot"
         private const val KEY_PRESET = "preset"
         private const val KEY_LEVELS = "levels"
         private const val KEY_NAMES = "names"
@@ -316,6 +333,7 @@ class ProfileStore private constructor(
         private const val KEY_CALIBRATION = "calibration"
         private const val KEY_CALIBRATION_LEFT = "calibration_left"
         private const val KEY_CALIBRATION_RIGHT = "calibration_right"
+        private const val KEY_CALIBRATION_ACTIVE = "calibration_active"
         private const val KEY_CANDIDATE_ID = "calibration_candidate_id"
         private const val KEY_CANDIDATE_STATUS = "calibration_candidate_status"
         private const val KEY_CANDIDATE_BEFORE_DB = "calibration_candidate_before_db"
@@ -331,6 +349,7 @@ class ProfileStore private constructor(
         private const val STATUS_ROLLING_BACK = "rolling_back"
         private const val STATUS_PENDING_VALIDATION = "pending_validation"
         private const val STATUS_PASSED = "passed"
+        private const val STATUS_NEUTRAL = "neutral"
         private const val STATUS_WORSE = "worse"
         private const val STATUS_INCONCLUSIVE = "inconclusive"
         private const val STATUS_FAILED = "failed"

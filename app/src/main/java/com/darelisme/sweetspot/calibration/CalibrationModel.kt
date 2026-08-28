@@ -84,6 +84,7 @@ enum class CalibrationPosition(val optional: Boolean) {
 enum class CaptureChannel {
     LEFT,
     RIGHT,
+    BOTH,
 }
 
 data class CaptureRequest(
@@ -115,7 +116,14 @@ data class AcceptedChannelEvidence(
     val request: CaptureRequest,
     val responseDb: BandCurve,
     val quality: CaptureQuality,
-)
+    val microphoneProfileId: String = "unknown",
+    val microphoneProfileRevision: String = "unknown",
+) {
+    init {
+        require(microphoneProfileId.isNotBlank() && microphoneProfileId.length <= 128)
+        require(microphoneProfileRevision.isNotBlank() && microphoneProfileRevision.length <= 128)
+    }
+}
 
 data class CompletePosition(
     val position: CalibrationPosition,
@@ -140,6 +148,9 @@ enum class CaptureRejectionReason {
     DIRECT_ARRIVAL_WEAK,
     CAPTURE_TOO_SHORT,
     INVALID_PCM,
+    UNSUPPORTED_SAMPLE_RATE,
+    MICROPHONE_PROFILE_UNAVAILABLE,
+    PLAYBACK_FAILED,
 }
 
 enum class CorrectionMode {
@@ -272,6 +283,7 @@ sealed interface CalibrationAction {
 
 sealed interface PendingCalibrationEffect {
     data class StageCandidate(val solutionId: SolutionId) : PendingCalibrationEffect
+    data class AcceptCandidate(val candidateId: CandidateId) : PendingCalibrationEffect
     data class RollbackThenReoptimize(
         val candidateId: CandidateId,
         val nextMode: CorrectionMode?,

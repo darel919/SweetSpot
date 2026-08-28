@@ -8,13 +8,6 @@ sealed interface CalibrationEvent {
     ) : CalibrationEvent
     data class CandidateStaged(val candidate: CalibrationCandidateState) : CalibrationEvent
     data class ValidationClassified(val outcome: ValidationOutcome) : CalibrationEvent
-    data object BrowserDisconnected : CalibrationEvent
-}
-
-sealed interface BrowserCalibrationCommand {
-    data class CancelCapture(val captureId: CaptureId) : BrowserCalibrationCommand
-    data object CancelOptionalRefinement : BrowserCalibrationCommand
-    data object FinishWithBest : BrowserCalibrationCommand
 }
 
 sealed interface CalibrationEffect {
@@ -36,19 +29,7 @@ class CalibrationStateMachine(
         is CalibrationEvent.CaptureRejected -> rejectCapture(job, event.request, event.reason)
         is CalibrationEvent.CandidateStaged -> stageCandidate(job, event.candidate)
         is CalibrationEvent.ValidationClassified -> classifyValidation(job, event.outcome)
-        CalibrationEvent.BrowserDisconnected -> CalibrationTransition(job, emptyList())
     }
-
-    fun handleBrowserCommand(job: CalibrationJob, command: BrowserCalibrationCommand): CalibrationTransition =
-        when (command) {
-            is BrowserCalibrationCommand.CancelCapture -> {
-                val activeCapture = (job.nextAction as? CalibrationAction.Capture)?.request?.captureId
-                if (activeCapture != command.captureId) CalibrationTransition(job, emptyList())
-                else persistAndPublish(job.copy(nextAction = CalibrationPlanner.nextAction(job)))
-            }
-            BrowserCalibrationCommand.CancelOptionalRefinement,
-            BrowserCalibrationCommand.FinishWithBest -> finishWithBest(job)
-        }
 
     private fun acceptChannel(job: CalibrationJob, evidence: AcceptedChannelEvidence): CalibrationTransition {
         val ledger = job.ledger.recordAccepted(evidence)
@@ -59,8 +40,14 @@ class CalibrationStateMachine(
         }
         val updatedUsability = selectUsability(job.usability, ledger, optimized)
         val confidence = when (optimized) {
-            is OptimizationResult.Valid -> optimized.solution.confidence
-            is OptimizationResult.Insufficient -> optimized.confidence
+            is OptimizationResult.Valid -> if (
+                (updatedUsability as? CalibrationUsability.Usable)?.best?.id == optimized.solution.id
+            ) {
+                optimized.solution.confidence
+            } else {
+                job.confidence
+            }
+            is OptimizationResult.Insufficient -> job.confidence ?: optimized.confidence
             null -> job.confidence
         }
         val provisional = job.copy(
@@ -85,7 +72,7 @@ class CalibrationStateMachine(
         val provisional = job.copy(
             revision = job.revision + 1,
             ledger = ledger,
-            lastError = CalibrationJobError(reason.name.lowercase(), "Capture was rejected"),
+            lastError = CalibrationJobError(reason.name.lowercase(), reason.userMessage()),
         )
         val phase = CalibrationPlanner.phase(provisional)
         val next = CalibrationPlanner.nextAction(provisional.copy(phase = phase))
@@ -124,7 +111,11 @@ class CalibrationStateMachine(
     ): CalibrationTransition {
         val candidate = requireNotNull(job.candidate)
         val record = ValidationRecord(candidate.id, outcome, candidate.validationAttemptIndex)
-        val history = job.validationHistory + record
+        val history = if (job.validationHistory.lastOrNull() == record) {
+            job.validationHistory
+        } else {
+            job.validationHistory + record
+        }
         return when (outcome) {
             ValidationOutcome.IMPROVED,
             ValidationOutcome.NEUTRAL -> {
@@ -134,12 +125,16 @@ class CalibrationStateMachine(
                         revision = job.revision + 1,
                         phase = CalibrationPhase.Complete,
                         validationHistory = history,
+                        candidate = null,
                         nextAction = CalibrationAction.Complete(solution.id),
                         pendingEffect = null,
                     ),
                 )
             }
             ValidationOutcome.INCONCLUSIVE_CAPTURE -> {
+                if (candidate.validationAttemptIndex + 1 >= MAX_VALIDATION_ATTEMPTS) {
+                    return rollback(job, candidate, history, dspError = true)
+                }
                 val retry = candidate.copy(validationAttemptIndex = candidate.validationAttemptIndex + 1)
                 val action = CalibrationAction.Validate(
                     captureId = CaptureId("validation-${candidate.id.value}-${retry.validationAttemptIndex}"),
@@ -192,26 +187,6 @@ class CalibrationStateMachine(
         )
     }
 
-    private fun finishWithBest(job: CalibrationJob): CalibrationTransition {
-        val usable = job.usability as? CalibrationUsability.Usable
-            ?: return CalibrationTransition(job, emptyList())
-        val pending = PendingCalibrationEffect.StageCandidate(usable.best.id)
-        val updated = job.copy(
-            revision = job.revision + 1,
-            phase = CalibrationPhase.CandidatePending,
-            nextAction = CalibrationAction.Wait("Staging the best calibration."),
-            pendingEffect = pending,
-        )
-        return CalibrationTransition(
-            updated,
-            listOf(
-                CalibrationEffect.Persist(updated),
-                CalibrationEffect.Execute(pending),
-                CalibrationEffect.Publish(updated.nextAction),
-            ),
-        )
-    }
-
     private fun selectUsability(
         current: CalibrationUsability,
         ledger: PositionLedger,
@@ -244,6 +219,25 @@ class CalibrationStateMachine(
         job,
         listOf(CalibrationEffect.Persist(job), CalibrationEffect.Publish(job.nextAction)),
     )
+
+    private companion object {
+        const val MAX_VALIDATION_ATTEMPTS = 2
+    }
+}
+
+private fun CaptureRejectionReason.userMessage(): String = when (this) {
+    CaptureRejectionReason.CLIPPING -> "The recording clipped. Lower the TV volume and try this position again."
+    CaptureRejectionReason.MARKER_UNRELIABLE -> "The TV sweep marker was unclear. Keep the phone still and reduce background noise."
+    CaptureRejectionReason.BAD_TIMING -> "The sweep timing was unstable. Keep the phone still and try this position again."
+    CaptureRejectionReason.CLOCK_DRIFT_UNTRUSTED -> "The phone clock drifted too far during the sweep. Keep the capture uninterrupted and try again."
+    CaptureRejectionReason.SIGNAL_TOO_LOW -> "The sweep was too quiet. Move the phone closer or raise the TV volume slightly."
+    CaptureRejectionReason.BACKGROUND_NOISE_HIGH -> "Background noise was too high. Pause playback and try again in a quieter room."
+    CaptureRejectionReason.DIRECT_ARRIVAL_WEAK -> "The direct speaker arrival was too weak. Point the phone toward the TV and try again."
+    CaptureRejectionReason.CAPTURE_TOO_SHORT -> "The phone recording ended too early. Keep the browser open until the sweep finishes."
+    CaptureRejectionReason.INVALID_PCM -> "The phone sent an invalid recording. Keep the browser open and try this position again."
+    CaptureRejectionReason.UNSUPPORTED_SAMPLE_RATE -> "The phone microphone sample rate is unsupported for this calibration."
+    CaptureRejectionReason.MICROPHONE_PROFILE_UNAVAILABLE -> "The phone did not provide a validated microphone profile. Choose a supported profile and try again."
+    CaptureRejectionReason.PLAYBACK_FAILED -> "The TV could not play this sweep. Stop other audio operations and try again."
 }
 
 object CalibrationPlanner {
@@ -259,7 +253,7 @@ object CalibrationPlanner {
         if (job.ledger.containsAllMandatoryPositions()) {
             return CalibrationPhase.Failed("Mandatory positions did not produce a trustworthy correction")
         }
-        if (mandatoryExhausted(job)) return CalibrationPhase.Failed("Three complete mandatory positions were not obtained")
+        if (mandatoryExhausted(job)) return CalibrationPhase.Failed(mandatoryFailureMessage(job))
         return if (job.ledger.complete(CalibrationPosition.CENTER) == null) {
             CalibrationPhase.CenterPreflight
         } else {
@@ -282,7 +276,7 @@ object CalibrationPlanner {
         val usable = job.usability as CalibrationUsability.Usable
         if (usable.grade == UsabilityGrade.SUFFICIENT) return false
         return listOf(CalibrationPosition.FORWARD, CalibrationPosition.BACKWARD).any { position ->
-            job.ledger.complete(position) == null && CaptureChannel.entries.any { channel ->
+            job.ledger.complete(position) == null && ROOM_CHANNELS.any { channel ->
                 attemptCount(job, position, channel) < MAX_ATTEMPTS_PER_CHANNEL
             }
         }
@@ -290,11 +284,27 @@ object CalibrationPlanner {
 
     private fun mandatoryExhausted(job: CalibrationJob): Boolean =
         PositionLedger.MANDATORY_POSITIONS.any { position ->
-            job.ledger.complete(position) == null && CaptureChannel.entries.any { channel ->
-                job.ledger.channels(position).accepted(channel) == null &&
+            job.ledger.complete(position) == null && ROOM_CHANNELS.all { channel ->
+                job.ledger.channels(position).accepted(channel) != null ||
                     attemptCount(job, position, channel) >= MAX_ATTEMPTS_PER_CHANNEL
             }
         }
+
+    private fun mandatoryFailureMessage(job: CalibrationJob): String {
+        val exhausted = PositionLedger.MANDATORY_POSITIONS.firstOrNull { position ->
+            job.ledger.complete(position) == null && ROOM_CHANNELS.all { channel ->
+                job.ledger.channels(position).accepted(channel) != null ||
+                    attemptCount(job, position, channel) >= MAX_ATTEMPTS_PER_CHANNEL
+            }
+        }
+        return when (exhausted) {
+            CalibrationPosition.CENTER -> "Center setup could not become trustworthy after the retry budget. Check volume, noise, and phone placement before trying again."
+            CalibrationPosition.LEFT -> "The left listening position could not become trustworthy after the retry budget. Keep the phone still and try again."
+            CalibrationPosition.RIGHT -> "The right listening position could not become trustworthy after the retry budget. Keep the phone still and try again."
+            null -> "Three complete mandatory positions were not obtained"
+            else -> "A required listening position could not become trustworthy after the retry budget"
+        }
+    }
 
     private fun nextForPositions(
         job: CalibrationJob,
@@ -302,7 +312,7 @@ object CalibrationPlanner {
     ): CalibrationAction.Capture? {
         positions.forEach { position ->
             if (job.ledger.complete(position) != null) return@forEach
-            CaptureChannel.entries.forEach { channel ->
+            ROOM_CHANNELS.forEach { channel ->
                 if (job.ledger.channels(position).accepted(channel) != null) return@forEach
                 val attempts = attemptCount(job, position, channel)
                 if (attempts < MAX_ATTEMPTS_PER_CHANNEL) return capture(position, channel, attempts)
@@ -322,6 +332,7 @@ object CalibrationPlanner {
     private fun PositionChannels.accepted(channel: CaptureChannel): AcceptedChannelEvidence? = when (channel) {
         CaptureChannel.LEFT -> left
         CaptureChannel.RIGHT -> right
+        CaptureChannel.BOTH -> null
     }
 
     private fun capture(
@@ -338,4 +349,6 @@ object CalibrationPlanner {
         ),
         instruction = "Measure ${position.name.lowercase()} ${channel.name.lowercase()}.",
     )
+
+    private val ROOM_CHANNELS = listOf(CaptureChannel.LEFT, CaptureChannel.RIGHT)
 }

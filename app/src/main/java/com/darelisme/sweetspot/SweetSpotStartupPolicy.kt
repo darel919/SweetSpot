@@ -19,12 +19,13 @@ internal object SweetSpotStartupPolicy {
         enabled: Boolean,
         reason: SweetSpotStartReason,
         requestedShowOverlay: Boolean = false,
+        startOnBoot: Boolean = enabled,
     ): SweetSpotStartupDecision {
         val shouldStart = when (reason) {
             SweetSpotStartReason.USER_LAUNCH,
             SweetSpotStartReason.EXPLICIT_COMMAND -> true
             SweetSpotStartReason.BOOT_COMPLETED,
-            SweetSpotStartReason.STICKY_RESTART -> enabled
+            SweetSpotStartReason.STICKY_RESTART -> startOnBoot
         }
         return SweetSpotStartupDecision(
             shouldStart = shouldStart,

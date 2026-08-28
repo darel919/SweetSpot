@@ -51,33 +51,6 @@ class CalibrationHardInvariantsTest {
     }
 
     @Test
-    fun browserCommandsCannotCreateEvidenceOrValidationOutcomes() {
-        val job = CalibrationTestFixtures.usableJob(machine)
-        val commands = listOf(
-            BrowserCalibrationCommand.CancelCapture(CaptureId("not-active")),
-            BrowserCalibrationCommand.CancelOptionalRefinement,
-            BrowserCalibrationCommand.FinishWithBest,
-        )
-
-        commands.forEach { command ->
-            val after = machine.handleBrowserCommand(job, command).job
-            assertEquals(job.ledger, after.ledger)
-            assertEquals(job.validationHistory, after.validationHistory)
-            assertEquals(job.usability, after.usability)
-        }
-    }
-
-    @Test
-    fun browserDisconnectDoesNotOwnJobLifetime() {
-        val job = CalibrationTestFixtures.usableJob(machine)
-
-        val transition = machine.reduce(job, CalibrationEvent.BrowserDisconnected)
-
-        assertSame(job, transition.job)
-        assertTrue(transition.effects.isEmpty())
-    }
-
-    @Test
     fun acceptedEvidenceIsInsidePersistedSnapshotBeforeNextActionPublishes() {
         val job = CalibrationTestFixtures.newJob()
         val transition = machine.reduce(

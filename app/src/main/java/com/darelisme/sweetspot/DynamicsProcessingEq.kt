@@ -9,8 +9,8 @@ import kotlin.math.*
  * Production audio engine: a single [DynamicsProcessing] on session 0 with
  * [INTERNAL_BANDS] pre-EQ bands that combines two layers:
  *
- *  - calibration: a read-only 64-band base curve (dB) set ONLY by the calibrate
- *    wizard (fed by iPhone-mic measurements). Persisted separately.
+ *  - calibration: a read-only 64-band base curve (dB) set by the TV calibration
+ *    engine from phone microphone captures. Persisted separately.
  *  - user: 24 user-facing bands (dB, exposed in millibels via the [AudioEngine]
  *    contract) that act as macro controls — each internal band takes the gain of
  *    the nearest user band.
@@ -127,6 +127,14 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
                     reason = reason ?: "Validation was inconclusive",
                 )
             }
+            if (requestedStatus == CalibrationValidationStatus.NEUTRAL) {
+                return NormalizedValidationResult(
+                    status = CalibrationValidationStatus.NEUTRAL,
+                    beforeDb = beforeDb?.takeIf { it.isFinite() },
+                    afterDb = afterDb?.takeIf { it.isFinite() },
+                    reason = reason ?: "Validation was neutral within tolerance",
+                )
+            }
             if (beforeDb == null || afterDb == null || !beforeDb.isFinite() || !afterDb.isFinite()) {
                 return NormalizedValidationResult(
                     status = CalibrationValidationStatus.INCONCLUSIVE,
@@ -176,9 +184,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     @Volatile private var dp: DynamicsProcessing? = null
     @Volatile private var enabled = true
     @Volatile private var activePreset = PRESET_FLAT
-    /** User EQ gains in dB. */
     private var userGains = FloatArray(USER_BANDS)
-    /** Read-only calibration base gains in dB. */
     private var calibration = FloatArray(INTERNAL_BANDS)
     private var calibrationLeft: FloatArray? = null
     private var calibrationRight: FloatArray? = null
@@ -483,6 +489,32 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     fun isCalibrationActive(): Boolean = calibrationActive
 
     @Synchronized
+    fun hasCalibrationProfile(): Boolean =
+        calibrationActive || profileStore.loadCalibration() != null || profileStore.loadCalibrationChannels() != null
+
+    /** Toggles the saved room correction without deleting its measured curve. */
+    @Synchronized
+    fun setCalibrationEnabled(enabled: Boolean): Boolean {
+        if (isAudioStateOverrideActive() || !hasCalibrationProfile()) return false
+        if (calibrationActive == enabled) return true
+        val previous = calibrationActive
+        calibrationActive = enabled
+        if (!applyAll(trackCalibrationStatus = true)) {
+            calibrationActive = previous
+            applyAll(trackCalibrationStatus = true)
+            return false
+        }
+        if (!profileStore.saveCalibrationEnabled(enabled)) {
+            calibrationActive = previous
+            applyAll(trackCalibrationStatus = true)
+            return false
+        }
+        lastCalibrationApplySucceeded = true
+        lastCalibrationApplyError = null
+        return true
+    }
+
+    @Synchronized
     fun wasLastCalibrationApplySuccessful(): Boolean = lastCalibrationApplySucceeded
 
     @Synchronized
@@ -699,6 +731,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
         val transaction = profileStore.loadCalibrationTransaction() ?: return false
         if (transaction.candidateId != candidateId
             || (transaction.validationStatus != CalibrationValidationStatus.PASSED
+                && transaction.validationStatus != CalibrationValidationStatus.NEUTRAL
                 && transaction.validationStatus != CalibrationValidationStatus.IMPORTED)
         ) {
             recordCalibrationFailure("Calibration candidate is not ready for acceptance")
@@ -1055,7 +1088,8 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
             }
             for (i in 0 until INTERNAL_BANDS) {
                 val userGain = if (calibrationValidationState == null) userGains[userBandForInternal[i]] else 0f
-                maximum = max(maximum, channelCalibration[i] + userGain)
+                val calibrationGain = if (calibrationActive) channelCalibration[i] else 0f
+                maximum = max(maximum, calibrationGain + userGain)
             }
         }
         return if (maximum > 0f) -(maximum + 0.5f) else 0f
@@ -1077,7 +1111,8 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
             else -> calibration
         }
         val userGain = if (calibrationValidationState == null) userGains[userBandForInternal[band]] else 0f
-        return effectiveCalibrationGain(channelCalibration[band], userGain, headroomVerified)
+        val calibrationGain = if (calibrationActive) channelCalibration[band] else 0f
+        return effectiveCalibrationGain(calibrationGain, userGain, headroomVerified)
     }
 
     private fun isValidDiagnosticProbeCurve(gains: FloatArray): Boolean =
@@ -1292,16 +1327,16 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
             calibrationLeft = channels.first.copyOf()
             calibrationRight = channels.second.copyOf()
             calibration = FloatArray(INTERNAL_BANDS) { (channels.first[it] + channels.second[it]) / 2f }
-            calibrationActive = true
+            calibrationActive = profileStore.isCalibrationEnabled()
         } else if (!INDEPENDENT_ROUTING_VERIFIED && channels != null
             && isValidCalibrationArray(channels.first) && isValidCalibrationArray(channels.second)) {
             calibration = FloatArray(INTERNAL_BANDS) { (channels.first[it] + channels.second[it]) / 2f }
-            calibrationActive = true
+            calibrationActive = profileStore.isCalibrationEnabled()
         } else if (channels != null) {
             profileStore.clearActiveCalibrationOnly()
         } else if (cal != null && isValidCalibrationArray(cal)) {
             for (i in 0 until INTERNAL_BANDS) calibration[i] = cal[i]
-            calibrationActive = true
+            calibrationActive = profileStore.isCalibrationEnabled()
         } else if (cal != null) {
             profileStore.clearActiveCalibrationOnly()
         }

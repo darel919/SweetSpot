@@ -11,6 +11,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okio.ByteString
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -34,6 +35,9 @@ class MailboxClient(
     interface CommandHandler {
         /** Handle a non-query command; return true if a state.snapshot should be posted back. */
         fun onCommand(type: String, payload: JSONObject, replyTo: (String, JSONObject) -> Unit)
+
+        /** Handles a binary calibration capture frame from the paired browser. */
+        fun onBinary(payload: ByteArray) {}
     }
 
     companion object {
@@ -122,6 +126,12 @@ class MailboxClient(
                     }
                 }
 
+                override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                    executor.execute {
+                        if (isCurrentSocket(webSocket)) handleSocketBinary(bytes.toByteArray())
+                    }
+                }
+
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                     executor.execute { handleSocketClosed(webSocket, "closed $code: $reason") }
                 }
@@ -187,6 +197,30 @@ class MailboxClient(
             }
             "room.error" -> Log.w(TAG, "Room WebSocket error: ${json.optString("message")}")
             else -> handleCommand(json)
+        }
+    }
+
+    private fun handleSocketBinary(payload: ByteArray) {
+        try {
+            commandHandler.onBinary(payload)
+        } catch (error: Throwable) {
+            Log.e(TAG, "binary calibration capture failed", error)
+        }
+    }
+
+    /** Publishes an unsolicited device event; state is still recoverable through state.get. */
+    fun publish(type: String, payload: JSONObject = JSONObject()) {
+        val out = JSONObject().apply {
+            put("v", 1)
+            put("id", "dev_${System.currentTimeMillis().toString(36)}_${responseCounter.incrementAndGet().toString(36)}")
+            put("type", type)
+            put("ts", System.currentTimeMillis())
+            put("payload", payload)
+        }
+        executor.execute {
+            if (socket?.send(out.toString()) != true) {
+                Log.w(TAG, "publish $type skipped because the room WebSocket is unavailable")
+            }
         }
     }
 

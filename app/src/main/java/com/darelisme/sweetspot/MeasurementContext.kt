@@ -24,10 +24,7 @@ internal data class MeasurementGeometry(
     val zCm: Double,
 )
 
-/**
- * Identity for one browser-owned acoustic measurement. The TV uses this only
- * to route the sweep and render progress; it never performs DSP policy.
- */
+/** Identity for one TV-planned acoustic measurement and its remote capture. */
 data class MeasurementContext(
     val positionId: String,
     val reference: String,

@@ -22,6 +22,7 @@ internal enum class CalibrationValidationStatus {
     ROLLING_BACK,
     PENDING,
     PASSED,
+    NEUTRAL,
     WORSE,
     INCONCLUSIVE,
     FAILED,
@@ -41,6 +42,7 @@ internal fun CalibrationValidationStatus.recoveryTarget(): CalibrationRecoveryTa
     CalibrationValidationStatus.FAILED -> CalibrationRecoveryTarget.PREVIOUS
     CalibrationValidationStatus.PENDING,
     CalibrationValidationStatus.PASSED,
+    CalibrationValidationStatus.NEUTRAL,
     CalibrationValidationStatus.IMPORTED -> CalibrationRecoveryTarget.CANDIDATE
 }
 
@@ -85,6 +87,7 @@ internal fun CalibrationValidationStatus.rollbackOutcome(): String = when (this)
     CalibrationValidationStatus.ROLLING_BACK,
     CalibrationValidationStatus.PENDING,
     CalibrationValidationStatus.PASSED,
+    CalibrationValidationStatus.NEUTRAL,
     CalibrationValidationStatus.INCONCLUSIVE,
     CalibrationValidationStatus.IMPORTED -> "inconclusive"
 }
@@ -99,4 +102,5 @@ internal fun canAcceptCalibrationCandidate(
         transaction.candidateId == candidateId &&
         liveDspVerified &&
         (transaction.validationStatus == CalibrationValidationStatus.PASSED
+            || transaction.validationStatus == CalibrationValidationStatus.NEUTRAL
             || transaction.validationStatus == CalibrationValidationStatus.IMPORTED)

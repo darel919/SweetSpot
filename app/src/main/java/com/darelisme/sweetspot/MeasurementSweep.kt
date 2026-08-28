@@ -11,9 +11,9 @@ import kotlin.math.sin
 /**
  * The playback description for one physical microphone position.
  *
- * The marker and both routed sweeps are one capture. A repair may suppress
- * one sweep, but it still uses the same marker/layout so the browser can keep
- * the accepted sibling channel and analyse the requested channel in place.
+ * The marker and both routed sweeps are one capture. A repair may suppress one
+ * sweep while the TV retains the accepted sibling channel and analyzes only the
+ * requested channel.
  */
 data class MeasurementSweep(
     val sampleRate: Int,
@@ -108,7 +108,6 @@ object MeasurementSweepGenerator {
         return signal
     }
 
-    /** Generates one synchronization marker using the same sweep definition as playback. */
     fun generateSyncMarker(
         sweep: MeasurementSweep,
         sampleRate: Int = sweep.sampleRate,

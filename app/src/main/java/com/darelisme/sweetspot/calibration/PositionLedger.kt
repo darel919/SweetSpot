@@ -26,6 +26,7 @@ data class PositionChannels(
             require(right == null || right.request.captureId == evidence.request.captureId)
             copy(right = right ?: evidence)
         }
+        CaptureChannel.BOTH -> error("A composite capture cannot enter a single-channel position ledger")
     }
 
     fun complete(position: CalibrationPosition): CompletePosition? {

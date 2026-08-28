@@ -5,6 +5,7 @@ import com.darelisme.sweetspot.MeasurementSweepGenerator
 import com.darelisme.sweetspot.SyncMarkerKind
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.hypot
 import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.min
@@ -25,7 +26,7 @@ data class CalibrationCapture(
     val channel: AnalysisChannel = AnalysisChannel.BOTH,
 ) {
     init {
-        require(sampleRateHz in 8_000..96_000)
+        require(sampleRateHz in 8_000..192_000)
         require(samples.isNotEmpty())
         require(samples.all(Float::isFinite))
     }
@@ -86,6 +87,10 @@ data class DirectArrivalDiagnostics(
     val supportRms: Float,
     val supportThreshold: Float,
     val rejection: DirectArrivalFailure?,
+    val candidateSample: Int? = acceptedSample,
+    val acceptanceThreshold: Float = supportThreshold,
+    val laterReflectionSample: Int? = null,
+    val laterReflectionPeak: Float? = null,
 )
 
 enum class DirectArrivalFailure {
@@ -103,6 +108,9 @@ data class MicrophoneCalibrationProfile(
     val frequenciesHz: FloatArray,
     val responseDb: FloatArray,
     val normalizeAtHz: Float = 1_000f,
+    val trustMinHz: Float = 30f,
+    val trustFullMaxHz: Float = 8_000f,
+    val trustTaperToHz: Float = 12_000f,
 ) {
     init {
         require(frequenciesHz.size == responseDb.size)
@@ -113,12 +121,31 @@ data class MicrophoneCalibrationProfile(
         require(frequenciesHz.all { it > 0f && it.isFinite() })
         require(responseDb.all(Float::isFinite))
         require(normalizeAtHz > 0f && normalizeAtHz.isFinite())
+        require(trustMinHz > 0f && trustMinHz < trustFullMaxHz)
+        require(trustFullMaxHz < trustTaperToHz && trustTaperToHz.isFinite())
     }
 
     fun compensationDbAt(frequencyHz: Float): Float {
         require(frequencyHz > 0f && frequencyHz.isFinite())
         val normalized = interpolate(frequencyHz) - interpolate(normalizeAtHz)
-        return -normalized
+        val weight = when {
+            frequencyHz < trustMinHz || frequencyHz >= trustTaperToHz -> 0f
+            frequencyHz <= trustFullMaxHz -> 1f
+            frequencyHz <= 10_000f -> 1f - 0.5f * (frequencyHz - trustFullMaxHz) / (10_000f - trustFullMaxHz)
+            else -> 0.5f * (trustTaperToHz - frequencyHz) / (trustTaperToHz - 10_000f)
+        }.coerceIn(0f, 1f)
+        val maximumAbsoluteCompensation = when {
+            frequencyHz <= trustFullMaxHz -> Float.POSITIVE_INFINITY
+            frequencyHz <= 10_000f -> 2f
+            frequencyHz < trustTaperToHz -> 1f
+            else -> 0f
+        }
+        val compensation = -normalized * weight
+        return if (maximumAbsoluteCompensation.isInfinite()) {
+            compensation
+        } else {
+            compensation.coerceIn(-maximumAbsoluteCompensation, maximumAbsoluteCompensation)
+        }
     }
 
     private fun interpolate(frequencyHz: Float): Float {
@@ -179,10 +206,17 @@ class AndroidResponseV1Analyzer : CalibrationAnalyzer {
         microphoneProfile: MicrophoneCalibrationProfile?,
     ): CalibrationAnalysis {
         require(sweep.sampleRate > 0)
-        val quality = quality(capture.samples, sweep, capture.sampleRateHz)
-        val marker = MarkerDetector.detect(capture.samples, sweep, capture.sampleRateHz)
+        val centered = removeDc(capture.samples)
+        val marker = MarkerDetector.detect(centered, sweep, capture.sampleRateHz)
+        val quality = quality(
+            centered,
+            sweep,
+            capture.sampleRateHz,
+            marker.startSample,
+            marker.leadingMarkerSample,
+        )
         if (quality.clippedSamples > 0) return emptyAnalysis(AnalysisStatus.CAPTURE_CLIPPED, marker, quality)
-        if (capture.sampleRateHz < 40_000) {
+        if (capture.sampleRateHz < 40_000 || sweep.endHz >= capture.sampleRateHz / 2f) {
             return emptyAnalysis(AnalysisStatus.UNSUPPORTED_SAMPLE_RATE, marker, quality)
         }
         val expectedLength = scaledParts(sweep, capture.sampleRateHz).totalFrames
@@ -203,23 +237,43 @@ class AndroidResponseV1Analyzer : CalibrationAnalyzer {
 
         val parts = scaledParts(sweep, capture.sampleRateHz)
         val clockRatio = marker.clockRatio ?: 1f
-        val left = if (capture.channel == AnalysisChannel.RIGHT) {
-            emptyList()
+        val leftResult = if (capture.channel == AnalysisChannel.RIGHT) {
+            SweepAnalysis(emptyList(), null)
         } else {
-            analyzeSweep(capture.samples, marker.startSample ?: 0, parts.sweepFrames, sweep, capture.sampleRateHz, microphoneProfile, clockRatio)
+            analyzeSweep(
+                centered,
+                marker.startSample ?: 0,
+                parts.sweepFrames,
+                parts.interSweepGapFrames,
+                sweep,
+                capture.sampleRateHz,
+                microphoneProfile,
+                clockRatio,
+            )
         }
-        val right = if (capture.channel == AnalysisChannel.LEFT) {
-            emptyList()
+        val rightResult = if (capture.channel == AnalysisChannel.LEFT) {
+            SweepAnalysis(emptyList(), null)
         } else {
-            analyzeSweep(capture.samples, marker.rightStartSample ?: 0, parts.sweepFrames, sweep, capture.sampleRateHz, microphoneProfile, clockRatio)
+            analyzeSweep(
+                centered,
+                marker.rightStartSample ?: 0,
+                parts.sweepFrames,
+                parts.postRollFrames,
+                sweep,
+                capture.sampleRateHz,
+                microphoneProfile,
+                clockRatio,
+            )
         }
-        val leftImpulse = if (left.isNotEmpty()) deconvolveChannel(capture.samples, marker.startSample ?: 0, parts.sweepFrames, sweep, capture.sampleRateHz, clockRatio) else null
-        val rightImpulse = if (right.isNotEmpty()) deconvolveChannel(capture.samples, marker.rightStartSample ?: 0, parts.sweepFrames, sweep, capture.sampleRateHz, clockRatio) else null
-        val leftDirect = leftImpulse?.let(::directArrival)
-        val rightDirect = rightImpulse?.let(::directArrival)
+        val left = leftResult.response
+        val right = rightResult.response
+        val leftDirect = leftResult.directArrival
+        val rightDirect = rightResult.directArrival
+        val leftRequested = capture.channel != AnalysisChannel.RIGHT
+        val rightRequested = capture.channel != AnalysisChannel.LEFT
         val directFailure = listOfNotNull(
-            if (left.isNotEmpty()) leftDirect?.rejection else null,
-            if (right.isNotEmpty()) rightDirect?.rejection else null,
+            if (leftRequested) leftDirect?.rejection else null,
+            if (rightRequested) rightDirect?.rejection else null,
         ).firstOrNull()
         if (directFailure != null) {
             return CalibrationAnalysis(
@@ -238,34 +292,38 @@ class AndroidResponseV1Analyzer : CalibrationAnalyzer {
         return CalibrationAnalysis(AnalysisStatus.OK, marker, quality, left, right, leftDirect, rightDirect)
     }
 
+    private data class SweepAnalysis(
+        val response: List<ResponsePoint>,
+        val directArrival: DirectArrivalDiagnostics?,
+    )
+
     private fun analyzeSweep(
         samples: FloatArray,
         start: Int,
         length: Int,
+        postRollFrames: Int,
         sweep: MeasurementSweep,
         sampleRate: Int,
         profile: MicrophoneCalibrationProfile?,
         clockRatio: Float,
-    ): List<ResponsePoint> {
-        val recorded = clockCorrectedSlice(samples, start, length, clockRatio) ?: return emptyList()
+    ): SweepAnalysis {
+        val targetLength = length + postRollFrames
+        val recorded = clockCorrectedSlice(samples, start, targetLength, clockRatio) ?: return SweepAnalysis(emptyList(), null)
         val reference = MeasurementSweepGenerator.generateSweepSignal(sweep, sampleRate)
-        val points = FrequencyResponse.extract(recorded, reference, sampleRate)
-        return points.map { point ->
+        val impulse = EssDeconvolver.deconvolve(
+            recorded = recorded,
+            reference = reference,
+            targetLength = targetLength,
+            causalLength = postRollFrames + 1,
+            clockRatio = 1f,
+        )
+        val direct = directArrival(impulse)
+        if (direct.rejection != null || direct.acceptedSample == null) return SweepAnalysis(emptyList(), direct)
+        val points = FrequencyResponse.extractWindowed(impulse, sampleRate, sweep.startHz, sweep.endHz)
+        val corrected = points.map { point ->
             point.copy(magnitudeDb = point.magnitudeDb + (profile?.compensationDbAt(point.frequencyHz) ?: 0f))
         }
-    }
-
-    private fun deconvolveChannel(
-        samples: FloatArray,
-        start: Int,
-        length: Int,
-        sweep: MeasurementSweep,
-        sampleRate: Int,
-        clockRatio: Float,
-    ): FloatArray? {
-        val recorded = clockCorrectedSlice(samples, start, length, clockRatio) ?: return null
-        val reference = MeasurementSweepGenerator.generateSweepSignal(sweep, sampleRate)
-        return EssDeconvolver.deconvolve(recorded, reference)
+        return SweepAnalysis(corrected, direct)
     }
 
     private fun clockCorrectedSlice(
@@ -287,23 +345,40 @@ class AndroidResponseV1Analyzer : CalibrationAnalyzer {
         }
     }
 
-    private fun quality(samples: FloatArray, sweep: MeasurementSweep, sampleRate: Int): CaptureSignalQuality {
-        var sumSquares = 0.0
+    private fun quality(
+        samples: FloatArray,
+        sweep: MeasurementSweep,
+        sampleRate: Int,
+        startSample: Int?,
+        noiseAnchorSample: Int?,
+    ): CaptureSignalQuality {
+        val parts = scaledParts(sweep, sampleRate)
+        val signalStart = startSample?.coerceIn(0, samples.size) ?: 0
+        val signalEnd = if (startSample == null) {
+            samples.size
+        } else {
+            min(samples.size, signalStart + parts.sweepFrames + parts.postRollFrames)
+        }
         var peak = 0f
         var clipped = 0
-        samples.forEach { sample ->
-            val absolute = abs(sample)
-            sumSquares += sample * sample
+        for (index in signalStart until signalEnd) {
+            val absolute = abs(samples[index])
             peak = max(peak, absolute)
             if (absolute >= CLIP_THRESHOLD) clipped++
         }
-        val rms = sqrt(sumSquares / samples.size).toFloat()
-        val parts = scaledParts(sweep, sampleRate)
-        val noiseEnd = min(samples.size, parts.leadingMarkerStartFrame)
+        val signalRms = if (signalEnd > signalStart) rms(samples, signalStart, signalEnd) else 0f
+        val noiseEnd = min(samples.size, noiseAnchorSample ?: startSample ?: parts.leadingMarkerStartFrame)
         val noiseStart = max(0, noiseEnd - min(parts.preRollFrames, sampleRate / 4))
         val noise = if (noiseEnd > noiseStart) rms(samples, noiseStart, noiseEnd) else 0f
-        val snr = if (noise > 0f && rms > 0f) (20f * log10(rms / noise)) else null
-        return CaptureSignalQuality(rms, peak, snr, clipped)
+        val snr = if (noise > 0f && signalRms > 0f) (20f * log10(signalRms / noise)) else null
+        return CaptureSignalQuality(signalRms, peak, snr, clipped)
+    }
+
+    private fun removeDc(samples: FloatArray): FloatArray {
+        if (samples.isEmpty()) return samples
+        val mean = samples.average().toFloat()
+        if (abs(mean) < 1e-8f) return samples
+        return FloatArray(samples.size) { index -> samples[index] - mean }
     }
 
     private fun emptyAnalysis(
@@ -397,13 +472,14 @@ object MarkerDetector {
         }
         val accepted = failure == null
         val driftTrusted = selected != null && minimum >= 0.55f && accepted
+        val nominalCapturePerTvFrame = sampleRateHz.toFloat() / sweep.sampleRate
         val start = if (accepted && selected != null) {
-            selected.leading.sample + ((tvParts.sweepStartFrame - tvParts.leadingMarkerStartFrame) *
-                sampleRateHz / sweep.sampleRate.toFloat() * selected.clockRatio).roundToInt()
+            selected.leading.sample + ((tvParts.sweepStartFrame - tvParts.leadingMarkerStartFrame).toFloat() *
+                nominalCapturePerTvFrame * selected.clockRatio).roundToInt()
         } else null
         val rightStart = if (accepted && selected != null) {
-            selected.leading.sample + ((tvParts.rightSweepStartFrame - tvParts.leadingMarkerStartFrame) *
-                sampleRateHz / sweep.sampleRate.toFloat() * selected.clockRatio).roundToInt()
+            selected.leading.sample + ((tvParts.rightSweepStartFrame - tvParts.leadingMarkerStartFrame).toFloat() *
+                nominalCapturePerTvFrame * selected.clockRatio).roundToInt()
         } else null
         return MarkerDetection(
             accepted = accepted,
@@ -565,13 +641,47 @@ object CalibrationFft {
 
 object EssDeconvolver {
     fun deconvolve(recorded: FloatArray, reference: FloatArray): FloatArray {
+        return deconvolve(
+            recorded = recorded,
+            reference = reference,
+            targetLength = recorded.size,
+            causalLength = recorded.size,
+            clockRatio = 1f,
+        )
+    }
+
+    fun deconvolve(
+        recorded: FloatArray,
+        reference: FloatArray,
+        targetLength: Int,
+        causalLength: Int,
+        clockRatio: Float = 1f,
+    ): FloatArray {
         require(recorded.isNotEmpty() && reference.isNotEmpty())
-        val length = nextPowerOfTwo(recorded.size + reference.size - 1)
+        require(targetLength >= reference.size)
+        require(causalLength in 1..targetLength)
+        require(clockRatio.isFinite() && clockRatio > 0f)
+        val sourceLength = (targetLength * clockRatio).roundToInt()
+        require(sourceLength <= recorded.size) {
+            "Recorded capture is shorter than the requested deconvolution window"
+        }
+        val warped = if (sourceLength == targetLength && sourceLength == recorded.size) {
+            recorded
+        } else {
+            FloatArray(targetLength) { index ->
+                val position = index.toFloat() * (sourceLength - 1) / (targetLength - 1).coerceAtLeast(1)
+                val lower = position.toInt().coerceIn(0, sourceLength - 1)
+                val upper = (lower + 1).coerceAtMost(sourceLength - 1)
+                val fraction = position - lower
+                recorded[lower] * (1f - fraction) + recorded[upper] * fraction
+            }
+        }
+        val length = nextPowerOfTwo(targetLength + reference.size - 1)
         val recordedReal = DoubleArray(length)
         val recordedImaginary = DoubleArray(length)
         val referenceReal = DoubleArray(length)
         val referenceImaginary = DoubleArray(length)
-        recorded.forEachIndexed { index, value -> recordedReal[index] = value.toDouble() }
+        warped.forEachIndexed { index, value -> recordedReal[index] = value.toDouble() }
         reference.forEachIndexed { index, value -> referenceReal[index] = value.toDouble() }
         CalibrationFft.transform(recordedReal, recordedImaginary)
         CalibrationFft.transform(referenceReal, referenceImaginary)
@@ -590,69 +700,143 @@ object EssDeconvolver {
             recordedImaginary[index] = imaginary
         }
         CalibrationFft.transform(recordedReal, recordedImaginary, inverse = true)
-        return FloatArray(min(recorded.size, recordedReal.size)) { index -> recordedReal[index].toFloat() }
+        return FloatArray(causalLength) { index -> recordedReal[index].toFloat() }
     }
 }
 
 object FrequencyResponse {
-    fun extract(recorded: FloatArray, reference: FloatArray, sampleRateHz: Int, points: Int = 48): List<ResponsePoint> {
-        require(recorded.size == reference.size && recorded.isNotEmpty())
-        require(points >= 2 && sampleRateHz > 0)
-        val length = nextPowerOfTwo(recorded.size)
-        val recordedReal = DoubleArray(length)
-        val recordedImaginary = DoubleArray(length)
-        val referenceReal = DoubleArray(length)
-        val referenceImaginary = DoubleArray(length)
-        recorded.forEachIndexed { index, value -> recordedReal[index] = value.toDouble() }
-        reference.forEachIndexed { index, value -> referenceReal[index] = value.toDouble() }
-        CalibrationFft.transform(recordedReal, recordedImaginary)
-        CalibrationFft.transform(referenceReal, referenceImaginary)
-        val maxReferencePower = referenceReal.indices.maxOf { index ->
-            referenceReal[index] * referenceReal[index] + referenceImaginary[index] * referenceImaginary[index]
+    fun extractWindowed(
+        impulse: FloatArray,
+        sampleRateHz: Int,
+        startHz: Float,
+        endHz: Float,
+        points: Int = 48,
+    ): List<ResponsePoint> {
+        if (impulse.isEmpty() || sampleRateHz <= 0 || points < 1) return emptyList()
+        val arrival = directArrival(impulse)
+        val peak = arrival.acceptedSample ?: return emptyList()
+        val fftLength = nextPowerOfTwo(max(impulse.size, max(256, points * 4)))
+        fun spectrum(gateMs: Float, taperMs: Float): Pair<DoubleArray, DoubleArray> {
+            val real = DoubleArray(fftLength)
+            val imaginary = DoubleArray(fftLength)
+            val preSamples = max(1, (sampleRateHz * 0.001f).roundToInt())
+            val gateSamples = max(preSamples + 1, (sampleRateHz * gateMs / 1000f).roundToInt())
+            val taperSamples = max(1, (sampleRateHz * taperMs / 1000f).roundToInt())
+            val end = min(impulse.size, peak + gateSamples + taperSamples)
+            for (index in max(0, peak - preSamples) until end) {
+                val relative = index - peak
+                val weight = when {
+                    relative < 0 -> (relative + preSamples).toFloat() / preSamples
+                    relative <= gateSamples -> 1f
+                    else -> 0.5f * (1f + cos(Math.PI * (relative - gateSamples) / taperSamples).toFloat())
+                }.coerceIn(0f, 1f)
+                real[index] = (impulse[index] * weight).toDouble()
+            }
+            CalibrationFft.transform(real, imaginary)
+            return real to imaginary
         }
-        val regularization = max(maxReferencePower * 1e-7, 1e-12)
-        val raw = (0 until points).map { index ->
-            val frequency = 20f * (20_000f / 20f).pow(index.toFloat() / (points - 1))
-            val bin = (frequency * length / sampleRateHz).roundToInt().coerceIn(1, length / 2)
-            val refPower = referenceReal[bin] * referenceReal[bin] + referenceImaginary[bin] * referenceImaginary[bin]
-            val numeratorReal = recordedReal[bin] * referenceReal[bin] + recordedImaginary[bin] * referenceImaginary[bin]
-            val numeratorImaginary = recordedImaginary[bin] * referenceReal[bin] - recordedReal[bin] * referenceImaginary[bin]
-            val magnitude = sqrt(numeratorReal * numeratorReal + numeratorImaginary * numeratorImaginary) /
-                max(regularization, refPower)
-            ResponsePoint(frequency, (20 * log10(max(magnitude, 1e-12))).toFloat())
+        val long = spectrum(250f, 40f)
+        val short = spectrum(80f, 40f)
+        val lowHz = max(10f, startHz)
+        val highHz = min(endHz, sampleRateHz / 2f - sampleRateHz.toFloat() / fftLength)
+        if (!(highHz > lowHz)) return emptyList()
+        val raw = (0 until points).map { pointIndex ->
+            val progress = if (points == 1) 0f else pointIndex.toFloat() / (points - 1)
+            val frequency = lowHz * (highHz / lowHz).pow(progress)
+            val centerBin = max(1, (frequency * fftLength / sampleRateHz).roundToInt())
+            val radius = max(2, (centerBin * 0.01f).roundToInt())
+            var totalDb = 0.0
+            var count = 0
+            for (bin in max(1, centerBin - radius)..min(fftLength / 2 - 1, centerBin + radius)) {
+                val longMagnitude = hypot(long.first[bin], long.second[bin])
+                val shortMagnitude = hypot(short.first[bin], short.second[bin])
+                val transition = when {
+                    frequency <= 200f -> 0f
+                    frequency >= 1_000f -> 1f
+                    else -> log10(frequency / 200f) / log10(1_000f / 200f)
+                }
+                val blend = transition * transition * (3f - 2f * transition)
+                val longDb = if (longMagnitude > 0.0) 20 * log10(longMagnitude) else -120.0
+                val shortDb = if (shortMagnitude > 0.0) 20 * log10(shortMagnitude) else -120.0
+                val magnitude = 10.0.pow((longDb * (1 - blend) + shortDb * blend) / 20)
+                if (magnitude > 0.0 && magnitude.isFinite()) {
+                    totalDb += 20 * log10(magnitude)
+                    count++
+                }
+            }
+            ResponsePoint(frequency, if (count == 0) -120f else (totalDb / count).toFloat())
         }
-        val normalization = raw.filter { it.frequencyHz in 500f..2_000f }.map(ResponsePoint::magnitudeDb).let { values ->
-            if (values.isEmpty()) 0f else values.sorted()[values.size / 2]
+        val reference = raw.filter { it.frequencyHz in 500f..2_000f }.map(ResponsePoint::magnitudeDb)
+            .ifEmpty { raw.map(ResponsePoint::magnitudeDb) }
+            .sorted()
+        val normalization = if (reference.size % 2 == 0) {
+            (reference[reference.size / 2 - 1] + reference[reference.size / 2]) / 2f
+        } else {
+            reference[reference.size / 2]
         }
         return raw.map { point -> point.copy(magnitudeDb = point.magnitudeDb - normalization) }
     }
 }
 
 private fun directArrival(impulse: FloatArray): DirectArrivalDiagnostics {
-    val searchEnd = min(impulse.size, max(1, (impulse.size * 0.08f).toInt()))
-    val noiseStart = max(0, impulse.size - max(1, impulse.size / 4))
+    if (impulse.isEmpty()) {
+        return DirectArrivalDiagnostics(null, 0f, 0f, null, 0f, 1e-7f, DirectArrivalFailure.NO_CANDIDATE, null, 1e-7f)
+    }
+    val noiseStart = if (impulse.size > 8) max(impulse.size * 3 / 4, impulse.size - max(1, impulse.size / 4)) else impulse.size
     val noiseRms = rms(impulse, noiseStart, impulse.size)
-    var peakSample = 0
+    val searchEnd = min(impulse.size, max(1, (impulse.size * 0.08f).roundToInt()))
     var peak = 0f
+    var directPeak = 0f
+    var directPeakIndex = -1
+    impulse.forEach { directValue -> peak = max(peak, abs(directValue)) }
     for (index in 0 until searchEnd) {
-        if (abs(impulse[index]) > peak) {
-            peak = abs(impulse[index])
-            peakSample = index
+        val value = abs(impulse[index])
+        if (value > directPeak) {
+            directPeak = value
+            directPeakIndex = index
         }
     }
-    val threshold = max(noiseRms * 8f, 1e-7f)
-    if (peak < noiseRms * 6f || peak < 1e-7f) {
-        return DirectArrivalDiagnostics(null, peak, noiseRms, ratioDb(peak, noiseRms), 0f, threshold, DirectArrivalFailure.PEAK_BELOW_NOISE)
+    val peakGate = max(noiseRms * 6f, 1e-7f)
+    if (directPeakIndex < 0) {
+        return DirectArrivalDiagnostics(null, peak, noiseRms, ratioDb(directPeak, noiseRms), 0f, peakGate, DirectArrivalFailure.NO_CANDIDATE, null, peakGate)
     }
-    val radius = max(1, (impulse.size * 0.0001f).toInt())
-    val start = max(0, peakSample - radius)
-    val end = min(impulse.size, peakSample + radius + 1)
-    val support = rms(impulse, start, end)
-    val supportThreshold = max(noiseRms * 1.5f, threshold * 0.05f)
-    if (support < supportThreshold) {
-        return DirectArrivalDiagnostics(null, peak, noiseRms, ratioDb(peak, noiseRms), support, supportThreshold, DirectArrivalFailure.CANDIDATE_NOT_SUSTAINED)
+    if (directPeak <= peakGate) {
+        val radius = max(1, (impulse.size * 0.0001f).roundToInt())
+        val support = rms(impulse, max(0, directPeakIndex - radius), min(searchEnd, directPeakIndex + radius + 1))
+        return DirectArrivalDiagnostics(null, peak, noiseRms, ratioDb(directPeak, noiseRms), support, peakGate, DirectArrivalFailure.PEAK_BELOW_NOISE, directPeakIndex, peakGate)
     }
-    return DirectArrivalDiagnostics(peakSample, peak, noiseRms, ratioDb(peak, noiseRms), support, supportThreshold, null)
+    val threshold = max(max(directPeak * 0.03f, noiseRms * 8f), 1e-7f)
+    val radius = max(1, (impulse.size * 0.0001f).roundToInt())
+    var rejected: DirectArrivalDiagnostics? = null
+    for (index in 0..directPeakIndex) {
+        val value = abs(impulse[index])
+        val left = if (index > 0) abs(impulse[index - 1]) else value
+        val right = if (index + 1 < searchEnd) abs(impulse[index + 1]) else value
+        if (value < left || value < right || value < threshold) continue
+        val start = max(0, index - radius)
+        val end = min(searchEnd, index + radius + 1)
+        val support = rmsExcluding(impulse, start, end, index)
+        val supportThreshold = max(noiseRms * 1.5f, threshold * 0.05f)
+        if (support >= supportThreshold || (index == 0 && directPeak >= threshold)) {
+            return DirectArrivalDiagnostics(index, peak, noiseRms, ratioDb(directPeak, noiseRms), support, supportThreshold, null, index, threshold)
+        }
+        if (rejected == null || value > rejected.peak) {
+            rejected = DirectArrivalDiagnostics(null, peak, noiseRms, ratioDb(directPeak, noiseRms), support, supportThreshold, DirectArrivalFailure.CANDIDATE_NOT_SUSTAINED, index, threshold)
+        }
+    }
+    return rejected ?: DirectArrivalDiagnostics(null, peak, noiseRms, ratioDb(directPeak, noiseRms), 0f, threshold, DirectArrivalFailure.CANDIDATE_NOT_SUSTAINED, directPeakIndex, threshold)
+}
+
+private fun rmsExcluding(values: FloatArray, start: Int, end: Int, excluded: Int): Float {
+    if (end <= start) return 0f
+    var sum = 0.0
+    var count = 0
+    for (index in start until end) {
+        if (index == excluded) continue
+        sum += values[index] * values[index]
+        count++
+    }
+    return if (count == 0) 0f else sqrt(sum / count).toFloat()
 }
 
 private fun rms(values: FloatArray, start: Int, end: Int): Float {
@@ -663,7 +847,7 @@ private fun rms(values: FloatArray, start: Int, end: Int): Float {
 }
 
 private fun ratioDb(numerator: Float, denominator: Float): Float? =
-    if (numerator > 0f && denominator > 0f) (20 * log10(numerator / denominator)).toFloat() else null
+    if (numerator > 0f && denominator > 0f) 20 * log10(numerator / denominator) else null
 
 private fun nextPowerOfTwo(value: Int): Int {
     require(value > 0)

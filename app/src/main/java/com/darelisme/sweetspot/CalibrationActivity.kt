@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.view.KeyEvent
 import android.view.View
 import android.view.Window
 import android.view.WindowInsets
@@ -11,6 +12,7 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.window.OnBackInvokedDispatcher
 import java.lang.ref.WeakReference
 import kotlin.math.roundToInt
 
@@ -97,6 +99,11 @@ class CalibrationActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(buildContent())
         requestFullscreen(window)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+            ) { cancelCalibrationFromBack() }
+        }
     }
 
     override fun onResume() {
@@ -118,8 +125,15 @@ class CalibrationActivity : Activity() {
         super.onDestroy()
     }
 
-    @Suppress("DEPRECATION")
-    override fun onBackPressed() {
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_BACK && Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            cancelCalibrationFromBack()
+            return true
+        }
+        return super.onKeyUp(keyCode, event)
+    }
+
+    private fun cancelCalibrationFromBack() {
         sendServiceAction(SweetSpotService.ACTION_CALIBRATION_CANCEL)
     }
 

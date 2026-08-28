@@ -21,7 +21,6 @@ object DeviceIdentity {
     @Volatile
     private var cached: String? = null
 
-
     @Volatile
     private var cachedLanApiToken: String? = null
 
@@ -54,11 +53,6 @@ object DeviceIdentity {
         prefs.getString(KEY_NAME, null)?.let { return it }
         val suffix = get(context).takeLast(4)
         return "SweetSpot TV ($suffix)"
-    }
-
-    fun setName(context: Context, name: String) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit().putString(KEY_NAME, name).apply()
     }
 
     private fun generate(): String {

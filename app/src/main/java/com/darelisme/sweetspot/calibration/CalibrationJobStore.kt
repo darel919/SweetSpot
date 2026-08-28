@@ -26,6 +26,7 @@ class CalibrationJobStore(
     private val expectedAnalyzerRevision: AnalyzerRevision? = null,
     private val expectedSweepRevision: SweepRevision? = null,
 ) {
+    @Synchronized
     fun save(job: CalibrationJob) {
         validateJob(job)
         if (expectedAnalyzerRevision != null && job.analyzerRevision != expectedAnalyzerRevision) {
@@ -41,6 +42,16 @@ class CalibrationJobStore(
             if (current != null && current.revision > job.revision) {
                 throw StaleCalibrationSnapshotException(
                     "Snapshot ${job.id.value} is at revision ${current.revision}, received ${job.revision}",
+                )
+            }
+            if (current != null && current.revision == job.revision && current != job) {
+                throw StaleCalibrationSnapshotException(
+                    "Snapshot ${job.id.value} has a conflicting revision ${job.revision}",
+                )
+            }
+            if (current?.usability is CalibrationUsability.Usable && job.usability is CalibrationUsability.NotYetUsable) {
+                throw StaleCalibrationSnapshotException(
+                    "A usable calibration cannot be replaced by a non-usable snapshot",
                 )
             }
         }
@@ -63,6 +74,7 @@ class CalibrationJobStore(
         }
     }
 
+    @Synchronized
     fun load(id: CalibrationJobId): CalibrationJob? {
         val file = snapshotFile(id)
         if (!file.exists()) return null
@@ -85,6 +97,7 @@ class CalibrationJobStore(
         }
     }
 
+    @Synchronized
     fun list(): List<CalibrationJob> {
         if (!directory.exists()) return emptyList()
         val files = directory.listFiles { file -> file.isFile && file.name.endsWith(SNAPSHOT_SUFFIX) }
@@ -99,6 +112,7 @@ class CalibrationJobStore(
         }.sortedBy { it.createdAtMs }
     }
 
+    @Synchronized
     fun delete(id: CalibrationJobId) {
         val target = snapshotFile(id)
         if (target.exists() && !target.delete()) {
@@ -110,6 +124,7 @@ class CalibrationJobStore(
         }
     }
 
+    @Synchronized
     fun cleanupTemporarySnapshots() {
         if (!directory.exists()) return
         directory.listFiles { file -> file.isFile && file.name.endsWith(TEMP_SUFFIX) }
@@ -132,12 +147,48 @@ class CalibrationJobStore(
             require(job.ledger.solutionSourcesAreAccepted(usable.best)) {
                 "Calibration solution references an incomplete position"
             }
+            require(PositionLedger.MANDATORY_POSITIONS.all(usable.best.sourcePositions::contains)) {
+                "Calibration solution does not contain the complete mandatory position set"
+            }
+            require(usable.best.confidence.grade == usable.grade) {
+                "Calibration usability grade does not match solution confidence"
+            }
+            require(job.confidence == usable.best.confidence) {
+                "Persisted calibration confidence does not match the best solution"
+            }
         }
         val candidate = job.candidate
         if (candidate != null) {
             require(usable != null && candidate.solutionId == usable.best.id) {
                 "Calibration candidate does not reference the best solution"
             }
+        }
+        when (val effect = job.pendingEffect) {
+            null -> Unit
+            is PendingCalibrationEffect.StageCandidate -> require(
+                usable?.best?.id == effect.solutionId && job.phase is CalibrationPhase.CandidatePending,
+            ) { "Stage effect does not reference the best solution" }
+            is PendingCalibrationEffect.AcceptCandidate -> require(
+                candidate?.id == effect.candidateId && job.phase is CalibrationPhase.Validating,
+            ) { "Accept effect does not reference the active candidate" }
+            is PendingCalibrationEffect.RollbackThenReoptimize -> require(
+                candidate?.id == effect.candidateId && job.phase is CalibrationPhase.Restoring,
+            ) { "Rollback effect does not reference the active candidate" }
+            is PendingCalibrationEffect.RestorePrevious -> require(
+                candidate?.id == effect.candidateId && job.phase is CalibrationPhase.Restoring,
+            ) { "Restore effect does not reference the active candidate" }
+        }
+        when (val action = job.nextAction) {
+            is CalibrationAction.Validate -> require(
+                job.phase is CalibrationPhase.Validating && candidate?.id == action.candidateId,
+            ) { "Validation action does not reference the active candidate" }
+            is CalibrationAction.Complete -> require(
+                job.phase is CalibrationPhase.Complete && usable?.best?.id == action.solutionId,
+            ) { "Completion action does not reference the best solution" }
+            else -> Unit
+        }
+        require(job.validationHistory.all { it.attemptIndex >= 0 }) {
+            "Validation attempt index must not be negative"
         }
     }
 
@@ -175,7 +226,7 @@ class CalibrationJobStore(
 
 private object CalibrationSnapshotCodec {
     private const val MAGIC = 0x5353434A
-    private const val SCHEMA_VERSION = 1
+    private const val SCHEMA_VERSION = 2
     private const val MAX_STRING_BYTES = 1 shl 20
     private const val MAX_ATTEMPTS = 4_096
     private const val MAX_VALIDATION_RECORDS = 256
@@ -215,7 +266,7 @@ private object CalibrationSnapshotCodec {
         writeNullable(output, job.confidence, ::writeConfidence)
         writeNullable(output, job.nextAction, ::writeAction)
         writeNullable(output, job.candidate, ::writeCandidate)
-        writeList(output, job.validationHistory, ::writeValidationRecord)
+        writeList(output, job.validationHistory, MAX_VALIDATION_RECORDS, ::writeValidationRecord)
         writeNullable(output, job.pendingEffect, ::writePendingEffect)
         writeNullable(output, job.lastError, ::writeError)
     }
@@ -288,7 +339,7 @@ private object CalibrationSnapshotCodec {
     }
 
     private fun writeLedger(output: DataOutputStream, ledger: PositionLedger) {
-        writeList(output, ledger.attempts, ::writeAttempt)
+        writeList(output, ledger.attempts, MAX_ATTEMPTS, ::writeAttempt)
     }
 
     private fun readLedger(input: DataInputStream): PositionLedger =
@@ -320,12 +371,16 @@ private object CalibrationSnapshotCodec {
         output.writeFloat(evidence.quality.snrDb)
         output.writeFloat(evidence.quality.markerConfidence)
         output.writeFloat(evidence.quality.directArrivalConfidence)
+        writeString(output, evidence.microphoneProfileId)
+        writeString(output, evidence.microphoneProfileRevision)
     }
 
     private fun readEvidence(input: DataInputStream): AcceptedChannelEvidence = AcceptedChannelEvidence(
         request = readRequest(input),
         responseDb = readCurve(input),
         quality = CaptureQuality(input.readFloat(), input.readFloat(), input.readFloat()),
+        microphoneProfileId = readString(input),
+        microphoneProfileRevision = readString(input),
     )
 
     private fun writeRequest(output: DataOutputStream, request: CaptureRequest) {
@@ -367,7 +422,12 @@ private object CalibrationSnapshotCodec {
 
     private fun writeSolution(output: DataOutputStream, solution: CalibrationSolution) {
         writeString(output, solution.id.value)
-        writeList(output, solution.sourcePositions.sortedBy { it.ordinal }, ::writeEnum)
+        writeList(
+            output,
+            solution.sourcePositions.sortedBy { it.ordinal },
+            CalibrationPosition.entries.size,
+            ::writeEnum,
+        )
         writeCurve(output, solution.correctionDb)
         writeConfidence(output, solution.confidence)
         output.writeFloat(solution.score)
@@ -488,6 +548,10 @@ private object CalibrationSnapshotCodec {
                 output.writeByte(0)
                 writeString(output, effect.solutionId.value)
             }
+            is PendingCalibrationEffect.AcceptCandidate -> {
+                output.writeByte(3)
+                writeString(output, effect.candidateId.value)
+            }
             is PendingCalibrationEffect.RollbackThenReoptimize -> {
                 output.writeByte(1)
                 writeString(output, effect.candidateId.value)
@@ -508,6 +572,7 @@ private object CalibrationSnapshotCodec {
             nextMode = if (input.readBoolean()) readEnum(input) else null,
         )
         2 -> PendingCalibrationEffect.RestorePrevious(CandidateId(readString(input)))
+        3 -> PendingCalibrationEffect.AcceptCandidate(CandidateId(readString(input)))
         else -> throw IOException("Unknown pending calibration effect")
     }
 
@@ -534,7 +599,13 @@ private object CalibrationSnapshotCodec {
     private fun <T> readNullable(input: DataInputStream, reader: (DataInputStream) -> T): T? =
         if (input.readBoolean()) reader(input) else null
 
-    private fun <T> writeList(output: DataOutputStream, values: List<T>, writer: (DataOutputStream, T) -> Unit) {
+    private fun <T> writeList(
+        output: DataOutputStream,
+        values: List<T>,
+        maxSize: Int,
+        writer: (DataOutputStream, T) -> Unit,
+    ) {
+        require(values.size <= maxSize) { "Snapshot list is too large" }
         output.writeInt(values.size)
         values.forEach { writer(output, it) }
     }

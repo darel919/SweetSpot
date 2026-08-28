@@ -2,6 +2,7 @@ package com.darelisme.sweetspot.calibration
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 
 data class CalibrationCaptureFrame(
@@ -52,6 +53,15 @@ object CalibrationCaptureWire {
         input.get(metadataBytes)
         val pcm = ByteArray(pcmLength)
         input.get(pcm)
-        return CalibrationCaptureFrame(String(metadataBytes, StandardCharsets.UTF_8), pcm)
+        val metadata = try {
+            StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(metadataBytes))
+                .toString()
+        } catch (error: java.nio.charset.CharacterCodingException) {
+            throw IllegalArgumentException("Calibration metadata is not valid UTF-8", error)
+        }
+        return CalibrationCaptureFrame(metadata, pcm)
     }
 }

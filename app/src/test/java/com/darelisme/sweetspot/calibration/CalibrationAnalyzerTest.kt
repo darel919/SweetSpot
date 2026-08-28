@@ -85,11 +85,39 @@ class CalibrationAnalyzerTest {
     fun analyzerReportsClippingBeforeAcousticAcceptance() {
         val sweep = shortSweep()
         val capture = monoCapture(sweep).samples.copyOf()
-        capture[capture.lastIndex] = 1f
+        capture[sweep.parts().sweepStartFrame] = 1f
 
         val result = analyzer.analyze(CalibrationCapture(sweep.sampleRate, capture), sweep)
 
         assertEquals(AnalysisStatus.CAPTURE_CLIPPED, result.status)
+    }
+
+    @Test
+    fun clippingOutsideTheSynchronizedWindowDoesNotRejectTheSweep() {
+        val sweep = shortSweep()
+        val capture = monoCapture(sweep).samples.copyOf()
+        capture[capture.lastIndex] = 1f
+
+        val result = analyzer.analyze(CalibrationCapture(sweep.sampleRate, capture), sweep)
+
+        assertTrue(result.status != AnalysisStatus.CAPTURE_CLIPPED)
+    }
+
+    @Test
+    fun generatedCompositeCaptureProducesTwoResponsesAtTheTvRate() {
+        val sweep = MeasurementSweep(48_000)
+        val pcm = MeasurementSweepGenerator.generateStereoPcm(sweep, "both")
+        val samples = FloatArray(sweep.totalFrames) { frame ->
+            (pcm[frame * 2].toFloat() + pcm[frame * 2 + 1].toFloat()) / Short.MAX_VALUE
+        }
+
+        val result = analyzer.analyze(CalibrationCapture(sweep.sampleRate, samples), sweep)
+
+        assertEquals(AnalysisStatus.OK, result.status)
+        assertEquals(48, result.leftResponse.size)
+        assertEquals(48, result.rightResponse.size)
+        assertNotNull(result.leftDirectArrival?.acceptedSample)
+        assertNotNull(result.rightDirectArrival?.acceptedSample)
     }
 
     @Test

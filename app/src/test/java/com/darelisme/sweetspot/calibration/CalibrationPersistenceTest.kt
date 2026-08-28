@@ -10,6 +10,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class CalibrationPersistenceTest {
@@ -56,6 +57,31 @@ class CalibrationPersistenceTest {
         } finally {
             directory.deleteRecursively()
         }
+    }
+
+    @Test
+    fun validationCaptureRetriesOnceThenRestoresWithoutAnotherRoomWalk() {
+        val usable = CalibrationTestFixtures.usableJob(machine)
+        val best = requireNotNull(usable.bestSolution)
+        val candidate = CalibrationCandidateState(CandidateId("candidate-validation"), best.id, CorrectionMode.NORMAL, 0)
+        val validating = machine.reduce(usable, CalibrationEvent.CandidateStaged(candidate)).job
+
+        val retry = machine.reduce(
+            validating,
+            CalibrationEvent.ValidationClassified(ValidationOutcome.INCONCLUSIVE_CAPTURE),
+        ).job
+        assertEquals(CalibrationPhase.Validating, retry.phase)
+        assertEquals(1, (retry.nextAction as CalibrationAction.Validate).attemptIndex)
+        assertTrue(retry.minimumViableCalibration)
+
+        val exhausted = machine.reduce(
+            retry,
+            CalibrationEvent.ValidationClassified(ValidationOutcome.INCONCLUSIVE_CAPTURE),
+        ).job
+        assertEquals(CalibrationPhase.Restoring, exhausted.phase)
+        assertTrue(exhausted.pendingEffect is PendingCalibrationEffect.RestorePrevious)
+        assertTrue(exhausted.minimumViableCalibration)
+        assertEquals(2, exhausted.validationHistory.size)
     }
 
     @Test
@@ -229,6 +255,23 @@ class CalibrationPersistenceTest {
     }
 
     @Test
+    fun captureReadbackRejectsTamperedPcm() {
+        val root = temporaryDirectory()
+        try {
+            val fixture = captureFixture()
+            val store = CalibrationCaptureStore(root)
+            val stored = (store.store(fixture.metadata, ByteArrayInputStream(fixture.bytes)) as CaptureStoreResult.Stored).capture
+            stored.pcmFile.writeBytes(fixture.bytes.copyOf().also { it[0] = (it[0].toInt() xor 1).toByte() })
+
+            assertThrows(CaptureStoreException::class.java) {
+                store.get(fixture.metadata.jobId, fixture.metadata.captureId)
+            }
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun captureRejectsHashMismatchNonFiniteSamplesAndOversizePayload() {
         val root = temporaryDirectory()
         try {
@@ -313,6 +356,17 @@ class CalibrationPersistenceTest {
                 userAgent = "test-browser",
                 microphoneProfileId = "iphone-17-pro",
                 microphoneProfileRevision = "2026-01",
+                microphoneProfile = CalibrationMicrophoneProfilePayload(
+                    id = "iphone-17-pro",
+                    revision = "2026-01",
+                    frequenciesHz = floatArrayOf(20f, 20_000f),
+                    responseDb = floatArrayOf(0f, 0f),
+                    normalizeAtHz = 1_000f,
+                    trustMinHz = 30f,
+                    trustFullMaxHz = 8_000f,
+                    trustTaperToHz = 12_000f,
+                    capturePathStatus = CalibrationMicrophoneProfilePayload.VALIDATED,
+                ),
                 capturedAtMs = 1L,
                 contentSha256 = sha256(bytes),
             ),

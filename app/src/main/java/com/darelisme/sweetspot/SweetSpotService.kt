@@ -15,6 +15,22 @@ import android.system.Os
 import android.system.OsConstants
 import android.util.Log
 import android.widget.Toast
+import com.darelisme.sweetspot.calibration.AndroidResponseV1Analyzer
+import com.darelisme.sweetspot.calibration.CalibrationCaptureStore
+import com.darelisme.sweetspot.calibration.CalibrationCaptureWire
+import com.darelisme.sweetspot.calibration.CalibrationEngine
+import com.darelisme.sweetspot.calibration.CalibrationEngineListener
+import com.darelisme.sweetspot.calibration.CalibrationEngineResult
+import com.darelisme.sweetspot.calibration.CalibrationJob
+import com.darelisme.sweetspot.calibration.CalibrationJobId
+import com.darelisme.sweetspot.calibration.CalibrationJobJson
+import com.darelisme.sweetspot.calibration.CalibrationPhase
+import com.darelisme.sweetspot.calibration.CaptureAttempt
+import com.darelisme.sweetspot.calibration.CalibrationPosition
+import com.darelisme.sweetspot.calibration.CaptureId
+import com.darelisme.sweetspot.calibration.CaptureChannel
+import com.darelisme.sweetspot.calibration.TvCalibrationDsp
+import com.darelisme.sweetspot.calibration.TvCalibrationPlayback
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -58,8 +74,8 @@ internal fun parseStrictProbeArray(value: JSONArray?, expectedBands: Int): Float
 /**
  * Long-lived owner of the audio DSP objects and the control web server.
  *
- * This service is the single owner of the [AudioEngine] (which wraps the global
- * [android.media.audiofx.Equalizer] on session 0) and the embedded [WebServer].
+ * This service is the single owner of the [AudioEngine] (which applies global
+ * DSP through [DynamicsProcessingEq]) and the embedded [WebServer].
  * It survives [MainActivity] leaving the foreground and keeps the effect and the
  * server alive for the lifetime of the service.
  *
@@ -99,6 +115,8 @@ class SweetSpotService : Service(), ServiceActions {
     private var overlay: OverlayController? = null
     private var relay: MailboxClient? = null
     private var measurementController: MeasurementController? = null
+    private var calibrationEngine: CalibrationEngine? = null
+    private var calibrationPlayback: TvCalibrationPlayback? = null
     private var runtimeStarted = false
     private val runtimeLock = Any()
     private val stateRevision = AtomicLong(0)
@@ -162,9 +180,56 @@ class SweetSpotService : Service(), ServiceActions {
         var createdWebServer: WebServer? = null
         var createdRelay: MailboxClient? = null
         var createdMeasurementController: MeasurementController? = null
+        var createdCalibrationPlayback: TvCalibrationPlayback? = null
+        var createdCalibrationEngine: CalibrationEngine? = null
         try {
             createdEngine = DynamicsProcessingEq(profileStore).also { it.initialize() }
-            createdOverlay = OverlayController(this).also {
+            val calibrationSweep = MeasurementSweep(sampleRate = 48_000)
+            val calibrationAnalyzer = AndroidResponseV1Analyzer()
+            val calibrationJobStore = com.darelisme.sweetspot.calibration.CalibrationJobStore(
+                File(filesDir, "calibration/jobs"),
+                expectedAnalyzerRevision = calibrationAnalyzer.revision,
+                expectedSweepRevision = com.darelisme.sweetspot.calibration.SweepRevision(calibrationSweep.sweepRevision),
+            )
+            val calibrationCaptureStore = CalibrationCaptureStore(File(filesDir, "calibration/captures"))
+            createdCalibrationPlayback = TvCalibrationPlayback(
+                this,
+                createdEngine,
+                audioOperationGate,
+                calibrationSweep,
+            )
+            val newCalibrationEngine = CalibrationEngine(
+                jobStore = calibrationJobStore,
+                captureStore = calibrationCaptureStore,
+                analyzer = calibrationAnalyzer,
+                sweep = calibrationSweep,
+                playback = createdCalibrationPlayback,
+                dsp = TvCalibrationDsp(createdEngine),
+                listener = object : CalibrationEngineListener {
+                    override fun onJobChanged(job: CalibrationJob) {
+                        relay?.publish("calibration.job.state", CalibrationJobJson.view(job))
+                    }
+
+                    override fun onCaptureFinished(jobId: CalibrationJobId, captureId: CaptureId) {
+                        relay?.publish(
+                            "calibration.capture.finished",
+                            JSONObject().put("jobId", jobId.value).put("captureId", captureId.value),
+                        )
+                    }
+                },
+            )
+            createdCalibrationEngine = newCalibrationEngine
+            when (val recovery = newCalibrationEngine.resumeJob()) {
+                is CalibrationEngineResult.Rejected -> if (recovery.code != "no_job") {
+                    Log.w(TAG, "Calibration job recovery deferred: ${recovery.message}")
+                }
+                is CalibrationEngineResult.Updated -> Unit
+            }
+            createdOverlay = OverlayController(
+                context = this,
+                stateProvider = ::overlayState,
+                actions = overlayActions(),
+            ).also {
                 it.updatePairInfo(pairCodes.current())
             }
             createdWebServer = WebServer(
@@ -226,6 +291,8 @@ class SweetSpotService : Service(), ServiceActions {
             )
 
             engine = createdEngine
+            calibrationPlayback = createdCalibrationPlayback
+            this@SweetSpotService.calibrationEngine = createdCalibrationEngine
             overlay = createdOverlay
             webServer = createdWebServer
             relay = createdRelay
@@ -248,6 +315,8 @@ class SweetSpotService : Service(), ServiceActions {
             engine = null
             runtimeStarted = false
             try { createdMeasurementController?.shutdown() } catch (_: Throwable) {}
+            try { createdCalibrationEngine?.close() } catch (_: Throwable) {}
+            try { createdCalibrationPlayback?.close() } catch (_: Throwable) {}
             try { createdRelay?.stop() } catch (_: Throwable) {}
             try { createdWebServer?.stop() } catch (_: Throwable) {}
             try { createdOverlay?.hide() } catch (_: Throwable) {}
@@ -307,7 +376,8 @@ class SweetSpotService : Service(), ServiceActions {
         val decision = SweetSpotStartupPolicy.decide(
             enabled = profileStore.isEnabled(),
             reason = startReason(intent),
-            requestedShowOverlay = intent?.getBooleanExtra(EXTRA_SHOW_UI, false) ?: false
+            requestedShowOverlay = intent?.getBooleanExtra(EXTRA_SHOW_UI, false) ?: false,
+            startOnBoot = profileStore.isStartOnBootEnabled(),
         )
         if (!decision.shouldStart) {
             Log.i(TAG, "Skipping automatic start because SweetSpot is disabled")
@@ -347,11 +417,7 @@ class SweetSpotService : Service(), ServiceActions {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    /**
-     * Runs the temporary DynamicsProcessing band-capacity probe off the main
-     * thread. This is strictly diagnostic and never touches the production
-     * [EqualizerEngine] or any saved profiles. Results are captured for the web UI.
-     */
+    /** Runs the temporary DynamicsProcessing band-capacity probe off the main thread. */
     override fun runProbe() {
         Log.i(TAG, "DynamicsProcessing probe requested")
         if (!tryAcquireDiagnosticOperation()) {
@@ -382,6 +448,10 @@ class SweetSpotService : Service(), ServiceActions {
         mainHandler.removeCallbacks(clientDisconnectGrace)
         measurementController?.shutdown()
         measurementController = null
+        calibrationEngine?.close()
+        calibrationEngine = null
+        calibrationPlayback?.close()
+        calibrationPlayback = null
         releasePersistentProbeBlocking()
         stopForeground(STOP_FOREGROUND_REMOVE)
         relay?.stop()
@@ -520,6 +590,62 @@ class SweetSpotService : Service(), ServiceActions {
                 "profile.list",
                 "calibration.get" -> {
                     replyTo("state.snapshot", stateSnapshotJson())
+                    return
+                }
+                "calibration.job.start" -> {
+                    replyCalibrationJobResult(calibrationEngine?.startNewJob(), replyTo)
+                    return
+                }
+                "calibration.job.get" -> {
+                    val requestedId = payload.optString("jobId").takeIf { it.isNotBlank() }
+                    val current = calibrationEngine?.currentJob()
+                    if (requestedId == null || current?.id?.value == requestedId) {
+                        replyCalibrationJobResult(calibrationEngine?.resumeJob(), replyTo)
+                    } else {
+                        replyTo("state.snapshot", stateSnapshotJson().put("ok", false).put("error", "No matching calibration job"))
+                    }
+                    return
+                }
+                "calibration.job.finish" -> {
+                    val jobId = payload.optString("jobId").takeIf { it.isNotBlank() }?.let(::CalibrationJobId)
+                    replyCalibrationJobResult(
+                        jobId?.let { calibrationEngine?.finishWithBest(it) }
+                            ?: CalibrationEngineResult.Rejected(null, "invalid_job", "A calibration job ID is required"),
+                        replyTo,
+                    )
+                    return
+                }
+                "calibration.job.cancel" -> {
+                    val jobId = payload.optString("jobId").takeIf { it.isNotBlank() }?.let(::CalibrationJobId)
+                    val result = when (payload.optString("scope")) {
+                        "capture" -> {
+                            val captureId = payload.optString("captureId").takeIf { it.isNotBlank() }?.let(::CaptureId)
+                            if (jobId != null && captureId != null) calibrationEngine?.cancelCapture(jobId, captureId) else null
+                        }
+                        "optional_refinement" -> jobId?.let { calibrationEngine?.cancelOptionalRefinement(it) }
+                        else -> null
+                    }
+                    replyCalibrationJobResult(result ?: CalibrationEngineResult.Rejected(null, "invalid_cancel", "Invalid calibration cancel scope"), replyTo)
+                    return
+                }
+                "calibration.job.discard" -> {
+                    val jobId = payload.optString("jobId").takeIf { it.isNotBlank() }?.let(::CalibrationJobId)
+                    replyCalibrationJobResult(
+                        jobId?.let { calibrationEngine?.discardJob(it) }
+                            ?: CalibrationEngineResult.Rejected(null, "invalid_job", "A calibration job ID is required"),
+                        replyTo,
+                    )
+                    return
+                }
+                "calibration.capture.ready",
+                "calibration.validation.capture.ready" -> {
+                    val jobId = payload.optString("jobId").takeIf { it.isNotBlank() }?.let(::CalibrationJobId)
+                    val captureId = payload.optString("captureId").takeIf { it.isNotBlank() }?.let(::CaptureId)
+                    replyCalibrationJobResult(
+                        if (jobId != null && captureId != null) calibrationEngine?.captureReady(jobId, captureId)
+                        else CalibrationEngineResult.Rejected(null, "invalid_capture", "A calibration job and capture ID are required"),
+                        replyTo,
+                    )
                     return
                 }
                 "engine.enable" -> {
@@ -904,6 +1030,12 @@ class SweetSpotService : Service(), ServiceActions {
             replyTo("state.snapshot", stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
         }
 
+        override fun onBinary(payload: ByteArray) {
+            val result = calibrationEngine?.submitCaptureFrame(payload)
+            if (result == null) return
+            publishCalibrationCaptureResult(result, payload)
+        }
+
 
         private fun postProbeStatus(replyTo: (String, JSONObject) -> Unit) {
             val results = lastProbeResults.orEmpty()
@@ -953,6 +1085,65 @@ class SweetSpotService : Service(), ServiceActions {
                 put("persistent", persistent)
             })
         }
+    }
+
+    private fun replyCalibrationJobResult(
+        result: CalibrationEngineResult?,
+        replyTo: (String, JSONObject) -> Unit,
+    ) {
+        when (result) {
+            is CalibrationEngineResult.Updated -> replyTo("calibration.job.state", CalibrationJobJson.view(result.job))
+            is CalibrationEngineResult.Rejected -> {
+                val job = result.job
+                if (job != null) {
+                    replyTo("calibration.job.state", CalibrationJobJson.view(job))
+                } else {
+                    replyTo("state.snapshot", stateSnapshotJson().put("ok", false).put("error", result.message))
+                }
+            }
+            null -> replyTo("state.snapshot", stateSnapshotJson().put("ok", false).put("error", "Calibration engine is unavailable"))
+        }
+    }
+
+    private fun publishCalibrationCaptureResult(result: CalibrationEngineResult, frame: ByteArray) {
+        val decoded = try { CalibrationCaptureWire.decode(frame) } catch (_: Throwable) { return }
+        val metadata = try { JSONObject(decoded.metadataJson) } catch (_: Throwable) { return }
+        val job = result.job
+        val lastValidationOutcome = job?.validationHistory?.lastOrNull()?.outcome
+        val accepted = when (result) {
+            is CalibrationEngineResult.Rejected -> false
+            is CalibrationEngineResult.Updated -> {
+                val captureId = metadata.optString("captureId")
+                val channel = metadata.optString("channel")
+                if (channel == "both") {
+                    lastValidationOutcome != null &&
+                        lastValidationOutcome != com.darelisme.sweetspot.calibration.ValidationOutcome.INCONCLUSIVE_CAPTURE
+                } else {
+                    job?.ledger?.attempts?.any {
+                        it.request.captureId.value == captureId && it is CaptureAttempt.Accepted
+                    } == true
+                }
+            }
+        }
+        relay?.publish(
+            "calibration.capture.uploaded",
+            JSONObject().apply {
+                put("jobId", metadata.optString("jobId"))
+                put("captureId", metadata.optString("captureId"))
+                put("contentSha256", metadata.optString("contentSha256"))
+                put("sampleCount", metadata.optLong("sampleCount"))
+                put("byteCount", decoded.pcm.size)
+                put("status", if (accepted) "accepted" else "rejected")
+                if (!accepted) {
+                    val reason = when (result) {
+                        is CalibrationEngineResult.Rejected -> result.message
+                        is CalibrationEngineResult.Updated -> job?.lastError?.message
+                    }
+                    reason?.takeIf { it.isNotBlank() }?.let { put("reason", it) }
+                }
+            },
+        )
+        job?.let { relay?.publish("calibration.job.state", CalibrationJobJson.view(it)) }
     }
 
     /** Mirrors WebServer.deviceInfoJson; runs on the mailbox worker thread (~400ms sample window). */
@@ -1117,6 +1308,78 @@ class SweetSpotService : Service(), ServiceActions {
     }
 
     private fun dpEq() = engine as? DynamicsProcessingEq
+
+    private fun overlayState(): OverlayState {
+        val currentEngine = engine
+        val capabilities = currentEngine?.getCapabilities()
+        val presetOptions = buildList {
+            capabilities?.presets?.entries?.sortedBy { it.key }?.forEach { entry ->
+                add(OverlayPresetOption(name = entry.value, presetId = entry.key))
+            }
+            currentEngine?.listProfiles()?.forEach { name ->
+                add(OverlayPresetOption(name = name, profileName = name))
+            }
+        }
+        val job = calibrationEngine?.currentJob()
+        val calibrationMessage = when (job?.phase) {
+            CalibrationPhase.CenterPreflight -> "Center setup is being checked before you move the phone."
+            CalibrationPhase.MeasuringRequired -> "Follow the phone instructions for the center, left, and right positions."
+            CalibrationPhase.Usable,
+            CalibrationPhase.Refining -> "A usable correction exists. Optional positions can improve confidence."
+            CalibrationPhase.CandidatePending,
+            CalibrationPhase.Validating -> "Return the phone to center when the web dashboard asks for validation."
+            CalibrationPhase.Reoptimizing -> "The TV is trying a gentler correction from the saved room measurements."
+            CalibrationPhase.Restoring -> "The TV is restoring the last verified audio state."
+            CalibrationPhase.Complete -> "Calibration is complete and verified."
+            is CalibrationPhase.Failed -> job.phase.reason
+            CalibrationPhase.Cancelled -> "Calibration was cancelled."
+            null -> null
+        }
+        return OverlayState(
+            dspEnabled = currentEngine?.isEnabled() ?: profileStore.isEnabled(),
+            calibrationAvailable = dpEq()?.hasCalibrationProfile() == true,
+            calibrationEnabled = dpEq()?.isCalibrationActive() == true,
+            startOnBoot = profileStore.isStartOnBootEnabled(),
+            presets = presetOptions,
+            calibrationMessage = calibrationMessage,
+        )
+    }
+
+    private fun overlayActions(): OverlayActions = object : OverlayActions {
+        override fun setDspEnabled(enabled: Boolean) {
+            if (engine?.setEnabled(enabled) != true) showCalibrationErrorToast("The global DSP state could not be changed")
+            overlay?.refresh()
+        }
+
+        override fun setCalibrationEnabled(enabled: Boolean) {
+            if (dpEq()?.setCalibrationEnabled(enabled) != true) {
+                showCalibrationErrorToast("The room correction could not be changed")
+            }
+            overlay?.refresh()
+        }
+
+        override fun applyPreset(option: OverlayPresetOption) {
+            val applied = when {
+                option.presetId != null -> applyPresetWithFeedback(option.presetId)
+                option.profileName != null -> loadProfileWithFeedback(option.profileName)
+                else -> false
+            }
+            if (!applied) showCalibrationErrorToast("The selected EQ could not be applied")
+            overlay?.refresh()
+        }
+
+        override fun setStartOnBoot(enabled: Boolean) {
+            if (!profileStore.saveStartOnBootEnabled(enabled)) {
+                showCalibrationErrorToast("The start-on-boot setting could not be saved")
+            }
+            overlay?.refresh()
+        }
+
+        override fun startCalibration() {
+            // The paired web client owns microphone capture and starts the TV job.
+            overlay?.showPairing()
+        }
+    }
 
     private fun rollbackCalibrationCandidate(candidateId: String): Boolean {
         val eq = dpEq() ?: return false
@@ -1311,6 +1574,7 @@ class SweetSpotService : Service(), ServiceActions {
                     },
                 )
             })
+            put("calibrationJob", calibrationEngine?.currentJob()?.let(CalibrationJobJson::view) ?: JSONObject.NULL)
             put("profiles", JSONArray(engine.listProfiles().map { name ->
                 JSONObject().put("id", name).put("name", name)
             }))

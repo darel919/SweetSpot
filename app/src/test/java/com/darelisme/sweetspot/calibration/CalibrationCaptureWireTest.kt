@@ -39,4 +39,20 @@ class CalibrationCaptureWireTest {
             CalibrationCaptureWire.encode("{}", ByteArray(3))
         }
     }
+
+    @Test
+    fun rejectsMalformedUtf8Metadata() {
+        val frame = ByteBuffer.allocate(12 + 2 + 4)
+            .order(ByteOrder.BIG_ENDIAN)
+            .put(byteArrayOf('S'.code.toByte(), 'S'.code.toByte(), 'C'.code.toByte(), 'P'.code.toByte()))
+            .putInt(CalibrationCaptureWire.VERSION)
+            .putInt(2)
+            .put(byteArrayOf(0xc3.toByte(), 0x28))
+            .putInt(0)
+            .array()
+
+        assertThrows(IllegalArgumentException::class.java) {
+            CalibrationCaptureWire.decode(frame)
+        }
+    }
 }

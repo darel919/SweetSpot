@@ -14,7 +14,6 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 
-private const val LEGACY_CAPTURE_ATTEMPT_ID = "legacy-attempt"
 private val CAPTURE_ATTEMPT_ID_PATTERN = Regex("^[A-Za-z0-9_-]{1,128}$")
 
 sealed interface CalibrationEngineResult {
@@ -131,7 +130,7 @@ class CalibrationEngine(
     fun captureReady(
         jobId: CalibrationJobId,
         captureId: CaptureId,
-        captureAttemptId: String = LEGACY_CAPTURE_ATTEMPT_ID,
+        captureAttemptId: String,
     ): CalibrationEngineResult = runOnWorker {
         val current = requireJob(jobId) ?: return@runOnWorker rejected("no_job", "No matching calibration job")
         if (!validCaptureAttemptId(captureAttemptId)) {
@@ -351,7 +350,7 @@ class CalibrationEngine(
         metadataJson: String,
         pcm: InputStream,
         pcmBytes: Long,
-        captureAttemptId: String = LEGACY_CAPTURE_ATTEMPT_ID,
+        captureAttemptId: String,
     ): CalibrationEngineResult = runOnWorker {
         if (!validCaptureAttemptId(captureAttemptId)) {
             return@runOnWorker rejected("invalid_capture_attempt", "The capture attempt identity is invalid")

@@ -23,8 +23,9 @@ val calibrationEngine = CalibrationEngine(
 )
 
 calibrationEngine.startNewJob(CalibrationJobMode.AUTO)
-calibrationEngine.captureReady(jobId, captureId)
-calibrationEngine.submitCaptureStream(metadataJson, pcmInput, pcmBytes)
+val captureAttemptId = "capture-attempt-1"
+calibrationEngine.captureReady(jobId, captureId, captureAttemptId)
+calibrationEngine.submitCaptureStream(metadataJson, pcmInput, pcmBytes, captureAttemptId)
 calibrationEngine.currentJob()
 calibrationEngine.close()
 ```

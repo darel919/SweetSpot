@@ -9,8 +9,11 @@ import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.CheckBox
+import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -60,7 +63,7 @@ class OverlayController(
         const val CONNECTION_CONNECTED = "connected"
     }
 
-    private enum class Page { HOME, PAIRING, CALIBRATION }
+    private enum class Page { HOME, PAIRING, CALIBRATION, EQ_PROFILE }
 
     private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -205,6 +208,7 @@ class OverlayController(
             Page.HOME -> buildHome(container)
             Page.PAIRING -> buildPairing(container)
             Page.CALIBRATION -> buildCalibration(container)
+            Page.EQ_PROFILE -> buildEqProfileMenu(container)
         }
         return scroll
     }
@@ -214,23 +218,18 @@ class OverlayController(
         val code = pairCode.orEmpty()
         if (forcePairingQr || shouldShowPairingQr(code, connectionState)) buildPairingSection(container, compact = true)
 
-        addButton(container, "DSP: ${if (state.dspEnabled) "ON" else "OFF"}") {
-            actions.setDspEnabled(!state.dspEnabled)
-            refreshContent()
-        }
+        addCheckbox(container, "DSP", state.dspEnabled, actions::setDspEnabled)
         if (state.calibrationAvailable) {
-            addButton(container, "Calibration profile: ${if (state.calibrationEnabled) "ON" else "OFF"}") {
-                actions.setCalibrationEnabled(!state.calibrationEnabled)
-                refreshContent()
-            }
+            addCheckbox(container, "Calibration profile", state.calibrationEnabled, actions::setCalibrationEnabled)
         }
 
-        addText(container, "EQ presets", 17f, 0xFFB8B8BC.toInt(), Gravity.START, top = 16, bottom = 4)
-        state.presets.forEach { option ->
-            addButton(container, option.name) {
-                actions.applyPreset(option)
-                refreshContent()
-            }
+        addButton(container, "EQ profile") {
+            page = Page.EQ_PROFILE
+            refreshContent()
+        }
+        if (state.presets.isNotEmpty()) {
+            addText(container, "Quick EQ", 17f, 0xFFB8B8BC.toInt(), Gravity.START, top = 16, bottom = 4)
+            addQuickProfileSwitcher(container, state.presets)
         }
         addButton(container, "Calibration menu") { page = Page.CALIBRATION; refreshContent() }
         addButton(container, "Show QR link") { page = Page.PAIRING; forcePairingQr = true; refreshContent() }
@@ -260,10 +259,7 @@ class OverlayController(
             bottom = 12,
         )
         if (state.calibrationAvailable) {
-            addButton(container, "Calibration profile: ${if (state.calibrationEnabled) "ON" else "OFF"}") {
-                actions.setCalibrationEnabled(!state.calibrationEnabled)
-                refreshContent()
-            }
+            addCheckbox(container, "Calibration profile", state.calibrationEnabled, actions::setCalibrationEnabled)
         }
         addButton(container, "Start calibration") {
             actions.startCalibration()
@@ -273,6 +269,25 @@ class OverlayController(
         }
         addButton(container, "Show QR link") { page = Page.PAIRING; forcePairingQr = true; refreshContent() }
         addButton(container, "Back to controls") { page = Page.HOME; refreshContent() }
+    }
+
+    private fun buildEqProfileMenu(container: LinearLayout) {
+        val options = stateProvider().presets
+        addText(container, "EQ profile", 22f, 0xFFFFFFFF.toInt(), Gravity.CENTER, bottom = 8)
+        addText(container, "Choose a built-in or saved EQ profile.", 16f, 0xFFE8E8EA.toInt(), Gravity.CENTER, bottom = 12)
+        if (options.isEmpty()) {
+            addText(container, "No EQ profiles are available.", 16f, 0xFFB8B8BC.toInt(), Gravity.CENTER, bottom = 12)
+        } else {
+            options.forEach { option ->
+                addButton(container, option.name) {
+                    actions.applyPreset(option)
+                    page = Page.HOME
+                    refreshContent()
+                }
+            }
+        }
+        addButton(container, "Back to controls") { page = Page.HOME; refreshContent() }
+        addButton(container, "Hide to background") { hideInternal() }
     }
 
     private fun buildPairingSection(container: LinearLayout, compact: Boolean) {
@@ -317,6 +332,70 @@ class OverlayController(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT,
         ))
+    }
+
+    private fun addCheckbox(
+        parent: LinearLayout,
+        label: String,
+        checked: Boolean,
+        action: (Boolean) -> Unit,
+    ) {
+        val checkbox = CheckBox(context).apply {
+            text = label
+            textSize = 16f
+            isFocusable = true
+            isClickable = true
+            isChecked = checked
+            setOnCheckedChangeListener { _, next ->
+                action(next)
+                refreshContent()
+            }
+        }
+        parent.addView(checkbox, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { bottomMargin = dp(6) })
+        if (!focusAssigned) {
+            focusAssigned = true
+            checkbox.post { checkbox.requestFocus() }
+        }
+    }
+
+    private fun addQuickProfileSwitcher(parent: LinearLayout, options: List<OverlayPresetOption>) {
+        val scroll = HorizontalScrollView(context).apply {
+            isHorizontalScrollBarEnabled = false
+            descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+        }
+        val row = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+        options.forEach { option ->
+            val button = Button(context).apply {
+                text = option.name
+                textSize = 14f
+                isFocusable = true
+                isClickable = true
+                setOnClickListener {
+                    actions.applyPreset(option)
+                    refreshContent()
+                }
+                setOnFocusChangeListener { view, hasFocus ->
+                    if (hasFocus) {
+                        view.post { scroll.smoothScrollTo((view.left - dp(16)).coerceAtLeast(0), 0) }
+                    }
+                }
+            }
+            row.addView(button, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { marginEnd = dp(6) })
+        }
+        scroll.addView(row, ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
+        parent.addView(scroll, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { bottomMargin = dp(6) })
     }
 
     private fun addButton(parent: LinearLayout, label: String, action: () -> Unit) {

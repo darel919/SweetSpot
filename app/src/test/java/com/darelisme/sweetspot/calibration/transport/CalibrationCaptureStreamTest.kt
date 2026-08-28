@@ -27,6 +27,7 @@ class CalibrationCaptureStreamTest {
                 ?: error("missing $name")
             fun decode(name: String): ByteArray = Base64.getDecoder().decode(field(name))
             val metadata = String(decode("metadataJsonBase64"), StandardCharsets.UTF_8)
+            val captureAttemptId = field("captureAttemptId")
             val pcm = decode("pcmBase64")
             val chunks = Regex("\\\"chunksBase64\\\"\\s*:\\s*\\[\\s*\\\"([^\\\"]+)\\\"\\s*,\\s*\\\"([^\\\"]+)\\\"\\s*\\]")
                 .find(fixture)?.groupValues?.drop(1)?.map(Base64.getDecoder()::decode)
@@ -43,6 +44,7 @@ class CalibrationCaptureStreamTest {
                 metadataJson = metadata,
                 expectedSampleCount = 4,
                 expectedByteCount = 16,
+                captureAttemptId = captureAttemptId,
             )))
             assertNull(receiver.accept(CalibrationCaptureStreamFrame.Chunk(
                 sessionId = field("sessionId"),
@@ -50,6 +52,7 @@ class CalibrationCaptureStreamTest {
                 sequence = 0,
                 sampleCount = 2,
                 pcm = pcm.copyOfRange(0, 8),
+                captureAttemptId = captureAttemptId,
             )))
             assertNull(receiver.accept(CalibrationCaptureStreamFrame.Chunk(
                 sessionId = field("sessionId"),
@@ -57,6 +60,7 @@ class CalibrationCaptureStreamTest {
                 sequence = 1,
                 sampleCount = 2,
                 pcm = pcm.copyOfRange(8, 16),
+                captureAttemptId = captureAttemptId,
             )))
             val completed = receiver.accept(CalibrationCaptureStreamFrame.End(
                 sessionId = field("sessionId"),
@@ -66,6 +70,7 @@ class CalibrationCaptureStreamTest {
                 finalByteCount = 16,
                 finalSha256 = field("sha256"),
                 metadataJson = metadata,
+                captureAttemptId = captureAttemptId,
             )) ?: error("expected completed capture")
             assertArrayEquals(pcm, completed.pcmFile.readBytes())
             receiver.delete(completed)
@@ -78,8 +83,8 @@ class CalibrationCaptureStreamTest {
             val receiver = CalibrationCaptureStreamReceiver(root)
             val pcm = floats(0.25f, -0.5f)
             val hash = pcm.sha256()
-            val begin = CalibrationCaptureStreamFrame.Begin("session-1", "capture-1", "{\"jobId\":\"job-1\",\"captureId\":\"capture-1\"}", null, null)
-            val chunk = CalibrationCaptureStreamFrame.Chunk("session-1", "capture-1", 0, 2, pcm)
+            val begin = CalibrationCaptureStreamFrame.Begin("session-1", "capture-1", "{\"jobId\":\"job-1\",\"captureId\":\"capture-1\"}", null, null, "attempt-1")
+            val chunk = CalibrationCaptureStreamFrame.Chunk("session-1", "capture-1", 0, 2, pcm, "attempt-1")
             val end = CalibrationCaptureStreamFrame.End(
                 sessionId = "session-1",
                 captureId = "capture-1",
@@ -88,6 +93,7 @@ class CalibrationCaptureStreamTest {
                 finalByteCount = pcm.size.toLong(),
                 finalSha256 = hash,
                 metadataJson = "{\"jobId\":\"job-1\",\"captureId\":\"capture-1\"}",
+                captureAttemptId = "attempt-1",
             )
 
             assertNull(receiver.accept(begin))
@@ -204,6 +210,7 @@ class CalibrationCaptureStreamTest {
                 "{\"jobId\":\"job-1\",\"captureId\":\"capture-1\"}",
                 null,
                 null,
+                "attempt-1",
             ))
             receiver.accept(CalibrationCaptureStreamFrame.Chunk(
                 "session-1",
@@ -211,6 +218,7 @@ class CalibrationCaptureStreamTest {
                 0,
                 1,
                 floats(0.25f),
+                "attempt-1",
             ))
 
             assertThrows(java.io.IOException::class.java) {
@@ -220,6 +228,7 @@ class CalibrationCaptureStreamTest {
                     0,
                     1,
                     floats(-0.25f),
+                    "attempt-1",
                 ))
             }
             receiver.cancel()
@@ -237,6 +246,7 @@ class CalibrationCaptureStreamTest {
                 "{\"jobId\":\"job-1\",\"captureId\":\"capture-current\"}",
                 null,
                 null,
+                "attempt-current",
             ))
 
             assertFalse(receiver.cancel("session-old", "capture-current"))
@@ -246,6 +256,7 @@ class CalibrationCaptureStreamTest {
                 0,
                 1,
                 floats(0.25f),
+                "attempt-current",
             )))
             receiver.cancel()
         }
@@ -314,6 +325,7 @@ class CalibrationCaptureStreamTest {
                 "{\"jobId\":\"job-1\",\"captureId\":\"capture-1\"}",
                 null,
                 null,
+                "attempt-1",
             ))
 
             assertThrows(java.io.IOException::class.java) {
@@ -323,6 +335,7 @@ class CalibrationCaptureStreamTest {
                     0,
                     1,
                     floats(Float.NaN),
+                    "attempt-1",
                 ))
             }
             assertEquals(0, root.listFiles()?.size ?: 0)
@@ -333,14 +346,14 @@ class CalibrationCaptureStreamTest {
     fun receiverRejectsMissingChunksAndCleansAHashMismatch() {
         withTempDirectory { root ->
             val receiver = CalibrationCaptureStreamReceiver(root)
-            receiver.accept(CalibrationCaptureStreamFrame.Begin("session-1", "capture-1", "{\"jobId\":\"job-1\",\"captureId\":\"capture-1\"}", null, null))
+            receiver.accept(CalibrationCaptureStreamFrame.Begin("session-1", "capture-1", "{\"jobId\":\"job-1\",\"captureId\":\"capture-1\"}", null, null, "attempt-1"))
             val pcm = floats(0.25f)
             assertThrows(java.io.IOException::class.java) {
-                receiver.accept(CalibrationCaptureStreamFrame.Chunk("session-1", "capture-1", 1, 1, pcm))
+                receiver.accept(CalibrationCaptureStreamFrame.Chunk("session-1", "capture-1", 1, 1, pcm, "attempt-1"))
             }
             receiver.cancel()
-            receiver.accept(CalibrationCaptureStreamFrame.Begin("session-1", "capture-1", "{\"jobId\":\"job-1\",\"captureId\":\"capture-1\"}", null, null))
-            receiver.accept(CalibrationCaptureStreamFrame.Chunk("session-1", "capture-1", 0, 1, pcm))
+            receiver.accept(CalibrationCaptureStreamFrame.Begin("session-1", "capture-1", "{\"jobId\":\"job-1\",\"captureId\":\"capture-1\"}", null, null, "attempt-1"))
+            receiver.accept(CalibrationCaptureStreamFrame.Chunk("session-1", "capture-1", 0, 1, pcm, "attempt-1"))
             assertThrows(java.io.IOException::class.java) {
                 receiver.accept(
                     CalibrationCaptureStreamFrame.End(
@@ -351,6 +364,7 @@ class CalibrationCaptureStreamTest {
                         4,
                         "0".repeat(64),
                         "{\"jobId\":\"job-1\",\"captureId\":\"capture-1\"}",
+                        "attempt-1",
                     ),
                 )
             }

@@ -201,7 +201,7 @@ class CalibrationEngineTest {
             val job = (engine.startNewJob() as CalibrationEngineResult.Updated).job
             val action = job.nextAction as CalibrationAction.Capture
 
-            val result = engine.captureReady(job.id, action.request.captureId)
+            val result = engine.captureReady(job.id, action.request.captureId, "fixture-playback-failure")
             val updated = (result as CalibrationEngineResult.Updated).job
 
             assertEquals(1, updated.ledger.rejectedAttempts.size)

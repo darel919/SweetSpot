@@ -18,7 +18,7 @@ sealed interface CalibrationCaptureStreamFrame {
         val metadataJson: String,
         val expectedSampleCount: Long?,
         val expectedByteCount: Long?,
-        override val captureAttemptId: String = "legacy-attempt",
+        override val captureAttemptId: String,
     ) : CalibrationCaptureStreamFrame
 
     data class Chunk(
@@ -27,7 +27,7 @@ sealed interface CalibrationCaptureStreamFrame {
         val sequence: Long,
         val sampleCount: Long,
         val pcm: ByteArray,
-        override val captureAttemptId: String = "legacy-attempt",
+        override val captureAttemptId: String,
     ) : CalibrationCaptureStreamFrame
 
     data class End(
@@ -38,7 +38,7 @@ sealed interface CalibrationCaptureStreamFrame {
         val finalByteCount: Long,
         val finalSha256: String,
         val metadataJson: String,
-        override val captureAttemptId: String = "legacy-attempt",
+        override val captureAttemptId: String,
     ) : CalibrationCaptureStreamFrame
 }
 

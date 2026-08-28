@@ -1,0 +1,50 @@
+{
+  "validStarted": {
+    "v": 1,
+    "id": "tv-started-1",
+    "type": "calibration.capture.started",
+    "ts": 1700000000000,
+    "transportSessionId": "generation-1",
+    "payload": {
+      "jobId": "job-1",
+      "captureId": "capture-1",
+      "captureAttemptId": "capture-attempt-1"
+    }
+  },
+  "validWindow": {
+    "v": 1,
+    "id": "tv-window-1",
+    "type": "calibration.capture.window",
+    "ts": 1700000000001,
+    "transportSessionId": "generation-1",
+    "payload": {
+      "captureId": "capture-1",
+      "captureAttemptId": "capture-attempt-1",
+      "nextSequence": 8,
+      "windowSize": 8
+    }
+  },
+  "invalidWindow": {
+    "v": 1,
+    "id": "tv-window-invalid",
+    "type": "calibration.capture.window",
+    "ts": 1700000000002,
+    "transportSessionId": "generation-1",
+    "payload": {
+      "captureId": "capture-1",
+      "captureAttemptId": "capture-attempt-1",
+      "nextSequence": 8,
+      "windowSize": 0
+    }
+  },
+  "oversizedEnvelope": {
+    "v": 1,
+    "id": "oversized",
+    "type": "pong",
+    "ts": 1700000000003,
+    "transportSessionId": "generation-1",
+    "payload": {
+      "paddingBytes": 16384
+    }
+  }
+}

@@ -22,7 +22,7 @@ val calibrationEngine = CalibrationEngine(
     dsp = calibrationDsp,
 )
 
-calibrationEngine.startNewJob()
+calibrationEngine.startNewJob(CalibrationJobMode.AUTO)
 calibrationEngine.captureReady(jobId, captureId)
 calibrationEngine.submitCaptureStream(metadataJson, pcmInput, pcmBytes)
 calibrationEngine.currentJob()
@@ -33,7 +33,7 @@ The browser renders the TV action, records PCM, uploads it, and waits for the ne
 
 ```ts
 const calibration = useCalibrationRemoteMic(connection)
-calibration.startNewJob()
+calibration.startNewJob('auto')
 // The composable records only the action emitted by the TV.
 calibration.refreshJob()
 ```
@@ -71,6 +71,7 @@ sealed interface CalibrationUsability {
 
 data class CalibrationJob(
     val id: CalibrationJobId,
+    val mode: CalibrationJobMode,
     val revision: Long,
     val analyzerRevision: AnalyzerRevision,
     val sweepRevision: SweepRevision,
@@ -86,7 +87,7 @@ data class CalibrationJob(
 )
 ```
 
-`CalibrationUsability.Usable` replaces a mutable minimum-viable boolean. Normal transitions have no path back to `NotYetUsable`. An incompatible revision or corrupt accepted record enters a separate recovery failure state.
+`CalibrationUsability.Usable` replaces a mutable minimum-viable boolean. Normal transitions have no path back to `NotYetUsable`. Auto mode can stage once the mandatory minimum is sufficient; advanced mode continues the optional forward and backward positions before staging. An incompatible revision or corrupt accepted record enters a separate recovery failure state.
 
 `PositionLedger` stores historical attempts and complete accepted positions separately. Only a `CompletePosition` with accepted left and right evidence can enter aggregation. A repair can add the missing channel without replacing its accepted sibling.
 
@@ -160,7 +161,7 @@ The TV publishes a compact `CalibrationJobView` in the state snapshot. Curves an
 full debug details use a separate detail response if the compact view approaches
 the control-message limit.
 
-The browser can start, get, resume, cancel a capture, finish with the best solution, cancel optional refinement, or explicitly discard the job. It cannot submit marker decisions, convergence, a correction, validation classification, or candidate finalization.
+The browser can start an auto or advanced job, get, resume, cancel a capture, finish with the best solution, cancel optional refinement, or explicitly discard the job. It cannot submit marker decisions, convergence, a correction, validation classification, or candidate finalization.
 
 `useCalibrationRemoteMic()` owns microphone permission, recording, metadata, binary upload, cancellation requests, and rendering state. Browser reload reconstructs all calibration UI from the TV job.
 
@@ -169,20 +170,17 @@ The browser can start, get, resume, cancel a capture, finish with the best solut
 ```text
 com.darelisme.sweetspot.calibration/
   CalibrationEngine.kt
-  CalibrationModel.kt
-  CalibrationStateMachine.kt
-  CalibrationJobStore.kt
-  CalibrationJobJson.kt
-  CalibrationCaptureStore.kt
+  analysis/CalibrationAnalyzer.kt
+  capture/CalibrationCaptureStore.kt
+  model/CalibrationModel.kt
+  model/CalibrationStateMachine.kt
+  model/CalibrationJobJson.kt
+  persistence/CalibrationJobStore.kt
+  playback/CalibrationAudioPort.kt
+  playback/TvCalibrationPlayback.kt
   transport/CalibrationCaptureStreamReceiver.kt
   transport/CalibrationCaptureStreamWire.kt
-  CalibrationAnalyzer.kt
-  CalibrationMicrophoneProfilePayload.kt
-  PositionLedger.kt
-  SpatialCorrection.kt
-  CalibrationAudioPort.kt
-  TvCalibrationPlayback.kt
-  TvCalibrationDsp.kt
+  dsp/TvCalibrationDsp.kt
 ```
 
 Marker, FFT, drift, impulse, and response helpers remain internal behind

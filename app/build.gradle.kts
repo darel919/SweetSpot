@@ -54,4 +54,5 @@ dependencies {
     implementation(libs.zxing.core)
     implementation(libs.webrtc.android)
     testImplementation(libs.junit)
+    androidTestImplementation(libs.junit)
 }

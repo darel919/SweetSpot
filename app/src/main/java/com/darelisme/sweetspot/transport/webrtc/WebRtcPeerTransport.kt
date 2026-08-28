@@ -3,8 +3,6 @@ package com.darelisme.sweetspot.transport.webrtc
 import android.content.Context
 import android.util.Log
 import com.darelisme.sweetspot.pairing.PairingSessionManager
-import com.darelisme.sweetspot.calibration.transport.CalibrationCaptureStreamFrame
-import com.darelisme.sweetspot.calibration.transport.CalibrationCaptureStreamWire
 import com.darelisme.sweetspot.transport.PeerTransport
 import com.darelisme.sweetspot.transport.PeerTransportDiagnostics
 import com.darelisme.sweetspot.transport.PeerTransportState
@@ -38,24 +36,57 @@ class WebRtcPeerTransport(
     context: Context,
     private val pairingSessionProvider: () -> PairingSessionManager.Session,
     private val commandHandler: PeerTransport.CommandHandler,
-    private val onSessionConnected: (String) -> Unit,
+    private val onSessionConnected: (String) -> Boolean,
     private val onSessionDisconnected: (String) -> Unit,
 ) : PeerTransport {
     companion object {
         private const val TAG = "SweetSpotWebRtc"
         private const val CONTROL_CHANNEL = "control"
         private const val CAPTURE_CHANNEL = "capture"
-        private const val MAX_CONTROL_BYTES = 64 * 1024
+        private const val MAX_CONTROL_BYTES = 16 * 1024
+        private const val MAX_SIGNALING_TEXT_BYTES = 48 * 1024
         private const val MAX_CAPTURE_FRAME_BYTES = 32 * 1024
         private const val MAX_CAPTURE_QUEUE = 8
+        private const val MAX_CONTROL_QUEUE = 128
+        private const val MAX_CONTROL_BUFFERED_BYTES = 256 * 1024
+        private const val MAX_PENDING_CONTROL_BYTES = 256 * 1024
+        private const val MAX_PENDING_PRIORITY_CONTROL_BYTES = 64 * 1024
+        private const val MAX_PENDING_PRIORITY_CONTROL = 16
+        private const val CONTROL_FLUSH_DELAY_MS = 25L
+        private const val MAX_PENDING_CANDIDATES = 64
         private const val MAX_SEEN_MESSAGES = 512
         private const val RECONNECT_CLOSE_GRACE_MS = 30_000L
+        private val GENERATION_PATTERN = Regex("[A-Za-z0-9_-]{1,128}")
+        private val ATTEMPT_PATTERN = Regex("[A-Za-z0-9_-]{1,128}")
+        private val NON_RETRYABLE_SIGNALING_ERRORS = setOf(
+            "bad_message",
+            "bad_json",
+            "device_in_use",
+            "invalid_pairing",
+            "origin_rejected",
+            "pairing_expired",
+            "payload_too_large",
+            "peer_in_use",
+            "stale_session",
+            "protocol_mismatch",
+        )
     }
 
     private val appContext = context.applicationContext
     private val controlExecutor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "sweetspot-peer-control").apply { isDaemon = true }
     }
+    private val controlQueuePermits = java.util.concurrent.Semaphore(MAX_CONTROL_QUEUE, true)
+    private val priorityControlExecutor: ThreadPoolExecutor = ThreadPoolExecutor(
+        1,
+        1,
+        0L,
+        TimeUnit.MILLISECONDS,
+        ArrayBlockingQueue(16),
+        { runnable -> Thread(runnable, "sweetspot-peer-priority").apply { isDaemon = true } },
+        ThreadPoolExecutor.AbortPolicy(),
+    )
+    private val controlDispatchLock = Any()
     private val captureExecutor: ThreadPoolExecutor = ThreadPoolExecutor(
         1,
         1,
@@ -69,7 +100,8 @@ class WebRtcPeerTransport(
         role = "device",
         sessionProvider = pairingSessionProvider,
         listener = object : SignalingClient.Listener {
-            override fun onConnected() = postControl {
+            override fun onConnected(roundTripMs: Long?) = postControl {
+                signalingRoundTripMs = roundTripMs
                 if (currentState != PeerTransportState.DIRECT) setState(PeerTransportState.SIGNALING)
             }
 
@@ -88,7 +120,11 @@ class WebRtcPeerTransport(
 
     private val running = AtomicBoolean(false)
     private var currentState = PeerTransportState.IDLE
+    @Volatile
     private var currentGeneration: String? = null
+    private var authenticatedGeneration: String? = null
+    private var currentAttemptId: String? = null
+    @Volatile
     private var peer: PeerConnection? = null
     private var factory: PeerConnectionFactory? = null
     private var control: DataChannel? = null
@@ -103,14 +139,22 @@ class WebRtcPeerTransport(
     private var selectedCandidateType: String? = null
     private var selectedCandidateProtocol: String? = null
     private var rttMs: Double? = null
+    private var signalingRoundTripMs: Long? = null
     @Volatile
     private var lastControlMessageAt: Long? = null
     @Volatile
     private var lastPeerTrafficAt: Long? = null
     private var directPresenceSent = false
     private var reconnectCloseTask: ScheduledFuture<*>? = null
+    private var controlFlushTask: ScheduledFuture<*>? = null
     private val pendingCandidates = ArrayDeque<IceCandidate>()
     private val seenMessageIds = LinkedHashSet<String>()
+    private val pendingControl = BoundedControlQueue(
+        maxMessages = MAX_CONTROL_QUEUE,
+        maxBytes = MAX_PENDING_CONTROL_BYTES,
+        maxPriorityMessages = MAX_PENDING_PRIORITY_CONTROL,
+        maxPriorityBytes = MAX_PENDING_PRIORITY_CONTROL_BYTES,
+    )
 
     override fun start() {
         if (!running.compareAndSet(false, true)) return
@@ -142,7 +186,8 @@ class WebRtcPeerTransport(
             closePeer(notify = true)
             setState(PeerTransportState.CLOSED)
         }
-        controlExecutor.shutdown()
+        controlExecutor.shutdownNow()
+        priorityControlExecutor.shutdownNow()
         captureExecutor.shutdownNow()
         captureExecutor.awaitTermination(1, TimeUnit.SECONDS)
     }
@@ -150,7 +195,7 @@ class WebRtcPeerTransport(
     override fun reconnectForPairingRotation() {
         if (!running.get()) return
         postControl {
-            if (directPresenceSent) return@postControl
+            if (directPresenceSent || authenticatedGeneration != null) return@postControl
             closePeer(notify = false)
             currentGeneration = null
             signaling.resetGeneration()
@@ -166,50 +211,124 @@ class WebRtcPeerTransport(
         }
     }
 
-    private fun postControl(block: () -> Unit) {
-        if (!running.get() && currentState != PeerTransportState.CLOSED) return
+    private fun postControl(priority: Boolean = false, block: () -> Unit) {
+        if (!running.get()) return
+        if (priority) {
+            try {
+                priorityControlExecutor.execute {
+                    synchronized(controlDispatchLock) { block() }
+                }
+            } catch (_: RejectedExecutionException) {
+                try {
+                    controlExecutor.execute {
+                        synchronized(controlDispatchLock) { block() }
+                    }
+                } catch (_: RejectedExecutionException) {
+                    setError("The TV control queue is unavailable. Retry the connection.")
+                }
+            }
+            return
+        }
+        if (!controlQueuePermits.tryAcquire()) {
+            setError("The TV control queue is full. Retry the connection.")
+            return
+        }
         try {
-            controlExecutor.execute(block)
+            controlExecutor.execute {
+                try {
+                    synchronized(controlDispatchLock) { block() }
+                } finally {
+                    controlQueuePermits.release()
+                }
+            }
         } catch (_: RejectedExecutionException) {
-            // Shutdown is final. No work may be queued after service teardown.
+            controlQueuePermits.release()
         }
     }
 
     private fun handleSignal(message: JSONObject) {
+        if (!exactInt(message.opt("v"), 1)) {
+            signaling.suspend()
+            failPeer("The signaling service sent an unsupported message", retryable = false)
+            return
+        }
         when (message.optString("type")) {
-            "signal.ready" -> if (message.optBoolean("peerOnline", false)) {
-                setState(PeerTransportState.SIGNALING)
-            } else {
-                setState(PeerTransportState.PAIRING)
+            "signal.ready" -> {
+                val role = message.opt("role") as? String
+                val peerOnline = message.opt("peerOnline") as? Boolean
+                if (role != "device" || peerOnline == null) {
+                    rejectSignalingMessage("The signaling service sent an invalid ready message")
+                    return
+                }
+                if (peerOnline) setState(PeerTransportState.SIGNALING) else setState(PeerTransportState.PAIRING)
             }
-            "signal.peer" -> Unit
+            "signal.peer" -> {
+                val role = message.opt("role") as? String
+                val online = message.opt("online") as? Boolean
+                if (role != "client" || online == null) {
+                    rejectSignalingMessage("The signaling service sent an invalid peer message")
+                } else if (!online && authenticatedGeneration == null && currentGeneration != null) {
+                    closePeer(notify = false)
+                    currentGeneration = null
+                    signaling.resetGeneration()
+                    setState(PeerTransportState.PAIRING)
+                }
+            }
             "signal.offer" -> handleOffer(message)
             "signal.ice" -> handleCandidate(message)
             "signal.error" -> {
-                val code = message.optString("code", "signaling_error")
-                val detail = message.optString("message", "Signaling failed")
+                val code = message.opt("code") as? String ?: ""
+                val detail = message.opt("message") as? String ?: ""
+                if (code.isBlank() || detail.isBlank() || code.length > 128 || detail.length > 2_048
+                    || code.toByteArray(StandardCharsets.UTF_8).size > 128
+                    || detail.toByteArray(StandardCharsets.UTF_8).size > MAX_SIGNALING_TEXT_BYTES
+                ) {
+                    rejectSignalingMessage("The signaling service sent an invalid error")
+                    return
+                }
                 setError("$code: $detail")
-                if (currentState != PeerTransportState.DIRECT) setState(PeerTransportState.FAILED)
+                if (currentState != PeerTransportState.DIRECT) {
+                    val retryable = code !in NON_RETRYABLE_SIGNALING_ERRORS
+                    if (!retryable) signaling.suspend()
+                    if (retryable) failPeer(detail) else failPeer(detail, retryable = false)
+                }
             }
+            else -> rejectSignalingMessage("The signaling service sent an unsupported message")
         }
     }
 
+    private fun rejectSignalingMessage(message: String) {
+        signaling.suspend()
+        failPeer(message, retryable = false)
+    }
+
     private fun handleOffer(message: JSONObject) {
-        val generation = message.optString("generation")
+        val generation = message.opt("generation") as? String ?: ""
+        val attemptId = message.opt("attemptId") as? String ?: ""
         val description = message.optJSONObject("description")
-        val sdp = description?.optString("sdp").orEmpty()
-        if (generation.isBlank() || description?.optString("type") != "offer" || sdp.isBlank()) {
-            setError("The TV received an invalid direct connection offer")
+        val descriptionType = description?.opt("type") as? String
+        val sdp = description?.opt("sdp") as? String ?: ""
+        if (!GENERATION_PATTERN.matches(generation)
+            || !ATTEMPT_PATTERN.matches(attemptId)
+            || descriptionType != "offer"
+            || sdp.isBlank()
+            || sdp.toByteArray(StandardCharsets.UTF_8).size > MAX_SIGNALING_TEXT_BYTES
+        ) {
+            rejectSignalingMessage("The TV received an invalid direct connection offer")
             return
         }
-        if (directPresenceSent && currentGeneration != generation) {
+        if (authenticatedGeneration != null && authenticatedGeneration != generation) {
             setError("A dashboard is already connected to this TV")
             return
         }
-        if (currentGeneration != generation || hasClosedDataChannel()) {
-            closePeer(notify = directPresenceSent)
+        if (currentGeneration != generation || hasClosedDataChannel()
+            || (currentAttemptId != null && currentAttemptId != attemptId)
+        ) {
+            val preserveSession = authenticatedGeneration == generation
+            closePeer(notify = directPresenceSent && !preserveSession, releaseSession = !preserveSession)
             currentGeneration = generation
         }
+        currentAttemptId = attemptId
         signaling.setGeneration(generation)
         setState(PeerTransportState.CONNECTING)
         val connection = ensurePeer() ?: return
@@ -221,7 +340,7 @@ class WebRtcPeerTransport(
                 if (peer !== connection || currentGeneration != generation) return@postControl
                 remoteDescriptionSet = true
                 while (pendingCandidates.isNotEmpty()) connection.addIceCandidate(pendingCandidates.removeFirst())
-                createAnswer(connection, generation)
+                createAnswer(connection, generation, attemptId)
             }
 
             override fun onCreateFailure(error: String) = Unit
@@ -232,7 +351,7 @@ class WebRtcPeerTransport(
         }, offer)
     }
 
-    private fun createAnswer(connection: PeerConnection, generation: String) {
+    private fun createAnswer(connection: PeerConnection, generation: String, attemptId: String) {
         connection.createAnswer(object : SdpObserver {
             override fun onCreateSuccess(description: SessionDescription) {
                 if (description.type != SessionDescription.Type.ANSWER) return
@@ -241,12 +360,14 @@ class WebRtcPeerTransport(
 
                     override fun onSetSuccess() = postControl {
                         if (peer !== connection || currentGeneration != generation) return@postControl
-                        signaling.send(JSONObject().apply {
+                        val sent = signaling.send(JSONObject().apply {
                             put("v", 1)
                             put("type", "signal.answer")
                             put("generation", generation)
+                            put("attemptId", attemptId)
                             put("description", JSONObject().put("type", "answer").put("sdp", description.description))
                         })
+                        if (!sent) failPeer("The signaling service is unavailable while connecting")
                     }
 
                     override fun onCreateFailure(error: String) = Unit
@@ -268,17 +389,57 @@ class WebRtcPeerTransport(
     }
 
     private fun handleCandidate(message: JSONObject) {
-        val generation = message.optString("generation")
-        if (generation.isBlank() || generation != currentGeneration) return
-        val value = message.optJSONObject("candidate") ?: return
+        val generation = message.opt("generation") as? String ?: return
+        val attemptId = message.opt("attemptId") as? String ?: return
+        if (generation.isBlank() || generation != currentGeneration || attemptId != currentAttemptId) return
+        val value = message.optJSONObject("candidate") ?: run {
+            rejectSignalingMessage("The signaling service sent an invalid ICE candidate")
+            return
+        }
+        val sdpMid = when (val raw = value.opt("sdpMid")) {
+            null,
+            JSONObject.NULL,
+            -> null
+            is String -> raw.takeIf { it.length <= 128 } ?: run {
+                rejectSignalingMessage("The signaling service sent an invalid ICE candidate")
+                return
+            }
+            else -> {
+                rejectSignalingMessage("The signaling service sent an invalid ICE candidate")
+                return
+            }
+        }
+        val sdpMLineIndex = (value.opt("sdpMLineIndex") as? Number)?.toDouble()?.let { number ->
+            if (!number.isFinite() || number < 0.0 || number > 32.0 || number % 1.0 != 0.0) null else number.toInt()
+        } ?: run {
+            rejectSignalingMessage("The signaling service sent an invalid ICE candidate")
+            return
+        }
+        val sdp = value.opt("candidate") as? String ?: run {
+            rejectSignalingMessage("The signaling service sent an invalid ICE candidate")
+            return
+        }
         val candidate = IceCandidate(
-            if (value.isNull("sdpMid")) null else value.optString("sdpMid"),
-            value.optInt("sdpMLineIndex", -1),
-            value.optString("candidate"),
+            sdpMid,
+            sdpMLineIndex,
+            sdp,
         )
-        if (candidate.sdp.isBlank() || candidate.sdpMLineIndex < 0) return
+        if (candidate.sdp.isBlank()
+            || candidate.sdp.toByteArray(StandardCharsets.UTF_8).size > MAX_SIGNALING_TEXT_BYTES
+            || candidate.sdpMLineIndex !in 0..32
+            || candidate.sdpMid?.length?.let { it > 128 } == true
+        ) {
+            rejectSignalingMessage("The signaling service sent an invalid ICE candidate")
+            return
+        }
         val connection = peer ?: return
-        if (remoteDescriptionSet) connection.addIceCandidate(candidate) else pendingCandidates.addLast(candidate)
+        if (remoteDescriptionSet) {
+            connection.addIceCandidate(candidate)
+        } else if (pendingCandidates.size < MAX_PENDING_CANDIDATES) {
+            pendingCandidates.addLast(candidate)
+        } else {
+            failPeer("The direct connection sent too many ICE candidates")
+        }
     }
 
     private fun ensurePeer(): PeerConnection? {
@@ -314,7 +475,9 @@ class WebRtcPeerTransport(
                     }
 
                     override fun onIceCandidate(candidate: IceCandidate) = postControl {
-                        if (peer === createdConnection && currentGeneration == generation) sendCandidate(candidate, generation)
+                        if (peer === createdConnection && currentGeneration == generation) {
+                            sendCandidate(candidate, generation, currentAttemptId ?: return@postControl)
+                        }
                     }
 
                     override fun onIceCandidatesRemoved(candidates: Array<IceCandidate>) = Unit
@@ -371,7 +534,13 @@ class WebRtcPeerTransport(
     }
 
     private fun channelObserver(channel: DataChannel, owner: PeerConnection, binary: Boolean): DataChannel.Observer = object : DataChannel.Observer {
-        override fun onBufferedAmountChange(previousAmount: Long) = Unit
+        override fun onBufferedAmountChange(previousAmount: Long) {
+            if (!binary && peer === owner) {
+                postControl(priority = true) {
+                    if (peer === owner && control === channel) flushPendingControl()
+                }
+            }
+        }
 
         override fun onStateChange() = postControl {
             if (peer === owner) handleChannelState(channel)
@@ -389,8 +558,20 @@ class WebRtcPeerTransport(
                 }
                 return
             }
+            val frameBytes = buffer.data.remaining()
+            val maxBytes = if (binary) MAX_CAPTURE_FRAME_BYTES else MAX_CONTROL_BYTES
+            if (frameBytes > maxBytes) {
+                postControl {
+                    setError(if (binary) {
+                        "The capture frame exceeds the direct transport limit"
+                    } else {
+                        "The direct control message exceeds the size limit"
+                    })
+                }
+                return
+            }
             val bytes = try {
-                val copy = ByteArray(buffer.data.remaining())
+                val copy = ByteArray(frameBytes)
                 buffer.data.get(copy)
                 copy
             } catch (error: Throwable) {
@@ -400,17 +581,25 @@ class WebRtcPeerTransport(
             synchronized(this@WebRtcPeerTransport) { bytesReceived += bytes.size }
             lastPeerTrafficAt = System.currentTimeMillis()
             if (binary) {
-                if (bytes.size > MAX_CAPTURE_FRAME_BYTES) {
-                    postControl { setError("The capture chunk exceeds the direct transport limit") }
-                    return
-                }
+                val generation = currentGeneration
+                if (generation == null) return
                 try {
-                    captureExecutor.execute { handleCaptureFrame(owner, bytes) }
+                    captureExecutor.execute { handleCaptureData(owner, generation, bytes) }
                 } catch (_: RejectedExecutionException) {
-                    postControl { setError("The TV capture queue is full. Retry this capture.") }
+                    postControl(priority = true) {
+                        if (peer === owner && currentGeneration == generation) {
+                            commandHandler.onCaptureDataRejected(
+                                generation,
+                                bytes,
+                                "The TV capture queue is full. Retry this capture.",
+                            )
+                        }
+                    }
                 }
             } else {
-                postControl { handleControlMessage(owner, bytes) }
+                postControl(priority = isPriorityControl(bytes)) {
+                    handleControlMessage(owner, bytes)
+                }
             }
         }
     }
@@ -430,6 +619,7 @@ class WebRtcPeerTransport(
             }
             schedulePeerClose()
         } else {
+            if (channel === control) flushPendingControl()
             maybeDirect()
         }
     }
@@ -438,15 +628,10 @@ class WebRtcPeerTransport(
         it?.state() == DataChannel.State.CLOSING || it?.state() == DataChannel.State.CLOSED
     }
 
-    private fun handleCaptureFrame(owner: PeerConnection, bytes: ByteArray) {
-        if (peer !== owner) return
+    private fun handleCaptureData(owner: PeerConnection, generation: String, bytes: ByteArray) {
+        if (peer !== owner || currentGeneration != generation) return
         try {
-            val frame = CalibrationCaptureStreamWire.decode(bytes)
-            if (peer !== owner || frame.sessionId != currentGeneration) return
-            commandHandler.onCaptureFrame(frame)
-            if (frame is CalibrationCaptureStreamFrame.End) {
-                postControl { setState(PeerTransportState.DIRECT) }
-            }
+            commandHandler.onCaptureData(generation, bytes)
         } catch (error: Throwable) {
             postControl { setError(error.message ?: "The TV rejected the capture stream") }
         }
@@ -465,12 +650,12 @@ class WebRtcPeerTransport(
             setError("The TV received invalid direct control data")
             return
         }
-        if (value.optString("kind") == "sweetspot.transport") {
+        if ((value.opt("kind") as? String) == "sweetspot.transport") {
             handleCapability(value)
             return
         }
         val generation = currentGeneration ?: return
-        if (!value.has("transportSessionId") || value.optString("transportSessionId") != generation) return
+        if (value.opt("transportSessionId") as? String != generation) return
         if (!PeerEnvelopeValidator.isValid(value, generation)) {
             setError("The TV received an invalid control envelope")
             return
@@ -486,31 +671,52 @@ class WebRtcPeerTransport(
             sendControl(envelope("pong", JSONObject(), id))
             return
         }
-        commandHandler.onCommand(type, payload) { replyType, replyPayload ->
-            postControl { sendControl(envelope(replyType, replyPayload, id)) }
+        commandHandler.onCommand(generation, type, payload) { replyType, replyPayload ->
+            postControl {
+                if (peer !== owner || currentGeneration != generation) return@postControl
+                sendControl(envelope(replyType, replyPayload, id))
+            }
         }
     }
 
     private fun handleCapability(value: JSONObject) {
         val generation = currentGeneration ?: return
-        if (value.optString("sessionId") != generation) return
-        if (value.optString("type") != "hello" && value.optString("type") != "ready") {
-            failPeer("The dashboard sent an invalid direct transport handshake")
+        if ((value.opt("sessionId") as? String) != generation) return
+        val type = value.opt("type") as? String
+        if (type != "hello" && type != "ready") {
+            signaling.suspend()
+            failPeer("The dashboard sent an invalid direct transport handshake", retryable = false)
             return
         }
-        val capabilities = value.optJSONObject("capabilities") ?: return
-        if (capabilities.optInt("protocolVersion", -1) != 1
-            || capabilities.optInt("transportVersion", -1) != 1
-            || capabilities.optInt("captureStreamVersion", -1) != 1
-            || capabilities.optJSONArray("channels")?.let { it.length() == 2 && it.optString(0) == CONTROL_CHANNEL && it.optString(1) == CAPTURE_CHANNEL } != true
-            || capabilities.optInt("maxCaptureChunkBytes", 0) !in 1..16 * 1024
+        val capabilities = value.optJSONObject("capabilities") ?: run {
+            signaling.suspend()
+            failPeer("The dashboard sent an incomplete direct transport handshake", retryable = false)
+            return
+        }
+        val channels = capabilities.optJSONArray("channels")
+        if (!exactInt(capabilities.opt("protocolVersion"), 1)
+            || !exactInt(capabilities.opt("transportVersion"), 1)
+            || !exactInt(capabilities.opt("captureStreamVersion"), 1)
+            || channels?.let {
+                it.length() == 2
+                    && it.opt(0) as? String == CONTROL_CHANNEL
+                    && it.opt(1) as? String == CAPTURE_CHANNEL
+            } != true
+            || !exactInt(capabilities.opt("maxCaptureChunkBytes"), 16 * 1024)
         ) {
-            failPeer("The dashboard and TV do not support the same direct transport")
+            signaling.suspend()
+            failPeer("The dashboard and TV do not support the same direct transport", retryable = false)
             return
         }
         remoteReady = true
-        if (value.optString("type") == "hello") sendCapability("ready")
+        if (type == "hello") sendCapability("ready")
         maybeDirect()
+    }
+
+    private fun exactInt(value: Any?, expected: Int): Boolean {
+        val number = value as? Number ?: return false
+        val asDouble = number.toDouble()
+        return asDouble.isFinite() && asDouble == expected.toDouble()
     }
 
     private fun sendCapability(type: String) {
@@ -540,32 +746,72 @@ class WebRtcPeerTransport(
         reconnectCloseTask = null
         setState(PeerTransportState.DIRECT)
         if (!directPresenceSent) {
+            if (!pairingSessionConnected(generation)) {
+                failPeer("A dashboard is already connected to this TV")
+                closePeer(notify = false, releaseSession = false)
+                return
+            }
+            authenticatedGeneration = generation
             directPresenceSent = true
-            pairingSessionConnected(generation)
             listener?.onPeerPresence(true, generation)
         }
         requestStats(peer ?: return)
         signaling.suspend()
     }
 
-    private fun sendCandidate(candidate: IceCandidate, generation: String) {
-        signaling.send(JSONObject().apply {
+    private fun sendCandidate(candidate: IceCandidate, generation: String, attemptId: String) {
+        val sent = signaling.send(JSONObject().apply {
             put("v", 1)
             put("type", "signal.ice")
             put("generation", generation)
+            put("attemptId", attemptId)
             put("candidate", JSONObject().apply {
                 put("candidate", candidate.sdp)
                 put("sdpMid", candidate.sdpMid ?: JSONObject.NULL)
                 put("sdpMLineIndex", candidate.sdpMLineIndex)
             })
         })
+        if (!sent && currentState != PeerTransportState.DIRECT) {
+            failPeer("The signaling service is unavailable while connecting")
+        }
     }
 
-    private fun sendRawControl(text: String): Boolean {
-        val channel = control ?: return false
-        if (channel.state() != DataChannel.State.OPEN) return false
+    private fun sendRawControl(text: String, queueIfBlocked: Boolean = false, priority: Boolean = false): Boolean {
         val bytes = text.toByteArray(StandardCharsets.UTF_8)
         if (bytes.size > MAX_CONTROL_BYTES) return false
+        synchronized(controlDispatchLock) {
+            if (queueIfBlocked) flushPendingControl()
+            if (sendControlBytes(bytes)) return true
+            val channel = control
+            if (!queueIfBlocked || channel == null || channel.state() != DataChannel.State.OPEN) return false
+            if (pendingControl.enqueue(bytes, isPriority = priority)) {
+                scheduleControlFlush()
+                return true
+            }
+            setError("The TV direct control buffer is full. Retry the operation.")
+            return false
+        }
+    }
+
+    private fun sendControl(envelope: JSONObject): Boolean {
+        val text = envelope.toString()
+        return sendRawControl(text, queueIfBlocked = true, priority = isPriorityControl(text.toByteArray(StandardCharsets.UTF_8)))
+    }
+
+    private fun isPriorityControl(bytes: ByteArray): Boolean = try {
+        val value = JSONObject(String(bytes, StandardCharsets.UTF_8))
+        when (value.opt("type") as? String) {
+            "calibration.job.cancel", "calibration.job.discard", "pong" -> true
+            else -> false
+        }
+    } catch (_: Throwable) {
+        false
+    }
+
+    private fun sendControlBytes(bytes: ByteArray): Boolean {
+        val channel = control ?: return false
+        if (channel.state() != DataChannel.State.OPEN) return false
+        if (channel.bufferedAmount() > MAX_CONTROL_BUFFERED_BYTES - bytes.size) return false
         val sent = channel.send(DataChannel.Buffer(ByteBuffer.wrap(bytes), false))
         if (sent) {
             bytesSent += bytes.size
@@ -574,7 +820,32 @@ class WebRtcPeerTransport(
         return sent
     }
 
-    private fun sendControl(envelope: JSONObject): Boolean = sendRawControl(envelope.toString())
+    private fun flushPendingControl() {
+        while (true) {
+            val bytes = pendingControl.peek() ?: break
+            if (!sendControlBytes(bytes)) {
+                scheduleControlFlush()
+                return
+            }
+            pendingControl.removeFirst()
+        }
+        controlFlushTask?.cancel(false)
+        controlFlushTask = null
+    }
+
+    private fun scheduleControlFlush() {
+        if (controlFlushTask != null || !running.get() || pendingControl.isEmpty) return
+        controlFlushTask = try {
+            controlExecutor.schedule({
+                synchronized(controlDispatchLock) {
+                    controlFlushTask = null
+                    flushPendingControl()
+                }
+            }, CONTROL_FLUSH_DELAY_MS, TimeUnit.MILLISECONDS)
+        } catch (_: RejectedExecutionException) {
+            null
+        }
+    }
 
     private fun envelope(type: String, payload: JSONObject, replyTo: String? = null): JSONObject = JSONObject().apply {
         val id = "dev_${System.currentTimeMillis().toString(36)}_${bytesSent.toString(36)}"
@@ -657,9 +928,27 @@ class WebRtcPeerTransport(
         emitDiagnostics()
     }
 
-    private fun failPeer(message: String) {
+    private fun failPeer(message: String, retryable: Boolean = true) {
         setError(message)
-        setState(PeerTransportState.FAILED)
+        if (!running.get()) {
+            setState(PeerTransportState.FAILED)
+            return
+        }
+        if (!retryable) {
+            closePeer(notify = true, releaseSession = true)
+            setState(PeerTransportState.FAILED)
+            return
+        }
+        reconnectCount++
+        val generation = currentGeneration
+        if (directPresenceSent) {
+            directPresenceSent = false
+            listener?.onPeerPresence(false, generation)
+        }
+        closePeer(notify = false, releaseSession = false)
+        setState(PeerTransportState.RECONNECTING)
+        signaling.reconnect()
+        if (generation != null) schedulePeerClose()
     }
 
     private fun setError(message: String) {
@@ -691,15 +980,21 @@ class WebRtcPeerTransport(
         bytesReceived = bytesReceived,
         reconnectCount = reconnectCount,
         captureBufferedBytes = capture?.bufferedAmount() ?: 0L,
+        signalingRoundTripMs = signalingRoundTripMs,
         lastControlMessageAt = lastControlMessageAt,
         lastPeerTrafficAt = lastPeerTrafficAt,
         lastError = lastError,
     )
 
     @Synchronized
-    private fun closePeer(notify: Boolean) {
+    private fun closePeer(notify: Boolean, releaseSession: Boolean = true) {
         reconnectCloseTask?.cancel(false)
         reconnectCloseTask = null
+        synchronized(controlDispatchLock) {
+            controlFlushTask?.cancel(false)
+            controlFlushTask = null
+            pendingControl.clear()
+        }
         val generation = currentGeneration
         val wasPresent = directPresenceSent
         directPresenceSent = false
@@ -714,6 +1009,7 @@ class WebRtcPeerTransport(
         selectedCandidateType = null
         selectedCandidateProtocol = null
         rttMs = null
+        currentAttemptId = null
         val oldPeer = peer
         peer = null
         try { oldPeer?.close() } catch (_: Throwable) {}
@@ -724,7 +1020,10 @@ class WebRtcPeerTransport(
             try { PeerConnectionFactory.shutdownInternalTracer() } catch (_: Throwable) {}
         }
         factory = null
-        pairingSessionDisconnected(generation)
+        if (releaseSession) {
+            authenticatedGeneration = null
+            pairingSessionDisconnected(generation)
+        }
         if (wasPresent && notify) listener?.onPeerPresence(false, generation)
     }
 
@@ -745,8 +1044,8 @@ class WebRtcPeerTransport(
         try { channel.dispose() } catch (_: Throwable) {}
     }
 
-    private fun pairingSessionConnected(generation: String) {
-        try { onSessionConnected(generation) } catch (_: Throwable) {}
+    private fun pairingSessionConnected(generation: String): Boolean {
+        return try { onSessionConnected(generation) } catch (_: Throwable) { false }
     }
 
     private fun pairingSessionDisconnected(generation: String?) {

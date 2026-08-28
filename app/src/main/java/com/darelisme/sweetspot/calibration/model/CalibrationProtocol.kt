@@ -79,8 +79,8 @@ internal fun parseCalibrationSessionAbortValues(
 internal fun parseCalibrationSessionAbortPayload(payload: JSONObject): CalibrationSessionAbort? {
     val message = if (!payload.has("message")) null else payload.get("message") as? String ?: return null
     return parseCalibrationSessionAbortValues(
-        sessionId = payload.optString("sessionId"),
-        code = payload.optString("code"),
+        sessionId = payload.get("sessionId") as? String ?: return null,
+        code = payload.get("code") as? String ?: return null,
         message = message,
     )
 }

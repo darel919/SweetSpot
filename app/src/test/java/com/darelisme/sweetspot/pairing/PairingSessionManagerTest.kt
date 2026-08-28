@@ -2,6 +2,7 @@ package com.darelisme.sweetspot.pairing
 
 import com.darelisme.sweetspot.pairing.PairingSessionManager
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -28,6 +29,8 @@ class PairingSessionManagerTest {
         val manager = PairingSessionManager()
         val first = manager.ensureActive(now = 1_000L)
         manager.markPeerConnected("generation-1")
+        assertFalse(manager.markPeerConnected("generation-2"))
+        assertTrue(manager.hasActivePeer())
         assertEquals(first, manager.ensureActive(now = first.expiresAt + 1L))
         assertTrue(!manager.isExpired(first.expiresAt + 1L))
         assertEquals(first, manager.rotate(now = first.expiresAt + 2L))

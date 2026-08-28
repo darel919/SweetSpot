@@ -227,7 +227,8 @@ class CalibrationJobStore(
 
 private object CalibrationSnapshotCodec {
     private const val MAGIC = 0x5353434A
-    private const val SCHEMA_VERSION = 2
+    private const val SCHEMA_VERSION = 3
+    private val SUPPORTED_SCHEMA_VERSIONS = setOf(2, SCHEMA_VERSION)
     private const val MAX_STRING_BYTES = 1 shl 20
     private const val MAX_ATTEMPTS = 4_096
     private const val MAX_VALIDATION_RECORDS = 256
@@ -241,15 +242,15 @@ private object CalibrationSnapshotCodec {
     fun read(input: DataInputStream): CalibrationJob {
         if (input.readInt() != MAGIC) throw IOException("Unknown calibration snapshot format")
         val schema = input.readInt()
-        if (schema != SCHEMA_VERSION) throw CalibrationSnapshotIncompatibleException("Unsupported snapshot schema $schema")
-        return readJob(input)
+        if (schema !in SUPPORTED_SCHEMA_VERSIONS) throw CalibrationSnapshotIncompatibleException("Unsupported snapshot schema $schema")
+        return readJob(input, schema)
     }
 
     fun readJobId(file: File): CalibrationJobId {
         FileInputStream(file).use { fileInput ->
             DataInputStream(BufferedInputStream(fileInput)).use { input ->
                 if (input.readInt() != MAGIC) throw IOException("Unknown calibration snapshot format")
-                if (input.readInt() != SCHEMA_VERSION) throw IOException("Unsupported snapshot schema")
+                if (input.readInt() !in SUPPORTED_SCHEMA_VERSIONS) throw IOException("Unsupported snapshot schema")
                 return CalibrationJobId(readString(input))
             }
         }
@@ -261,6 +262,7 @@ private object CalibrationSnapshotCodec {
         output.writeLong(job.revision)
         writeString(output, job.analyzerRevision.value)
         writeString(output, job.sweepRevision.value)
+        writeEnum(output, job.mode)
         writePhase(output, job.phase)
         writeLedger(output, job.ledger)
         writeUsability(output, job.usability)
@@ -272,12 +274,13 @@ private object CalibrationSnapshotCodec {
         writeNullable(output, job.lastError, ::writeError)
     }
 
-    private fun readJob(input: DataInputStream): CalibrationJob {
+    private fun readJob(input: DataInputStream, schema: Int): CalibrationJob {
         val id = CalibrationJobId(readString(input))
         val createdAtMs = input.readLong()
         val revision = input.readLong()
         val analyzerRevision = AnalyzerRevision(readString(input))
         val sweepRevision = SweepRevision(readString(input))
+        val mode = if (schema >= 3) readEnum<CalibrationJobMode>(input) else CalibrationJobMode.AUTO
         val phase = readPhase(input)
         val ledger = readLedger(input)
         val usability = readUsability(input, ledger)
@@ -293,6 +296,7 @@ private object CalibrationSnapshotCodec {
             revision = revision,
             analyzerRevision = analyzerRevision,
             sweepRevision = sweepRevision,
+            mode = mode,
             phase = phase,
             ledger = ledger,
             usability = usability,

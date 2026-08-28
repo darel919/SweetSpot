@@ -270,16 +270,22 @@ object CalibrationPlanner {
         if (job.phase is CalibrationPhase.Failed || job.phase is CalibrationPhase.Complete) return null
         nextForPositions(job, PositionLedger.MANDATORY_POSITIONS.toList().sortedBy { it.ordinal })?.let { return it }
         val usable = job.usability as? CalibrationUsability.Usable ?: return null
-        if (usable.grade == UsabilityGrade.SUFFICIENT) {
+        if (job.mode != CalibrationJobMode.ADVANCED && usable.grade == UsabilityGrade.SUFFICIENT) {
             return CalibrationAction.Wait("The calibration is ready to stage.")
         }
         nextForPositions(job, listOf(CalibrationPosition.FORWARD, CalibrationPosition.BACKWARD))?.let { return it }
-        return CalibrationAction.Wait("The best calibration is ready to stage.")
+        return CalibrationAction.Wait(
+            if (job.mode == CalibrationJobMode.ADVANCED) {
+                "The full room scan is complete and ready to stage."
+            } else {
+                "The best calibration is ready to stage."
+            },
+        )
     }
 
     private fun optionalMeasurementNeeded(job: CalibrationJob): Boolean {
         val usable = job.usability as CalibrationUsability.Usable
-        if (usable.grade == UsabilityGrade.SUFFICIENT) return false
+        if (job.mode != CalibrationJobMode.ADVANCED && usable.grade == UsabilityGrade.SUFFICIENT) return false
         return listOf(CalibrationPosition.FORWARD, CalibrationPosition.BACKWARD).any { position ->
             job.ledger.complete(position) == null && ROOM_CHANNELS.any { channel ->
                 attemptCount(job, position, channel) < MAX_ATTEMPTS_PER_CHANNEL

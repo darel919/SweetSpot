@@ -2,6 +2,7 @@ package com.darelisme.sweetspot.calibration.model
 
 import org.json.JSONObject
 import kotlin.math.abs
+import kotlin.math.floor
 import kotlin.math.roundToInt
 
 internal data class MeasurementContextWire(
@@ -186,7 +187,7 @@ data class MeasurementContext(
 
         fun fromJson(value: JSONObject?): MeasurementContext? {
             if (value == null) return null
-            val positionId = value.optString("positionId")
+            val positionId = value.opt("positionId") as? String ?: return null
             if (positionTarget(positionId) == null) return null
             val geometryFields = listOf("reference", "xCm", "yCm", "zCm")
             val hasWireGeometry = geometryFields.any(value::has)
@@ -195,20 +196,20 @@ data class MeasurementContext(
             return fromWire(
                 MeasurementContextWire(
                     positionId = positionId,
-                    positionIndex = value.optInt("positionIndex", -1),
-                    positionCount = value.optInt("positionCount", -1),
-                    channel = value.optString("channel"),
-                    captureKind = value.optString("captureKind"),
-                    repairChannel = value.optString("repairChannel"),
-                    attemptIndex = value.optInt("attemptIndex", -1),
-                    attemptCount = value.optInt("attemptCount", -1),
-                    phase = value.optString("phase"),
+                    positionIndex = exactInt(value.opt("positionIndex")),
+                    positionCount = exactInt(value.opt("positionCount")),
+                    channel = value.opt("channel") as? String ?: "",
+                    captureKind = value.opt("captureKind") as? String ?: "",
+                    repairChannel = value.opt("repairChannel") as? String ?: "",
+                    attemptIndex = exactInt(value.opt("attemptIndex")),
+                    attemptCount = exactInt(value.opt("attemptCount")),
+                    phase = value.opt("phase") as? String ?: "",
                     geometry = if (hasCompleteWireGeometry) {
                         MeasurementGeometry(
-                            reference = value.optString("reference"),
-                            xCm = value.optDouble("xCm", Double.NaN),
-                            yCm = value.optDouble("yCm", Double.NaN),
-                            zCm = value.optDouble("zCm", Double.NaN),
+                            reference = value.opt("reference") as? String ?: "",
+                            xCm = finiteDouble(value.opt("xCm")),
+                            yCm = finiteDouble(value.opt("yCm")),
+                            zCm = finiteDouble(value.opt("zCm")),
                         )
                     } else {
                         null
@@ -245,5 +246,17 @@ data class MeasurementContext(
             "backward" -> MeasurementGeometry(REFERENCE_CENTER, 0.0, -10.0, -35.0)
             else -> null
         }
+
+        private fun exactInt(value: Any?): Int = (value as? Number)?.toDouble()?.let { number ->
+            if (number.isFinite() && number >= Int.MIN_VALUE && number <= Int.MAX_VALUE && number == floor(number)) {
+                number.toInt()
+            } else {
+                -1
+            }
+        } ?: -1
+
+        private fun finiteDouble(value: Any?): Double = (value as? Number)?.toDouble()
+            ?.takeIf(Double::isFinite)
+            ?: Double.NaN
     }
 }

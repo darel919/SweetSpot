@@ -49,4 +49,5 @@ class CalibrationProtocolTest {
         assertEquals(true, isCalibrationSessionOutcome("error"))
         assertEquals(false, isCalibrationSessionOutcome("unknown"))
     }
+
 }

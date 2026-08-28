@@ -32,7 +32,7 @@ center/left/right set and stages that solution when optional work is exhausted.
 
 Cloudflare provides HTTPS hosting and a short-lived SDP/ICE rendezvous only.
 After the ordered, reliable `control` and `capture` DataChannels open, the
-browser sends envelopes and bounded `SSCP` Float32 mono PCM chunks directly to
+browser sends envelopes and bounded `SSCS` Float32 mono PCM chunks directly to
 the TV. The TV stores the chunks in a partial file, verifies ordering, counts,
 metadata, and SHA-256, then passes only the finalized capture to the analyzer.
 

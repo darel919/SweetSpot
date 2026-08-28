@@ -6,16 +6,16 @@ import com.darelisme.sweetspot.audio.engine.DynamicsProcessingEq
 import com.darelisme.sweetspot.calibration.CalibrationEngineResult
 import com.darelisme.sweetspot.calibration.transport.CalibrationCaptureStreamFrame
 import com.darelisme.sweetspot.calibration.transport.CalibrationCaptureStreamReceiver
+import com.darelisme.sweetspot.calibration.transport.CalibrationCaptureStreamWire
 import com.darelisme.sweetspot.calibration.model.*
 import com.darelisme.sweetspot.calibration.model.CalibrationPackageCodec
 import com.darelisme.sweetspot.calibration.model.CalibrationPackageParseResult
 import com.darelisme.sweetspot.calibration.model.CalibrationPackageSourceDevice
-import com.darelisme.sweetspot.calibration.model.CalibrationValidationStatus
 import com.darelisme.sweetspot.calibration.model.MeasurementContext
 import com.darelisme.sweetspot.calibration.model.MeasurementResponsePayload
 import com.darelisme.sweetspot.calibration.model.parseCalibrationSessionAbortPayload
-import com.darelisme.sweetspot.calibration.model.rollbackOutcome
 import com.darelisme.sweetspot.transport.PeerTransport
+import com.darelisme.sweetspot.transport.protocol.PeerEnvelopeValidator
 import org.json.JSONObject
 import java.io.FileInputStream
 import kotlin.math.roundToInt
@@ -27,9 +27,22 @@ internal class SweetSpotPeerCommandHandler(
 
     companion object {
         private const val TAG = "SweetSpot"
+        private const val CAPTURE_WINDOW_SIZE = 8
+        private val CAPTURE_ATTEMPT_ID_PATTERN = Regex("^[A-Za-z0-9_-]{1,128}$")
     }
 
-    override fun onCommand(type: String, payload: JSONObject, replyTo: (String, JSONObject) -> Unit) {
+    override fun onCommand(sessionId: String, type: String, payload: JSONObject, replyTo: (String, JSONObject) -> Unit) {
+        PeerEnvelopeValidator.validateClientPayload(type, payload)?.let { error ->
+            Log.w(TAG, "Rejected invalid $type payload")
+            replyTo(
+                "state.snapshot",
+                host.stateSnapshotJson()
+                    .put("ok", false)
+                    .put("errorCode", "invalid_payload")
+                    .put("error", error),
+            )
+            return
+        }
         if (diagnostics.handle(type, payload, replyTo)) return
         val engine = host.commandAudioEngine
         var commandOk = true
@@ -42,7 +55,18 @@ internal class SweetSpotPeerCommandHandler(
                 return
             }
             "calibration.job.start" -> {
-                host.replyCalibrationJobResult(host.commandCalibrationEngine?.startNewJob(), replyTo)
+                val mode = when (payload.opt("mode")) {
+                    null,
+                    JSONObject.NULL,
+                    "auto" -> CalibrationJobMode.AUTO
+                    "advanced" -> CalibrationJobMode.ADVANCED
+                    else -> null
+                }
+                host.replyCalibrationJobResult(
+                    mode?.let { host.commandCalibrationEngine?.startNewJob(it) }
+                        ?: CalibrationEngineResult.Rejected(null, "invalid_mode", "The calibration mode is not supported"),
+                    replyTo,
+                )
                 return
             }
             "calibration.job.get" -> {
@@ -69,17 +93,23 @@ internal class SweetSpotPeerCommandHandler(
                 val result = when (payload.optString("scope")) {
                     "capture" -> {
                         val captureId = payload.optString("captureId").takeIf { it.isNotBlank() }?.let(::CaptureId)
+                        val hasCaptureAttempt = payload.has("captureAttemptId")
+                        val captureAttemptId = captureAttemptId(payload)
                         val currentJob = host.commandCalibrationEngine?.currentJob()
                         val currentCaptureId = when (val action = currentJob?.nextAction) {
                             is CalibrationAction.Capture -> action.request.captureId.value
                             is CalibrationAction.Validate -> action.captureId.value
                             else -> null
                         }
-                        if (jobId != null && captureId != null
-                            && currentJob?.id?.value == jobId.value
-                            && currentCaptureId == captureId.value
-                        ) host.commandCaptureStreamReceiver?.cancel()
-                        if (jobId != null && captureId != null) host.commandCalibrationEngine?.cancelCapture(jobId, captureId) else null
+                        if (hasCaptureAttempt && captureAttemptId == null) {
+                            CalibrationEngineResult.Rejected(null, "invalid_capture_attempt", "The capture attempt identity is invalid")
+                        } else if (jobId != null && captureId != null) {
+                            if (captureAttemptId != null
+                                && currentJob?.id?.value == jobId.value
+                                && currentCaptureId == captureId.value
+                            ) host.commandCaptureStreamReceiver?.cancel(sessionId, captureId.value, captureAttemptId)
+                            host.commandCalibrationEngine?.cancelCapture(jobId, captureId, captureAttemptId)
+                        } else null
                     }
                     "optional_refinement" -> jobId?.let {
                         if (host.commandCalibrationEngine?.currentJob()?.id?.value == it.value) host.commandCaptureStreamReceiver?.cancel()
@@ -104,9 +134,11 @@ internal class SweetSpotPeerCommandHandler(
             "calibration.validation.capture.ready" -> {
                 val jobId = payload.optString("jobId").takeIf { it.isNotBlank() }?.let(::CalibrationJobId)
                 val captureId = payload.optString("captureId").takeIf { it.isNotBlank() }?.let(::CaptureId)
+                val captureAttemptId = captureAttemptId(payload)
                 host.replyCalibrationJobResult(
-                    if (jobId != null && captureId != null) host.commandCalibrationEngine?.captureReady(jobId, captureId)
-                    else CalibrationEngineResult.Rejected(null, "invalid_capture", "A calibration job and capture ID are required"),
+                    if (jobId != null && captureId != null && captureAttemptId != null) {
+                        host.commandCalibrationEngine?.captureReady(jobId, captureId, captureAttemptId)
+                    } else CalibrationEngineResult.Rejected(null, "invalid_capture", "A calibration job, capture ID, and capture attempt are required"),
                     replyTo,
                 )
                 return
@@ -129,7 +161,7 @@ internal class SweetSpotPeerCommandHandler(
                     commandError = "Expected $bandCount user EQ bands"
                 } else {
                     for (i in 0 until bandCount) {
-                        val value = arr.optDouble(i, Double.NaN)
+                        val value = (arr.opt(i) as? Number)?.toDouble() ?: Double.NaN
                         if (!value.isFinite()
                             || value < DynamicsProcessingEq.MIN_USER_LEVEL_MILLIBELS / 100f
                             || value > DynamicsProcessingEq.MAX_USER_LEVEL_MILLIBELS / 100f
@@ -157,29 +189,19 @@ internal class SweetSpotPeerCommandHandler(
                 commandOk = host.applyPresetWithFeedback(payload.optInt("preset", -1))
                 if (!commandOk) commandError = "Live DSP rejected preset"
             }
-            "profile.save" -> payload.optString("name").takeIf { it.isNotBlank() }?.let { engine?.saveCurrentProfile(it) }
+            "profile.save" -> {
+                val name = payload.optString("name")
+                commandOk = engine?.saveCurrentProfile(name) == true
+                if (!commandOk) commandError = "Live DSP rejected profile save"
+            }
             "profile.load" -> {
                 commandOk = payload.optString("name").takeIf { it.isNotBlank() }?.let { host.loadProfileWithFeedback(it) } ?: false
                 if (!commandOk) commandError = "Live DSP rejected profile load"
             }
-            "profile.delete" -> payload.optString("name").takeIf { it.isNotBlank() }?.let { engine?.deleteProfile(it) }
-            "calibration.applyCandidate" -> {
-                val arr = payload.optJSONArray("bandsDb")
-                val leftArr = payload.optJSONArray("leftBandsDb")
-                val rightArr = payload.optJSONArray("rightBandsDb")
-                val left = parseStrictCalibrationArray(leftArr)
-                val right = parseStrictCalibrationArray(rightArr)
-                val common = parseStrictCalibrationArray(arr)
-                commandOk = if (leftArr != null || rightArr != null) {
-                    val target = host.dpEq()
-                    common != null && left != null && right != null && target?.applyCalibrationCandidate(common, left, right) == true
-                } else {
-                    common != null && host.dpEq()?.applyCalibrationCandidate(common) == true
-                }
-                if (!commandOk) commandError = host.dpEq()?.getLastCalibrationApplyError() ?: "Calibration candidate was rejected"
-                if (!commandOk) host.showCalibrationErrorToast(commandError ?: "Calibration candidate was rejected")
-                replyTo("state.snapshot", host.stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
-                return
+            "profile.delete" -> {
+                val name = payload.optString("name")
+                commandOk = engine?.deleteProfile(name) == true
+                if (!commandOk) commandError = "Live DSP rejected profile delete"
             }
             "calibration.export" -> {
                 val target = host.dpEq()
@@ -233,63 +255,20 @@ internal class SweetSpotPeerCommandHandler(
                 })
                 return
             }
-            "calibration.acceptCandidate" -> {
-                val candidateId = payload.optString("candidateId")
-                val transaction = host.dpEq()?.getCalibrationTransaction()
-                commandOk = candidateId.isNotBlank() && (host.dpEq()?.acceptCalibrationCandidate(candidateId) == true)
-                if (!commandOk) commandError = "Calibration candidate is not available for acceptance"
-                if (commandOk) {
-                    host.commandMeasurementController?.validationFinalized(candidateId, "improved", transaction?.reason)
-                } else if (candidateId.isNotBlank()) {
-                    host.commandMeasurementController?.validationFinalizationFailed(candidateId, commandError ?: "Calibration candidate acceptance failed")
-                }
-                replyTo("state.snapshot", host.stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
-                return
-            }
-            "calibration.rollbackCandidate" -> {
-                val candidateId = payload.optString("candidateId")
-                val transaction = host.dpEq()?.getCalibrationTransaction()
-                val result = transaction?.validationStatus?.rollbackOutcome() ?: "inconclusive"
-                commandOk = candidateId.isNotBlank() && host.rollbackCalibrationCandidate(candidateId)
-                if (!commandOk) commandError = host.dpEq()?.getLastCalibrationApplyError() ?: "Calibration candidate rollback failed"
-                if (commandOk) {
-                    host.commandMeasurementController?.validationFinalized(candidateId, result, transaction?.reason)
-                } else if (candidateId.isNotBlank()) {
-                    host.commandMeasurementController?.validationFinalizationFailed(candidateId, commandError ?: "Calibration candidate rollback failed")
-                }
-                replyTo("state.snapshot", host.stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
-                return
-            }
-            "calibration.validation.result" -> {
-                val candidateId = payload.optString("candidateId")
-                val status = when (payload.optString("status")) {
-                    "passed" -> CalibrationValidationStatus.PASSED
-                    "worse" -> CalibrationValidationStatus.WORSE
-                    "inconclusive" -> CalibrationValidationStatus.INCONCLUSIVE
-                    "failed" -> CalibrationValidationStatus.FAILED
-                    else -> null
-                }
-                val before = if (payload.has("beforeDb")) payload.optDouble("beforeDb", Double.NaN).toFloat().takeIf { it.isFinite() } else null
-                val after = if (payload.has("afterDb")) payload.optDouble("afterDb", Double.NaN).toFloat().takeIf { it.isFinite() } else null
-                val reason = payload.optString("reason").takeIf { it.isNotBlank() }
-                commandOk = candidateId.isNotBlank() && status != null && host.dpEq()?.recordCalibrationValidation(
-                    candidateId,
-                    status,
-                    before,
-                    after,
-                    reason,
-                ) == true
-                if (!commandOk) commandError = "Calibration validation result was rejected"
-                if (!commandOk && candidateId.isNotBlank()) {
-                    host.commandMeasurementController?.validationFinalizationFailed(candidateId, commandError ?: "Calibration validation result was rejected")
-                }
-                replyTo("state.snapshot", host.stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
-                return
-            }
             "calibration.reset" -> {
                 commandOk = host.resetCalibration()
             }
             "calibrationSession.begin" -> {
+                if (payload.optString("phase", "measurement") != "measurement" || payload.optString("candidateId").isNotBlank()) {
+                    replyTo(
+                        "measurement.error",
+                        JSONObject()
+                            .put("sessionId", payload.optString("sessionId"))
+                            .put("code", "invalid_session")
+                            .put("message", "Remote validation is owned by the TV calibration job"),
+                    )
+                    return
+                }
                 host.commandMeasurementController?.begin(
                     payload.optString("sessionId"),
                     payload.optString("channel", "both"),
@@ -300,7 +279,7 @@ internal class SweetSpotPeerCommandHandler(
                 )
                 return
             }
-            "calibrationSession.end" -> {
+            "diagnostics.calibrationSession.end" -> {
                 host.commandMeasurementController?.end(
                     payload.optString("sessionId"),
                     payload.optString("outcome").takeIf { it.isNotBlank() },
@@ -431,17 +410,48 @@ internal class SweetSpotPeerCommandHandler(
         replyTo("state.snapshot", host.stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
     }
 
-    override fun onCaptureFrame(frame: CalibrationCaptureStreamFrame) {
+    override fun onCaptureData(sessionId: String, data: ByteArray) {
         val receiver = host.commandCaptureStreamReceiver ?: return
+        var captureId = ""
+        var captureAttemptId = ""
+        var frameSessionId: String? = null
         var completed: CalibrationCaptureStreamReceiver.Completed? = null
         try {
-            val finished = receiver.accept(frame) ?: return
+            val frame = CalibrationCaptureStreamWire.decode(data)
+            captureId = frame.captureId
+            captureAttemptId = frame.captureAttemptId
+            frameSessionId = frame.sessionId
+            if (frame.sessionId != sessionId) throw IllegalArgumentException("Calibration capture belongs to a stale peer session")
+            val finished = receiver.accept(frame)
+            when (frame) {
+                is CalibrationCaptureStreamFrame.Begin -> host.publishCalibrationCaptureWindow(
+                    frame.captureId,
+                    frame.captureAttemptId,
+                    0,
+                    CAPTURE_WINDOW_SIZE,
+                )
+                is CalibrationCaptureStreamFrame.Chunk -> if ((frame.sequence + 1) % CAPTURE_WINDOW_SIZE == 0L) {
+                    host.publishCalibrationCaptureWindow(
+                        frame.captureId,
+                        frame.captureAttemptId,
+                        frame.sequence + 1,
+                        CAPTURE_WINDOW_SIZE,
+                    )
+                }
+                is CalibrationCaptureStreamFrame.End -> Unit
+            }
+            if (finished == null) return
             completed = finished
+            if (finished.duplicate) {
+                host.publishCalibrationCaptureResult(null, finished)
+                return
+            }
             val result = FileInputStream(finished.pcmFile).use { input ->
                 host.commandCalibrationEngine?.submitCaptureStream(
                     metadataJson = finished.metadataJson,
                     pcm = input,
                     pcmBytes = finished.byteCount,
+                    captureAttemptId = finished.captureAttemptId,
                 )
             }
             if (result != null) host.publishCalibrationCaptureResult(result, finished)
@@ -451,9 +461,28 @@ internal class SweetSpotPeerCommandHandler(
             completed?.let { finished ->
                 try { receiver.delete(finished) } catch (_: Throwable) {}
             }
-            receiver.cancel()
-            host.publishCalibrationCaptureRejection(frame.captureId, error.message ?: "The TV rejected this calibration recording")
+            if (frameSessionId == sessionId && captureId.isNotBlank()) receiver.cancel(sessionId, captureId, captureAttemptId)
+            if (frameSessionId == sessionId && captureId.isNotBlank() && captureAttemptId.isNotBlank()) {
+                host.publishCalibrationCaptureRejection(captureId, captureAttemptId, error.message ?: "The TV rejected this calibration recording")
+            }
         }
+    }
+
+    override fun onCaptureDataRejected(sessionId: String, data: ByteArray, reason: String) {
+        try {
+            val frame = CalibrationCaptureStreamWire.decode(data)
+            if (frame.sessionId != sessionId) return
+            host.commandCaptureStreamReceiver?.cancel(sessionId, frame.captureId, frame.captureAttemptId)
+            host.publishCalibrationCaptureRejection(frame.captureId, frame.captureAttemptId, reason)
+        } catch (error: Throwable) {
+            Log.w(TAG, "Unable to identify rejected direct capture frame", error)
+            host.commandCaptureStreamReceiver?.cancel()
+        }
+    }
+
+    private fun captureAttemptId(payload: JSONObject): String? {
+        val value = payload.optString("captureAttemptId").takeIf { it.isNotBlank() } ?: return null
+        return value.takeIf { CAPTURE_ATTEMPT_ID_PATTERN.matches(it) }
     }
 
 }

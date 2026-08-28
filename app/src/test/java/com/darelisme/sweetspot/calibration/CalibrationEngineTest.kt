@@ -125,7 +125,13 @@ class CalibrationEngineTest {
             val staged = first.finishWithBest(jobId) as CalibrationEngineResult.Updated
             val validation = staged.job.nextAction as CalibrationAction.Validate
             analyzer.lastAction = null
-            submit(first, frame(jobId, validation.captureId, validation.position, CaptureChannel.BOTH, validation.attemptIndex))
+            val attemptId = "fixture-attempt-${validation.captureId.value}"
+            first.captureReady(jobId, validation.captureId, attemptId)
+            submit(
+                first,
+                frame(jobId, validation.captureId, validation.position, CaptureChannel.BOTH, validation.attemptIndex),
+                attemptId,
+            )
             val completed = requireNotNull(first.currentJob())
             assertEquals(CalibrationPhase.Complete, completed.phase)
             first.close()
@@ -159,12 +165,14 @@ class CalibrationEngineTest {
             val jobId = (engine.startNewJob() as CalibrationEngineResult.Updated).job.id
             val firstAction = requireNotNull(engine.currentJob()).nextAction as CalibrationAction.Capture
             val firstFrame = frame(jobId, firstAction.request.captureId, firstAction.request.position, firstAction.request.channel, firstAction.request.attemptIndex)
+            val firstAttempt = "fixture-attempt-${firstAction.request.captureId.value}"
             analyzer.lastAction = firstAction
-            submit(engine, firstFrame)
+            engine.captureReady(jobId, firstAction.request.captureId, firstAttempt)
+            submit(engine, firstFrame, firstAttempt)
             captureMandatory(engine, analyzer)
 
             val current = requireNotNull(engine.currentJob())
-            val duplicate = submit(engine, firstFrame)
+            val duplicate = submit(engine, firstFrame, firstAttempt)
 
             assertEquals(current, (duplicate as CalibrationEngineResult.Updated).job)
             assertEquals(current.ledger, requireNotNull(engine.currentJob()).ledger)
@@ -206,6 +214,42 @@ class CalibrationEngineTest {
     }
 
     @Test
+    fun duplicateCaptureReadyAfterPlaybackFinishesDoesNotReplayTheSweep() {
+        val root = Files.createTempDirectory("sweetspot-engine-ready-duplicate-").toFile()
+        try {
+            val analyzer = FixtureAnalyzer()
+            val sweep = MeasurementSweep(48_000)
+            val store = CalibrationJobStore(root.resolve("jobs"))
+            val captures = CalibrationCaptureStore(root.resolve("captures"))
+            var startCount = 0
+            val listener = object : CalibrationEngineListener {
+                override fun onCaptureStarted(jobId: CalibrationJobId, captureId: CaptureId, captureAttemptId: String) {
+                    startCount++
+                }
+            }
+            val engine = CalibrationEngine(
+                store,
+                captures,
+                analyzer,
+                sweep,
+                playback = ImmediatePlayback,
+                listener = listener,
+                metadataParser = FixtureMetadataParser,
+            )
+            val job = (engine.startNewJob() as CalibrationEngineResult.Updated).job
+            val action = job.nextAction as CalibrationAction.Capture
+            val attemptId = "fixture-attempt-${action.request.captureId.value}"
+
+            assertTrue(engine.captureReady(job.id, action.request.captureId, attemptId) is CalibrationEngineResult.Updated)
+            assertTrue(engine.captureReady(job.id, action.request.captureId, attemptId) is CalibrationEngineResult.Updated)
+            assertEquals(1, startCount)
+            engine.close()
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun remoteMicrophoneProfileIsUsedByTheTvAnalyzer() {
         val root = Files.createTempDirectory("sweetspot-engine-mic-profile-").toFile()
         try {
@@ -223,6 +267,8 @@ class CalibrationEngineTest {
             )
             val job = (engine.startNewJob() as CalibrationEngineResult.Updated).job
             val action = job.nextAction as CalibrationAction.Capture
+            val attemptId = "fixture-attempt-${action.request.captureId.value}"
+            engine.captureReady(job.id, action.request.captureId, attemptId)
 
             val submitted = submit(engine,
                 frame(
@@ -232,6 +278,7 @@ class CalibrationEngineTest {
                     action.request.channel,
                     action.request.attemptIndex,
                 ),
+                attemptId,
             )
             assertTrue(
                 (submitted as? CalibrationEngineResult.Rejected)?.message ?: "unexpected result",
@@ -266,7 +313,13 @@ class CalibrationEngineTest {
             val validation = staged.job.nextAction as CalibrationAction.Validate
             assertEquals(validation.candidateId, dsp.candidateId)
             analyzer.lastAction = null
-            val result = submit(engine, frame(jobId, validation.captureId, validation.position, CaptureChannel.BOTH, validation.attemptIndex))
+            val attemptId = "fixture-attempt-${validation.captureId.value}"
+            engine.captureReady(jobId, validation.captureId, attemptId)
+            val result = submit(
+                engine,
+                frame(jobId, validation.captureId, validation.position, CaptureChannel.BOTH, validation.attemptIndex),
+                attemptId,
+            )
             val completed = (result as CalibrationEngineResult.Updated).job
             assertEquals(CalibrationPhase.Complete, completed.phase)
             assertEquals(null, completed.candidate)
@@ -362,12 +415,24 @@ class CalibrationEngineTest {
         val job = requireNotNull(engine.currentJob())
         val action = job.nextAction as CalibrationAction.Capture
         analyzer.lastAction = action
-        val result = submit(engine, frame(job.id, action.request.captureId, action.request.position, action.request.channel, action.request.attemptIndex))
+        val attemptId = "fixture-attempt-${action.request.captureId.value}"
+        val ready = engine.captureReady(job.id, action.request.captureId, attemptId)
+        assertTrue(ready is CalibrationEngineResult.Updated)
+        val result = submit(
+            engine,
+            frame(job.id, action.request.captureId, action.request.position, action.request.channel, action.request.attemptIndex),
+            attemptId,
+        )
         assertTrue(result is CalibrationEngineResult.Updated)
     }
 
-    private fun submit(engine: CalibrationEngine, capture: FixtureCapture): CalibrationEngineResult =
-        engine.submitCaptureStream(capture.metadataJson, ByteArrayInputStream(capture.pcm), capture.pcm.size.toLong())
+    private fun submit(engine: CalibrationEngine, capture: FixtureCapture, captureAttemptId: String): CalibrationEngineResult =
+        engine.submitCaptureStream(
+            capture.metadataJson,
+            ByteArrayInputStream(capture.pcm),
+            capture.pcm.size.toLong(),
+            captureAttemptId,
+        )
 
     private fun frame(
         jobId: CalibrationJobId,

@@ -9,6 +9,7 @@ import com.darelisme.sweetspot.calibration.model.CaptureChannel
 import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.charset.StandardCharsets
 import org.json.JSONObject
 
 fun interface CalibrationCaptureMetadataParser {
@@ -16,7 +17,6 @@ fun interface CalibrationCaptureMetadataParser {
 }
 
 internal class CalibrationCaptureReader(
-    private val nowMs: () -> Long,
     private val metadataParser: CalibrationCaptureMetadataParser?,
 ) {
     fun parse(metadataJson: String, pcmBytes: Int): CaptureUploadMetadata =
@@ -79,45 +79,71 @@ internal class CalibrationCaptureReader(
     }
 
     private fun parseDefault(json: String, pcmBytes: Int): CaptureUploadMetadata {
+        require(pcmBytes > 0) { "PCM payload is empty" }
         val value = JSONObject(json)
-        val settingsValue = value.optJSONObject("browserCaptureSettings")
-            ?: value.optJSONObject("settings")
-            ?: JSONObject()
-        val settings = buildMap {
-            val keys = settingsValue.keys()
-            while (keys.hasNext()) {
-                val key = keys.next()
-                put(key, settingsValue.opt(key)?.toString() ?: "")
-            }
-        }
-        val sampleCount = value.getLong("sampleCount")
-        val byteCount = value.optLong("byteCount", pcmBytes.toLong())
-        val microphoneProfile = value.getJSONObject("microphoneProfile").let(::parseMicrophoneProfile)
+        val settings = parseSettings(value)
+        val sampleCount = exactLong(value.opt("sampleCount"), "sampleCount")
+        val byteCount = exactLong(value.opt("byteCount"), "byteCount")
+        val microphoneProfile = (value.opt("microphoneProfile") as? JSONObject)
+            ?.let(::parseMicrophoneProfile)
+            ?: throw IllegalArgumentException("microphoneProfile must be an object")
         val metadata = CaptureUploadMetadata(
-            jobId = CalibrationJobId(value.getString("jobId")),
-            captureId = CaptureId(value.getString("captureId")),
-            position = enumValue(value.optString("positionId", value.optString("position")), CalibrationPosition.entries),
-            attemptIndex = value.getInt("attemptIndex"),
-            channel = enumValue(value.optString("channel"), CaptureChannel.entries),
-            sampleRateHz = value.getInt("sampleRate"),
-            channelCount = value.getInt("channelCount"),
+            jobId = CalibrationJobId(requiredString(value, "jobId")),
+            captureId = CaptureId(requiredString(value, "captureId")),
+            position = enumValue(requiredString(value, "positionId", "position"), CalibrationPosition.entries),
+            attemptIndex = exactInt(value.opt("attemptIndex"), "attemptIndex"),
+            channel = enumValue(requiredString(value, "channel"), CaptureChannel.entries),
+            sampleRateHz = exactInt(value.opt("sampleRate"), "sampleRate"),
+            channelCount = exactInt(value.opt("channelCount"), "channelCount"),
             sampleCount = sampleCount,
             browserCaptureSettings = settings,
-            userAgent = value.optString("userAgent", value.optString("browserUserAgent")),
-            microphoneProfileId = value.optString("microphoneProfileId", value.optString("micProfileId")),
-            microphoneProfileRevision = value.optString("microphoneProfileRevision", value.optString("micProfileRevision", "unknown")),
+            userAgent = requiredString(value, "userAgent", "browserUserAgent"),
+            microphoneProfileId = requiredString(value, "microphoneProfileId", "micProfileId"),
+            microphoneProfileRevision = requiredString(value, "microphoneProfileRevision", "micProfileRevision"),
             microphoneProfile = microphoneProfile,
-            capturedAtMs = value.optLong("capturedAtMs", value.optLong("captureTimestamp", nowMs())),
-            contentSha256 = value.getString("contentSha256"),
+            capturedAtMs = exactLong(value.opt("capturedAtMs") ?: value.opt("captureTimestamp"), "capturedAtMs"),
+            contentSha256 = requiredString(value, "contentSha256"),
             byteCount = byteCount,
         ).normalized()
         require(metadata.byteCount == pcmBytes.toLong()) { "PCM byte count does not match payload" }
         return metadata
     }
 
+    private fun parseSettings(value: JSONObject): Map<String, String> {
+        val settingsValue = when {
+            value.has("settings") -> value.opt("settings")
+            value.has("browserCaptureSettings") -> value.opt("browserCaptureSettings")
+            else -> throw IllegalArgumentException("Capture settings are required")
+        } as? JSONObject ?: throw IllegalArgumentException("Capture settings must be an object")
+        val keys = settingsValue.keys()
+        val result = LinkedHashMap<String, String>()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            if (key.isBlank() || key.length > 4_096 || key.toByteArray(StandardCharsets.UTF_8).size > 4_096) {
+                throw IllegalArgumentException("Capture setting name is invalid")
+            }
+            if (result.size >= 64) throw IllegalArgumentException("Too many capture settings")
+            val raw = settingsValue.opt(key)
+            val setting = when (raw) {
+                JSONObject.NULL -> ""
+                is String -> raw
+                is Boolean -> raw.toString()
+                is Number -> raw.toString().takeIf { raw.toDouble().isFinite() }
+                else -> null
+            } ?: throw IllegalArgumentException("Capture setting $key is invalid")
+            if (setting.length > 4_096 || setting.toByteArray(StandardCharsets.UTF_8).size > 4_096) {
+                throw IllegalArgumentException("Capture setting $key is too large")
+            }
+            result[key] = setting
+        }
+        return result
+    }
+
     private fun parseMicrophoneProfile(value: JSONObject): CalibrationMicrophoneProfilePayload {
-        val frequenciesValue = value.getJSONArray("frequenciesHz")
-        val responseValue = value.getJSONArray("responseDb")
+        val frequenciesValue = value.opt("frequenciesHz") as? org.json.JSONArray
+            ?: throw IllegalArgumentException("Microphone profile frequencies are required")
+        val responseValue = value.opt("responseDb") as? org.json.JSONArray
+            ?: throw IllegalArgumentException("Microphone profile response is required")
         require(frequenciesValue.length() == responseValue.length()) {
             "Microphone profile frequency and response arrays must match"
         }
@@ -125,16 +151,57 @@ internal class CalibrationCaptureReader(
             "Microphone profile point count is outside the supported range"
         }
         return CalibrationMicrophoneProfilePayload(
-            id = value.getString("id"),
-            revision = value.getString("revision"),
-            frequenciesHz = FloatArray(frequenciesValue.length()) { frequenciesValue.getDouble(it).toFloat() },
-            responseDb = FloatArray(responseValue.length()) { responseValue.getDouble(it).toFloat() },
-            normalizeAtHz = value.getDouble("normalizeAtHz").toFloat(),
-            trustMinHz = value.getDouble("trustMinHz").toFloat(),
-            trustFullMaxHz = value.getDouble("trustFullMaxHz").toFloat(),
-            trustTaperToHz = value.getDouble("trustTaperToHz").toFloat(),
-            capturePathStatus = value.getString("capturePathStatus"),
+            id = requiredString(value, "id"),
+            revision = requiredString(value, "revision"),
+            frequenciesHz = FloatArray(frequenciesValue.length()) { finiteFloat(frequenciesValue.opt(it), "frequency") },
+            responseDb = FloatArray(responseValue.length()) { finiteFloat(responseValue.opt(it), "response") },
+            normalizeAtHz = finiteFloat(value.opt("normalizeAtHz"), "normalizeAtHz"),
+            trustMinHz = finiteFloat(value.opt("trustMinHz"), "trustMinHz"),
+            trustFullMaxHz = finiteFloat(value.opt("trustFullMaxHz"), "trustFullMaxHz"),
+            trustTaperToHz = finiteFloat(value.opt("trustTaperToHz"), "trustTaperToHz"),
+            capturePathStatus = requiredString(value, "capturePathStatus"),
         )
+    }
+
+    private fun requiredString(value: JSONObject, vararg keys: String): String {
+        for (key in keys) {
+            if (!value.has(key)) continue
+            val text = value.opt(key) as? String
+                ?: throw IllegalArgumentException("$key must be a string")
+            if (text.isBlank()) throw IllegalArgumentException("$key must not be blank")
+            return text
+        }
+        throw IllegalArgumentException("${keys.first()} is required")
+    }
+
+    private fun exactLong(value: Any?, key: String): Long {
+        val number = value as? Number ?: throw IllegalArgumentException("$key must be an integer")
+        val decimal = try { number.toString().toBigDecimal() } catch (_: NumberFormatException) {
+            throw IllegalArgumentException("$key must be an integer")
+        }
+        if (decimal < java.math.BigDecimal.ZERO
+            || decimal.remainder(java.math.BigDecimal.ONE).signum() != 0
+        ) throw IllegalArgumentException("$key must be an integer")
+        return try {
+            decimal.longValueExact()
+        } catch (_: ArithmeticException) {
+            throw IllegalArgumentException("$key is outside the supported range")
+        }
+    }
+
+    private fun exactInt(value: Any?, key: String): Int {
+        val number = exactLong(value, key)
+        if (number > Int.MAX_VALUE) throw IllegalArgumentException("$key is outside the supported range")
+        return number.toInt()
+    }
+
+    private fun finiteFloat(value: Any?, key: String): Float {
+        val number = value as? Number ?: throw IllegalArgumentException("$key must be numeric")
+        val converted = number.toDouble().toFloat()
+        if (!number.toDouble().isFinite() || !converted.isFinite()) {
+            throw IllegalArgumentException("$key must be finite")
+        }
+        return converted
     }
 
     private inline fun <reified T : Enum<T>> enumValue(raw: String, values: Iterable<T>): T {

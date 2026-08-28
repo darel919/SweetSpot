@@ -318,8 +318,8 @@ class WebServer(
 
             method == "POST" && path == "/api/saveprofile" -> {
                 val name = parseStringField(body, "name")
-                if (!name.isNullOrBlank()) engine.saveCurrentProfile(name)
-                sendJson(client, stateJson())
+                val ok = !name.isNullOrBlank() && engine.saveCurrentProfile(name)
+                sendJson(client, stateJson(ok, if (ok) null else "Live DSP rejected profile save"))
             }
 
             method == "POST" && path == "/api/loadprofile" -> {
@@ -333,8 +333,8 @@ class WebServer(
 
             method == "POST" && path == "/api/deleteprofile" -> {
                 val name = parseStringField(body, "name")
-                if (!name.isNullOrBlank()) engine.deleteProfile(name)
-                sendJson(client, stateJson())
+                val ok = !name.isNullOrBlank() && engine.deleteProfile(name)
+                sendJson(client, stateJson(ok, if (ok) null else "Live DSP rejected profile delete"))
             }
 
             method == "POST" && path == "/api/bypass" -> {

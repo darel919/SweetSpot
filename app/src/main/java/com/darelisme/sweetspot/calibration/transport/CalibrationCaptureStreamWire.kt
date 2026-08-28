@@ -4,11 +4,13 @@ import org.json.JSONObject
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 
 sealed interface CalibrationCaptureStreamFrame {
     val sessionId: String
     val captureId: String
+    val captureAttemptId: String
 
     data class Begin(
         override val sessionId: String,
@@ -16,6 +18,7 @@ sealed interface CalibrationCaptureStreamFrame {
         val metadataJson: String,
         val expectedSampleCount: Long?,
         val expectedByteCount: Long?,
+        override val captureAttemptId: String = "legacy-attempt",
     ) : CalibrationCaptureStreamFrame
 
     data class Chunk(
@@ -24,6 +27,7 @@ sealed interface CalibrationCaptureStreamFrame {
         val sequence: Long,
         val sampleCount: Long,
         val pcm: ByteArray,
+        override val captureAttemptId: String = "legacy-attempt",
     ) : CalibrationCaptureStreamFrame
 
     data class End(
@@ -34,6 +38,7 @@ sealed interface CalibrationCaptureStreamFrame {
         val finalByteCount: Long,
         val finalSha256: String,
         val metadataJson: String,
+        override val captureAttemptId: String = "legacy-attempt",
     ) : CalibrationCaptureStreamFrame
 }
 
@@ -67,13 +72,19 @@ object CalibrationCaptureStreamWire {
             throw IOException("Capture stream payload length does not match the frame")
         }
         val value = try {
-            JSONObject(String(bytes, HEADER_BYTES, headerLength.toInt(), StandardCharsets.UTF_8))
+            val headerText = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(bytes, HEADER_BYTES, headerLength.toInt()))
+                .toString()
+            JSONObject(headerText)
         } catch (error: Exception) {
-            throw IOException("Capture stream header is not valid JSON", error)
+            throw IOException("Capture stream header is not valid UTF-8 JSON", error)
         }
-        val sessionId = boundedId(value.optString("sessionId"))
-        val captureId = boundedId(value.optString("captureId"))
-        val declaredKind = value.optString("kind")
+        val sessionId = boundedId(requiredString(value, "sessionId"))
+        val captureId = boundedId(requiredString(value, "captureId"))
+        val captureAttemptId = boundedId(requiredString(value, "captureAttemptId"))
+        val declaredKind = requiredString(value, "kind")
         val expectedKind = when (kind) {
             1 -> "begin"
             2 -> "chunk"
@@ -82,9 +93,9 @@ object CalibrationCaptureStreamWire {
         }
         if (declaredKind != expectedKind) throw IOException("Capture stream header has the wrong kind")
         return when (kind) {
-            1 -> decodeBegin(value, sessionId, captureId, payloadLength)
-            2 -> decodeChunk(value, sessionId, captureId, bytes, payloadOffset, payloadLength)
-            else -> decodeEnd(value, sessionId, captureId, payloadLength)
+            1 -> decodeBegin(value, sessionId, captureId, captureAttemptId, payloadLength)
+            2 -> decodeChunk(value, sessionId, captureId, captureAttemptId, bytes, payloadOffset, payloadLength)
+            else -> decodeEnd(value, sessionId, captureId, captureAttemptId, payloadLength)
         }
     }
 
@@ -92,13 +103,14 @@ object CalibrationCaptureStreamWire {
         value: JSONObject,
         sessionId: String,
         captureId: String,
+        captureAttemptId: String,
         payloadLength: Long,
     ): CalibrationCaptureStreamFrame.Begin {
         if (payloadLength != 0L || !value.has("metadata") || value.opt("metadata") !is JSONObject) {
             throw IOException("Capture stream begin header is invalid")
         }
         val metadata = value.getJSONObject("metadata")
-        if (metadata.optString("captureId") != captureId) {
+        if ((metadata.opt("captureId") as? String) != captureId) {
             throw IOException("Capture stream begin capture ID does not match its metadata")
         }
         val expectedSampleCount = optionalCount(value, "expectedSampleCount")
@@ -115,6 +127,7 @@ object CalibrationCaptureStreamWire {
             metadataJson = metadata.toString(),
             expectedSampleCount = expectedSampleCount,
             expectedByteCount = expectedByteCount,
+            captureAttemptId = captureAttemptId,
         )
     }
 
@@ -122,6 +135,7 @@ object CalibrationCaptureStreamWire {
         value: JSONObject,
         sessionId: String,
         captureId: String,
+        captureAttemptId: String,
         bytes: ByteArray,
         payloadOffset: Long,
         payloadLength: Long,
@@ -137,6 +151,7 @@ object CalibrationCaptureStreamWire {
             sequence = sequence,
             sampleCount = sampleCount,
             pcm = bytes.copyOfRange(payloadOffset.toInt(), bytes.size),
+            captureAttemptId = captureAttemptId,
         )
     }
 
@@ -144,6 +159,7 @@ object CalibrationCaptureStreamWire {
         value: JSONObject,
         sessionId: String,
         captureId: String,
+        captureAttemptId: String,
         payloadLength: Long,
     ): CalibrationCaptureStreamFrame.End {
         if (payloadLength != 0L || !value.has("metadata") || value.opt("metadata") !is JSONObject) {
@@ -152,11 +168,15 @@ object CalibrationCaptureStreamWire {
         val chunkCount = requiredCount(value, "chunkCount")
         val finalSampleCount = requiredCount(value, "finalSampleCount")
         val finalByteCount = requiredCount(value, "finalByteCount")
-        val finalSha256 = value.optString("finalSha256")
+        val finalSha256 = requiredString(value, "finalSha256")
         val metadata = value.getJSONObject("metadata")
-        if (metadata.optString("captureId") != captureId
+        if ((metadata.opt("captureId") as? String) != captureId
             || finalByteCount != sampleByteCount(finalSampleCount)
-            || !finalSha256.matches(Regex("[a-fA-F0-9]{64}"))) {
+            || !finalSha256.matches(Regex("[a-fA-F0-9]{64}"))
+            || (metadata.opt("sampleCount") as? Number)?.let(::exactCount) != finalSampleCount
+            || (metadata.opt("byteCount") as? Number)?.let(::exactCount) != finalByteCount
+            || (metadata.opt("contentSha256") as? String)?.equals(finalSha256, ignoreCase = true) != true
+        ) {
             throw IOException("Capture stream end header is invalid")
         }
         return CalibrationCaptureStreamFrame.End(
@@ -167,6 +187,7 @@ object CalibrationCaptureStreamWire {
             finalByteCount = finalByteCount,
             finalSha256 = finalSha256.lowercase(),
             metadataJson = metadata.toString(),
+            captureAttemptId = captureAttemptId,
         )
     }
 
@@ -175,10 +196,25 @@ object CalibrationCaptureStreamWire {
         return value
     }
 
+    private fun requiredString(value: JSONObject, key: String): String = value.opt(key) as? String
+        ?: throw IOException("Capture stream $key is invalid")
+
     private fun requiredCount(value: JSONObject, key: String): Long {
-        val result = value.optLong(key, -1L)
-        if (result < 0L) throw IOException("Capture stream $key is invalid")
-        return result
+        val number = value.opt(key) as? Number
+            ?: throw IOException("Capture stream $key is invalid")
+        return exactCount(number) ?: throw IOException("Capture stream $key is invalid")
+    }
+
+    private fun exactCount(number: Number): Long? = try {
+        val decimal = number.toString().toBigDecimal()
+        if (decimal < java.math.BigDecimal.ZERO
+            || decimal.remainder(java.math.BigDecimal.ONE).signum() != 0
+        ) return null
+        decimal.longValueExact()
+    } catch (_: ArithmeticException) {
+        null
+    } catch (_: NumberFormatException) {
+        null
     }
 
     private fun optionalCount(value: JSONObject, key: String): Long? {

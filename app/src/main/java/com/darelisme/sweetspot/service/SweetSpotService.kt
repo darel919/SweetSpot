@@ -121,7 +121,6 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
     private var pendingDisconnectedPeerGeneration: String? = null
     private var captureStreamReceiver: CalibrationCaptureStreamReceiver? = null
     private val clientDisconnectGrace = Runnable {
-        pendingDisconnectedPeerGeneration?.let { pairCodes.markPeerDisconnected(it) }
         pendingDisconnectedPeerGeneration = null
         measurementController?.clientPresenceChanged(false)
         rotatePairingSession(force = true)
@@ -213,10 +212,17 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
                         peerTransport?.publish("calibration.job.state", CalibrationJobJson.view(job))
                     }
 
-                    override fun onCaptureFinished(jobId: CalibrationJobId, captureId: CaptureId) {
+                    override fun onCaptureStarted(jobId: CalibrationJobId, captureId: CaptureId, captureAttemptId: String) {
+                        publishCalibrationCaptureStarted(jobId.value, captureId.value, captureAttemptId)
+                    }
+
+                    override fun onCaptureFinished(jobId: CalibrationJobId, captureId: CaptureId, captureAttemptId: String) {
                         peerTransport?.publish(
                             "calibration.capture.finished",
-                            JSONObject().put("jobId", jobId.value).put("captureId", captureId.value),
+                            JSONObject()
+                                .put("jobId", jobId.value)
+                                .put("captureId", captureId.value)
+                                .put("captureAttemptId", captureAttemptId),
                         )
                     }
                 },
@@ -513,7 +519,13 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
                 if (job != null) {
                     replyTo("calibration.job.state", CalibrationJobJson.view(job))
                 } else {
-                    replyTo("state.snapshot", stateSnapshotJson().put("ok", false).put("error", result.message))
+                    replyTo(
+                        "state.snapshot",
+                        stateSnapshotJson()
+                            .put("ok", false)
+                            .put("errorCode", result.code)
+                            .put("error", result.message),
+                    )
                 }
             }
             null -> replyTo("state.snapshot", stateSnapshotJson().put("ok", false).put("error", "Calibration engine is unavailable"))
@@ -521,25 +533,21 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
     }
 
     override fun publishCalibrationCaptureResult(
-        result: CalibrationEngineResult,
+        result: CalibrationEngineResult?,
         capture: CalibrationCaptureStreamReceiver.Completed,
     ) {
         val metadata = try { JSONObject(capture.metadataJson) } catch (_: Throwable) { return }
-        val job = result.job
-        val lastValidationOutcome = job?.validationHistory?.lastOrNull()?.outcome
-        val accepted = when (result) {
-            is CalibrationEngineResult.Rejected -> false
-            is CalibrationEngineResult.Updated -> {
+        val job = result?.job ?: calibrationEngine?.currentJob()
+        val accepted = when {
+            capture.duplicate -> false
+            result is CalibrationEngineResult.Rejected -> false
+            result is CalibrationEngineResult.Updated -> if (metadata.optString("channel") == "both") {
+                true
+            } else {
                 val captureId = metadata.optString("captureId")
-                val channel = metadata.optString("channel")
-                if (channel == "both") {
-                    lastValidationOutcome != null &&
-                        lastValidationOutcome != com.darelisme.sweetspot.calibration.model.ValidationOutcome.INCONCLUSIVE_CAPTURE
-                } else {
-                    job?.ledger?.attempts?.any {
-                        it.request.captureId.value == captureId && it is CaptureAttempt.Accepted
-                    } == true
-                }
+                job?.ledger?.attempts?.any {
+                    it.request.captureId.value == captureId && it is CaptureAttempt.Accepted
+                } == true
             }
         }
         peerTransport?.publish(
@@ -547,14 +555,16 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
             JSONObject().apply {
                 put("jobId", metadata.optString("jobId"))
                 put("captureId", metadata.optString("captureId"))
-                put("contentSha256", metadata.optString("contentSha256"))
-                put("sampleCount", metadata.optLong("sampleCount"))
+                put("captureAttemptId", capture.captureAttemptId)
+                put("contentSha256", capture.sha256)
+                put("sampleCount", capture.sampleCount)
                 put("byteCount", capture.byteCount)
-                put("status", if (accepted) "accepted" else "rejected")
-                if (!accepted) {
+                put("status", if (capture.duplicate) "duplicate" else if (accepted) "accepted" else "rejected")
+                if (!accepted && !capture.duplicate) {
                     val reason = when (result) {
                         is CalibrationEngineResult.Rejected -> result.message
                         is CalibrationEngineResult.Updated -> job?.lastError?.message
+                        null -> "The TV could not process this calibration recording"
                     }
                     reason?.takeIf { it.isNotBlank() }?.let { put("reason", it) }
                 }
@@ -563,7 +573,33 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
         job?.let { peerTransport?.publish("calibration.job.state", CalibrationJobJson.view(it)) }
     }
 
-    override fun publishCalibrationCaptureRejection(captureId: String, reason: String) {
+    override fun publishCalibrationCaptureStarted(jobId: String, captureId: String, captureAttemptId: String) {
+        peerTransport?.publish(
+            "calibration.capture.started",
+            JSONObject()
+                .put("jobId", jobId)
+                .put("captureId", captureId)
+                .put("captureAttemptId", captureAttemptId),
+        )
+    }
+
+    override fun publishCalibrationCaptureWindow(
+        captureId: String,
+        captureAttemptId: String,
+        nextSequence: Long,
+        windowSize: Int,
+    ) {
+        peerTransport?.publish(
+            "calibration.capture.window",
+            JSONObject()
+                .put("captureId", captureId)
+                .put("captureAttemptId", captureAttemptId)
+                .put("nextSequence", nextSequence)
+                .put("windowSize", windowSize),
+        )
+    }
+
+    override fun publishCalibrationCaptureRejection(captureId: String, captureAttemptId: String, reason: String) {
         val job = calibrationEngine?.currentJob() ?: return
         val actionCaptureId = when (val action = job.nextAction) {
             is com.darelisme.sweetspot.calibration.model.CalibrationAction.Capture -> action.request.captureId.value
@@ -576,6 +612,7 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
             JSONObject()
                 .put("jobId", job.id.value)
                 .put("captureId", captureId)
+                .put("captureAttemptId", captureAttemptId)
                 .put("status", "rejected")
                 .put("reason", reason),
         )
@@ -598,7 +635,7 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
             put("bytesReceived", diagnostics.bytesReceived)
             put("captureBufferedBytes", diagnostics.captureBufferedBytes)
             put("reconnectCount", diagnostics.reconnectCount)
-            put("signalingRoundTripMs", JSONObject.NULL)
+            put("signalingRoundTripMs", diagnostics.signalingRoundTripMs ?: JSONObject.NULL)
             put("lastControlMessageAt", diagnostics.lastControlMessageAt ?: JSONObject.NULL)
             put("lastPeerTrafficAt", diagnostics.lastPeerTrafficAt ?: JSONObject.NULL)
             put("lastError", diagnostics.lastError ?: JSONObject.NULL)

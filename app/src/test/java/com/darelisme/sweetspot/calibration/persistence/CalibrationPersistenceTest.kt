@@ -36,6 +36,21 @@ class CalibrationPersistenceTest {
     }
 
     @Test
+    fun jobRoundTripRetainsAdvancedMode() {
+        val directory = temporaryDirectory()
+        try {
+            val original = CalibrationTestFixtures.newJob().copy(mode = CalibrationJobMode.ADVANCED)
+            val store = CalibrationJobStore(directory)
+
+            store.save(original)
+
+            assertEquals(CalibrationJobMode.ADVANCED, store.load(original.id)?.mode)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun jobRoundTripRetainsCandidateValidationAndRollbackIntent() {
         val directory = temporaryDirectory()
         try {

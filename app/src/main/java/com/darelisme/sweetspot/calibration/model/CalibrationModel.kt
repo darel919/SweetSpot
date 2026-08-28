@@ -81,6 +81,11 @@ enum class CalibrationPosition(val optional: Boolean) {
     BACKWARD(true),
 }
 
+enum class CalibrationJobMode {
+    AUTO,
+    ADVANCED,
+}
+
 enum class CaptureChannel {
     LEFT,
     RIGHT,
@@ -320,6 +325,7 @@ data class CalibrationJob(
     val revision: Long,
     val analyzerRevision: AnalyzerRevision,
     val sweepRevision: SweepRevision,
+    val mode: CalibrationJobMode = CalibrationJobMode.AUTO,
     val phase: CalibrationPhase,
     val ledger: PositionLedger,
     val usability: CalibrationUsability,
@@ -342,12 +348,14 @@ data class CalibrationJob(
             createdAtMs: Long,
             analyzerRevision: AnalyzerRevision,
             sweepRevision: SweepRevision,
+            mode: CalibrationJobMode = CalibrationJobMode.AUTO,
         ): CalibrationJob = CalibrationJob(
             id = id,
             createdAtMs = createdAtMs,
             revision = 0,
             analyzerRevision = analyzerRevision,
             sweepRevision = sweepRevision,
+            mode = mode,
             phase = CalibrationPhase.CenterPreflight,
             ledger = PositionLedger.empty(),
             usability = CalibrationUsability.NotYetUsable,

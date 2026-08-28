@@ -1,7 +1,6 @@
 package com.darelisme.sweetspot.transport
 
 import org.json.JSONObject
-import com.darelisme.sweetspot.calibration.transport.CalibrationCaptureStreamFrame
 
 enum class PeerTransportState {
     IDLE,
@@ -27,6 +26,7 @@ data class PeerTransportDiagnostics(
     val bytesReceived: Long = 0,
     val reconnectCount: Int = 0,
     val captureBufferedBytes: Long = 0,
+    val signalingRoundTripMs: Long? = null,
     val lastControlMessageAt: Long? = null,
     val lastPeerTrafficAt: Long? = null,
     val lastError: String? = null,
@@ -34,9 +34,11 @@ data class PeerTransportDiagnostics(
 
 interface PeerTransport {
     interface CommandHandler {
-        fun onCommand(type: String, payload: JSONObject, replyTo: (String, JSONObject) -> Unit)
+        fun onCommand(sessionId: String, type: String, payload: JSONObject, replyTo: (String, JSONObject) -> Unit)
 
-        fun onCaptureFrame(frame: CalibrationCaptureStreamFrame)
+        fun onCaptureData(sessionId: String, data: ByteArray)
+
+        fun onCaptureDataRejected(sessionId: String, data: ByteArray, reason: String) {}
     }
 
     interface Listener {

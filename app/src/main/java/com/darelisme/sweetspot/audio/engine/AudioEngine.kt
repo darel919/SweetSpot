@@ -13,10 +13,10 @@ interface AudioEngine {
     fun getActivePreset(): Int
     fun getCapabilities(): EngineCapabilities
 
-    fun saveCurrentProfile(name: String)
+    fun saveCurrentProfile(name: String): Boolean
     fun listProfiles(): List<String>
     fun loadProfile(name: String): Boolean
-    fun deleteProfile(name: String)
+    fun deleteProfile(name: String): Boolean
 
     fun beginMeasurementBypass(): MeasurementAudioOverrideResult
     fun endMeasurementBypass(state: MeasurementAudioState): Boolean

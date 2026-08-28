@@ -45,6 +45,27 @@ class CalibrationPlannerAndValidationTest {
     }
 
     @Test
+    fun advancedModeContinuesOptionalScanAfterSufficientSolution() {
+        var job = CalibrationJob.new(
+            id = CalibrationJobId("advanced-job"),
+            createdAtMs = 1L,
+            analyzerRevision = AnalyzerRevision("android-response-v1"),
+            sweepRevision = SweepRevision("android-sweep-v3"),
+            mode = CalibrationJobMode.ADVANCED,
+        )
+        PositionLedger.MANDATORY_POSITIONS.sortedBy { it.ordinal }.forEach { position ->
+            job = machine.reduce(job, CalibrationTestFixtures.accepted(position, CaptureChannel.LEFT)).job
+            job = machine.reduce(job, CalibrationTestFixtures.accepted(position, CaptureChannel.RIGHT)).job
+        }
+        job = machine.reduce(job, CalibrationTestFixtures.accepted(CalibrationPosition.FORWARD, CaptureChannel.LEFT)).job
+        job = machine.reduce(job, CalibrationTestFixtures.accepted(CalibrationPosition.FORWARD, CaptureChannel.RIGHT)).job
+
+        assertEquals(UsabilityGrade.SUFFICIENT, (job.usability as CalibrationUsability.Usable).grade)
+        assertEquals(CalibrationPhase.Refining, job.phase)
+        assertCapture(job, CalibrationPosition.BACKWARD, CaptureChannel.LEFT)
+    }
+
+    @Test
     fun validationFallbackOrderEndsByRestoringThePreviousCalibration() {
         assertEquals(
             CorrectionMode.GENTLE,

@@ -10,6 +10,7 @@ object CalibrationJobJson {
         put("revision", job.revision)
         put("analyzerRevision", job.analyzerRevision.value)
         put("sweepRevision", job.sweepRevision.value)
+        put("mode", job.mode.name.lowercase())
         put("phase", phase(job.phase))
         put("acceptedPositions", JSONArray(job.ledger.completePositions.map { it.position.name.lowercase() }))
         put("excludedPositions", JSONArray(excludedPositions(job)))

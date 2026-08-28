@@ -367,11 +367,12 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     }
 
     @Synchronized
-    override fun saveCurrentProfile(name: String) {
-        if (isAudioStateOverrideActive()) return
+    override fun saveCurrentProfile(name: String): Boolean {
+        if (isAudioStateOverrideActive()) return false
         val levels = IntArray(USER_BANDS) { (userGains[it] * 100).roundToInt() }
-        profileStore.saveNamed(name, isEnabled(), activePreset, levels)
+        if (!profileStore.saveNamed(name, isEnabled(), activePreset, levels)) return false
         save()
+        return true
     }
 
     @Synchronized
@@ -412,9 +413,7 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     }
 
     @Synchronized
-    override fun deleteProfile(name: String) {
-        profileStore.deleteNamed(name)
-    }
+    override fun deleteProfile(name: String): Boolean = profileStore.deleteNamed(name)
 
     @Synchronized
     fun getCalibrationBands(): FloatArray = getEffectiveCalibrationBands()

@@ -33,6 +33,8 @@ The browser owns microphone permission, capture-path metadata, microphone profil
 
 Center, left, and right form the minimum viable dataset. Optional position failures cannot erase that solution. Accepted evidence is persisted before the next action is published, so browser reloads and transport loss do not discard completed work. Raw PCM is temporary by default.
 
+The dashboard offers two TV-owned job modes. Auto stops optional refinement when the mandatory solution is sufficiently trustworthy. Advanced continues the forward and backward room positions when possible, then stages the best verified solution. Neither mode changes correction during the deterministic sweep being measured.
+
 See [`docs/tv-owned-calibration-architecture.md`](docs/tv-owned-calibration-architecture.md) and [`AGENTS.md`](AGENTS.md) for the authoritative boundaries and invariants.
 
 ## Resource constraints

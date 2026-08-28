@@ -14,6 +14,9 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 
+private const val LEGACY_CAPTURE_ATTEMPT_ID = "legacy-attempt"
+private val CAPTURE_ATTEMPT_ID_PATTERN = Regex("^[A-Za-z0-9_-]{1,128}$")
+
 sealed interface CalibrationEngineResult {
     val job: CalibrationJob?
 
@@ -28,7 +31,8 @@ sealed interface CalibrationEngineResult {
 
 interface CalibrationEngineListener {
     fun onJobChanged(job: CalibrationJob) {}
-    fun onCaptureFinished(jobId: CalibrationJobId, captureId: CaptureId) {}
+    fun onCaptureStarted(jobId: CalibrationJobId, captureId: CaptureId, captureAttemptId: String) {}
+    fun onCaptureFinished(jobId: CalibrationJobId, captureId: CaptureId, captureAttemptId: String) {}
 }
 
 object NoopCalibrationEngineListener : CalibrationEngineListener
@@ -56,11 +60,14 @@ class CalibrationEngine(
     private var closed = false
     @Volatile
     private var job: CalibrationJob? = null
-    private var activePlaybackCapture: CaptureId? = null
+    private data class ActivePlayback(val captureId: CaptureId, val captureAttemptId: String)
+
+    private var activePlayback: ActivePlayback? = null
+    private var captureFence: ActivePlayback? = null
     private val startupError: String?
     private val stateMachine = CalibrationStateMachine()
     private val spatialCorrection = SpatialCorrection()
-    private val captureReader = CalibrationCaptureReader(nowMs, metadataParser)
+    private val captureReader = CalibrationCaptureReader(metadataParser)
 
     init {
         startupError = try {
@@ -83,7 +90,7 @@ class CalibrationEngine(
 
     fun currentJob(): CalibrationJob? = job
 
-    fun startNewJob(): CalibrationEngineResult = runOnWorker {
+    fun startNewJob(mode: CalibrationJobMode = CalibrationJobMode.AUTO): CalibrationEngineResult = runOnWorker {
         if (startupError != null) return@runOnWorker rejected("persisted_state_invalid", startupError)
         val current = job
         if (current != null && !terminal(current)) {
@@ -105,6 +112,7 @@ class CalibrationEngine(
             createdAtMs = nowMs(),
             analyzerRevision = analyzer.revision,
             sweepRevision = SweepRevision(sweep.sweepRevision),
+            mode = mode,
         )
         persist(created)
         CalibrationEngineResult.Updated(created)
@@ -117,62 +125,217 @@ class CalibrationEngine(
         else CalibrationEngineResult.Updated(recover(recoverStoredCapture(current)))
     }
 
-    fun captureReady(jobId: CalibrationJobId, captureId: CaptureId): CalibrationEngineResult = runOnWorker {
+    fun captureReady(
+        jobId: CalibrationJobId,
+        captureId: CaptureId,
+        captureAttemptId: String = LEGACY_CAPTURE_ATTEMPT_ID,
+    ): CalibrationEngineResult = runOnWorker {
         val current = requireJob(jobId) ?: return@runOnWorker rejected("no_job", "No matching calibration job")
-        if (activePlaybackCapture == captureId) return@runOnWorker CalibrationEngineResult.Updated(current)
+        if (!validCaptureAttemptId(captureAttemptId)) {
+            return@runOnWorker rejected("invalid_capture_attempt", "The capture attempt identity is invalid")
+        }
+        val active = activePlayback
+        if (active != null) {
+            if (active.captureId == captureId && active.captureAttemptId == captureAttemptId) {
+                return@runOnWorker CalibrationEngineResult.Updated(current)
+            }
+            if (active.captureId == captureId) {
+                val request = captureRequest(current.nextAction)
+                    ?: return@runOnWorker rejected("stale_action", "The TV is not waiting for this capture")
+                when (val cancelled = playback.cancel(request)) {
+                    is CalibrationAudioResult.Failure -> {
+                        activePlayback = null
+                        captureFence = null
+                        return@runOnWorker if (cancelled.retryable) {
+                            rejected("capture_retry_unavailable", cancelled.message)
+                        } else {
+                            failPlayback(current, cancelled)
+                        }
+                    }
+                    is CalibrationAudioResult.Success -> Unit
+                }
+                activePlayback = null
+            }
+        }
+        if (captureFence == ActivePlayback(captureId, captureAttemptId)) {
+            return@runOnWorker CalibrationEngineResult.Updated(current)
+        }
         val action = current.nextAction
         val result = when (action) {
             is CalibrationAction.Capture -> {
                 if (action.request.captureId != captureId) {
                     return@runOnWorker rejected("stale_action", "Capture action is no longer active")
                 }
-                activePlaybackCapture = captureId
-                playback.start(action.request) { listener.onCaptureFinished(jobId, captureId) }
+                activePlayback = ActivePlayback(captureId, captureAttemptId)
+                captureFence = activePlayback
+                startPlayback(
+                    jobId,
+                    captureId,
+                    captureAttemptId,
+                ) { onFinished, onFailure ->
+                    playback.startWithFailure(
+                        action.request,
+                        onFinished,
+                        onFailure,
+                    )
+                }
             }
             is CalibrationAction.Validate -> {
                 if (action.captureId != captureId) {
                     return@runOnWorker rejected("stale_action", "Validation action is no longer active")
                 }
-                activePlaybackCapture = captureId
-                playback.startValidation(action) { listener.onCaptureFinished(jobId, captureId) }
+                activePlayback = ActivePlayback(captureId, captureAttemptId)
+                captureFence = activePlayback
+                startPlayback(
+                    jobId,
+                    captureId,
+                    captureAttemptId,
+                ) { onFinished, onFailure ->
+                    playback.startValidationWithFailure(
+                        action,
+                        onFinished,
+                        onFailure,
+                    )
+                }
             }
             else -> return@runOnWorker rejected("stale_action", "The TV is not waiting for this capture")
         }
         when (result) {
-            is CalibrationAudioResult.Success -> CalibrationEngineResult.Updated(current)
-            is CalibrationAudioResult.Failure -> {
-                activePlaybackCapture = null
-                when {
-                    action is CalibrationAction.Validate -> {
-                        val transition = stateMachine.reduce(
-                            current,
-                            CalibrationEvent.ValidationClassified(ValidationOutcome.INCONCLUSIVE_CAPTURE),
-                        )
-                        commit(transition)
-                        CalibrationEngineResult.Updated(transition.job)
-                    }
-                    action is CalibrationAction.Capture -> {
-                        val transition = stateMachine.reduce(
-                            current,
-                            CalibrationEvent.CaptureRejected(action.request, CaptureRejectionReason.PLAYBACK_FAILED),
-                        )
-                        autoStageWhenReady(commit(transition))
-                    }
-                    else -> rejected("playback_failed", result.message)
-                }
+            is CalibrationAudioResult.Success -> {
+                CalibrationEngineResult.Updated(current)
             }
+            is CalibrationAudioResult.Failure -> handlePlaybackFailure(current, action, result)
         }
     }
 
-    fun cancelCapture(jobId: CalibrationJobId, captureId: CaptureId): CalibrationEngineResult = runOnWorker {
+    private fun startPlayback(
+        jobId: CalibrationJobId,
+        captureId: CaptureId,
+        captureAttemptId: String,
+        start: (
+            onFinished: () -> Unit,
+            onFailure: (CalibrationAudioResult.Failure) -> Unit,
+        ) -> CalibrationAudioResult,
+    ): CalibrationAudioResult {
+        var returned = false
+        var finishedBeforeReturn = false
+        var failureBeforeReturn: CalibrationAudioResult.Failure? = null
+        val result = start(
+            {
+                if (returned) playbackFinished(jobId, captureId, captureAttemptId)
+                else finishedBeforeReturn = true
+            },
+            { failure ->
+                if (returned) handleAsyncPlaybackFailure(jobId, captureId, captureAttemptId, failure)
+                else failureBeforeReturn = failure
+            },
+        )
+        returned = true
+        if (result is CalibrationAudioResult.Success) {
+            listener.onCaptureStarted(jobId, captureId, captureAttemptId)
+            failureBeforeReturn?.let { handleAsyncPlaybackFailure(jobId, captureId, captureAttemptId, it) }
+            if (failureBeforeReturn == null && finishedBeforeReturn) {
+                playbackFinished(jobId, captureId, captureAttemptId)
+            }
+        }
+        return result
+    }
+
+    private fun playbackFinished(jobId: CalibrationJobId, captureId: CaptureId, captureAttemptId: String) {
+        try {
+            runOnWorker {
+                if (activePlayback != ActivePlayback(captureId, captureAttemptId)) return@runOnWorker
+                activePlayback = null
+                listener.onCaptureFinished(jobId, captureId, captureAttemptId)
+            }
+        } catch (_: Throwable) {
+            // A service shutdown may race the playback completion callback.
+        }
+    }
+
+    private fun handleAsyncPlaybackFailure(
+        jobId: CalibrationJobId,
+        captureId: CaptureId,
+        captureAttemptId: String,
+        failure: CalibrationAudioResult.Failure,
+    ) {
+        try {
+            runOnWorker {
+                val current = job ?: return@runOnWorker
+                if (current.id != jobId || activePlayback != ActivePlayback(captureId, captureAttemptId)) return@runOnWorker
+                when (val action = current.nextAction) {
+                    is CalibrationAction.Capture -> if (action.request.captureId == captureId) {
+                        handlePlaybackFailure(current, action, failure)
+                    }
+                    is CalibrationAction.Validate -> if (action.captureId == captureId) {
+                        handlePlaybackFailure(current, action, failure)
+                    }
+                    else -> activePlayback = null
+                }
+            }
+        } catch (_: Throwable) {
+            // A service shutdown may race an asynchronous playback callback.
+        }
+    }
+
+    private fun handlePlaybackFailure(
+        current: CalibrationJob,
+        action: CalibrationAction,
+        failure: CalibrationAudioResult.Failure,
+    ): CalibrationEngineResult {
+        activePlayback = null
+        captureFence = null
+        if (!failure.retryable) {
+            return failPlayback(current, failure)
+        }
+        return when (action) {
+            is CalibrationAction.Validate -> {
+                val transition = stateMachine.reduce(
+                    current.copy(lastError = CalibrationJobError(failure.code, failure.message)),
+                    CalibrationEvent.ValidationClassified(ValidationOutcome.INCONCLUSIVE_CAPTURE),
+                )
+                CalibrationEngineResult.Updated(commit(transition))
+            }
+            is CalibrationAction.Capture -> {
+                val transition = stateMachine.reduce(
+                    current.copy(lastError = CalibrationJobError(failure.code, failure.message)),
+                    CalibrationEvent.CaptureRejected(action.request, CaptureRejectionReason.PLAYBACK_FAILED),
+                )
+                autoStageWhenReady(commit(transition))
+            }
+            else -> rejected(failure.code, failure.message)
+        }
+    }
+
+    fun cancelCapture(
+        jobId: CalibrationJobId,
+        captureId: CaptureId,
+        captureAttemptId: String? = null,
+    ): CalibrationEngineResult = runOnWorker {
         val current = requireJob(jobId) ?: return@runOnWorker rejected("no_job", "No matching calibration job")
         val request = captureRequest(current.nextAction)
             ?: return@runOnWorker rejected("stale_action", "The TV is not waiting for this capture")
         if (request.captureId != captureId) return@runOnWorker rejected("stale_action", "Capture action is no longer active")
-        activePlaybackCapture = null
+        val active = activePlayback
+        if (captureAttemptId != null && active != null && active.captureAttemptId != captureAttemptId) {
+            return@runOnWorker rejected("stale_capture_attempt", "The capture attempt is no longer active")
+        }
+        if (captureAttemptId != null) {
+            val expected = active ?: captureFence
+            if (expected != null && (expected.captureId != captureId || expected.captureAttemptId != captureAttemptId)) {
+                return@runOnWorker rejected("stale_capture_attempt", "The capture attempt is no longer active")
+            }
+        }
         when (val result = playback.cancel(request)) {
-            is CalibrationAudioResult.Success -> CalibrationEngineResult.Updated(current)
-            is CalibrationAudioResult.Failure -> rejected("capture_cancel_failed", result.message)
+            is CalibrationAudioResult.Success -> {
+                activePlayback = null
+                captureFence = null
+                CalibrationEngineResult.Updated(current)
+            }
+            is CalibrationAudioResult.Failure -> {
+                activePlayback = null
+                if (result.retryable) rejected("capture_cancel_failed", result.message) else failPlayback(current, result)
+            }
         }
     }
 
@@ -185,7 +348,11 @@ class CalibrationEngine(
         metadataJson: String,
         pcm: InputStream,
         pcmBytes: Long,
+        captureAttemptId: String = LEGACY_CAPTURE_ATTEMPT_ID,
     ): CalibrationEngineResult = runOnWorker {
+        if (!validCaptureAttemptId(captureAttemptId)) {
+            return@runOnWorker rejected("invalid_capture_attempt", "The capture attempt identity is invalid")
+        }
         if (pcmBytes <= 0L || pcmBytes > Int.MAX_VALUE) {
             return@runOnWorker rejected("invalid_pcm_stream", "Calibration capture size is invalid")
         }
@@ -214,7 +381,15 @@ class CalibrationEngine(
         if (!metadataMatchesAction(metadata, captureAction, validationAction)) {
             return@runOnWorker rejected("stale_action", "Capture metadata does not match the TV action")
         }
-        if (activePlaybackCapture == metadata.captureId) activePlaybackCapture = null
+        if (activePlayback?.captureId == metadata.captureId) {
+            return@runOnWorker rejected("capture_in_progress", "The TV sweep has not finished yet")
+        }
+        val expectedCapture = captureFence
+        if (expectedCapture?.captureId != metadata.captureId
+            || expectedCapture.captureAttemptId != captureAttemptId
+        ) {
+            return@runOnWorker rejected("stale_capture_attempt", "The capture does not belong to the current TV sweep")
+        }
         val stored = try {
             captureStore.store(metadata, pcm)
         } catch (error: CaptureStoreException) {
@@ -231,7 +406,9 @@ class CalibrationEngine(
         } catch (error: IllegalArgumentException) {
             return@runOnWorker rejected("capture_store_failed", error.message ?: "Calibration capture could not be read")
         }
-        processStoredCapture(current, metadata, verifiedSamples, captureAction, validationAction)
+        val result = processStoredCapture(current, metadata, verifiedSamples, captureAction, validationAction)
+        captureFence = null
+        result
     }
 
     fun finishWithBest(jobId: CalibrationJobId): CalibrationEngineResult = runOnWorker {
@@ -243,10 +420,19 @@ class CalibrationEngine(
         val current = requireJob(jobId) ?: return@runOnWorker rejected("no_job", "No matching calibration job")
         val request = (current.nextAction as? CalibrationAction.Capture)?.request
         if (request == null || !request.optional) return@runOnWorker finishWithBest(jobId)
-        activePlaybackCapture = null
         when (val cancelled = playback.cancel(request)) {
-            is CalibrationAudioResult.Failure -> return@runOnWorker rejected("capture_cancel_failed", cancelled.message)
-            is CalibrationAudioResult.Success -> Unit
+            is CalibrationAudioResult.Failure -> {
+                activePlayback = null
+                captureFence = null
+                if (cancelled.retryable) {
+                    return@runOnWorker rejected("capture_cancel_failed", cancelled.message)
+                }
+                return@runOnWorker failPlayback(current, cancelled)
+            }
+            is CalibrationAudioResult.Success -> {
+                activePlayback = null
+                captureFence = null
+            }
         }
         stageBest(current)
     }
@@ -255,14 +441,25 @@ class CalibrationEngine(
         val current = requireJob(jobId) ?: return@runOnWorker rejected("no_job", "No matching calibration job")
         if (terminal(current)) return@runOnWorker CalibrationEngineResult.Updated(current)
         val activeRequest = captureRequest(current.nextAction)
-            ?.takeIf { activePlaybackCapture == it.captureId }
+            ?.takeIf { activePlayback?.captureId == it.captureId }
         if (activeRequest != null) {
             when (val cancelled = playback.cancel(activeRequest)) {
-                is CalibrationAudioResult.Failure -> return@runOnWorker rejected("capture_cancel_failed", cancelled.message)
-                is CalibrationAudioResult.Success -> Unit
+                is CalibrationAudioResult.Failure -> {
+                    activePlayback = null
+                    captureFence = null
+                    if (cancelled.retryable) {
+                        return@runOnWorker rejected("capture_cancel_failed", cancelled.message)
+                    }
+                    return@runOnWorker failPlayback(current, cancelled)
+                }
+                is CalibrationAudioResult.Success -> {
+                    activePlayback = null
+                    captureFence = null
+                }
             }
         }
-        activePlaybackCapture = null
+        activePlayback = null
+        captureFence = null
         val pendingCandidate = dsp.pendingCandidateId()
         val candidateToRollback = current.candidate?.id ?: pendingCandidate
         if (candidateToRollback != null && !rollbackIfNeeded(candidateToRollback)) {
@@ -280,13 +477,14 @@ class CalibrationEngine(
     override fun close() {
         if (closed) return
         val current = job
-        val activeCapture = activePlaybackCapture
+        val activeCapture = activePlayback
         if (current != null && activeCapture != null) {
-            captureRequest(current.nextAction)?.takeIf { it.captureId == activeCapture }?.let { request ->
+            captureRequest(current.nextAction)?.takeIf { it.captureId == activeCapture.captureId }?.let { request ->
                 try { playback.cancel(request) } catch (_: Throwable) {}
             }
         }
-        activePlaybackCapture = null
+        activePlayback = null
+        captureFence = null
         closed = true
         executor.shutdownNow()
     }
@@ -324,7 +522,7 @@ class CalibrationEngine(
         if (!metadataMatchesAction(metadata, captureAction, validationAction)) {
             return rejected("stale_action", "Capture metadata does not match the TV action")
         }
-        if (activePlaybackCapture == metadata.captureId) activePlaybackCapture = null
+        if (activePlayback?.captureId == metadata.captureId) activePlayback = null
         val profile = try {
             metadata.microphoneProfile
                 .takeIf(CalibrationMicrophoneProfilePayload::isCorrectionEligible)
@@ -717,7 +915,7 @@ class CalibrationEngine(
                 executePending(updated)
             }
             ValidationOutcome.INCONCLUSIVE_CAPTURE -> {
-                val transition = stateMachine.reduce(current, CalibrationEvent.ValidationClassified(ValidationOutcome.DSP_ERROR))
+                val transition = stateMachine.reduce(current, CalibrationEvent.ValidationClassified(outcome))
                 val updated = commit(transition)
                 executePending(updated)
             }
@@ -825,6 +1023,20 @@ class CalibrationEngine(
     private fun rejected(code: String, message: String): CalibrationEngineResult.Rejected =
         CalibrationEngineResult.Rejected(job, code, message)
 
+    private fun failPlayback(current: CalibrationJob, failure: CalibrationAudioResult.Failure): CalibrationEngineResult {
+        val failed = current.copy(
+            revision = current.revision + 1,
+            phase = CalibrationPhase.Failed(failure.message),
+            nextAction = null,
+            pendingEffect = null,
+            lastError = CalibrationJobError(failure.code, failure.message),
+        )
+        activePlayback = null
+        captureFence = null
+        persist(failed)
+        return CalibrationEngineResult.Updated(failed)
+    }
+
     private fun <T> runOnWorker(block: () -> T): T {
         check(!closed) { "Calibration engine is closed" }
         if (workerThread.get() == true) return block()
@@ -847,6 +1059,7 @@ class CalibrationEngine(
             metadata.channel == capture.request.channel
         validation != null -> metadata.captureId == validation.captureId &&
             metadata.position == validation.position &&
+            metadata.attemptIndex == validation.attemptIndex &&
             metadata.channel == CaptureChannel.BOTH
         else -> false
     }
@@ -892,4 +1105,6 @@ class CalibrationEngine(
         is CalibrationPhase.Failed -> true
         else -> false
     }
+
+    private fun validCaptureAttemptId(value: String): Boolean = CAPTURE_ATTEMPT_ID_PATTERN.matches(value)
 }

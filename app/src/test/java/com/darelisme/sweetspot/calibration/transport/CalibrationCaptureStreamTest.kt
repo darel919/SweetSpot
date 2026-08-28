@@ -9,8 +9,10 @@ import java.nio.charset.StandardCharsets
 import java.util.Base64
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CalibrationCaptureStreamTest {
@@ -100,6 +102,47 @@ class CalibrationCaptureStreamTest {
     }
 
     @Test
+    fun finalizedCaptureRetriesAreIdempotent() {
+        withTempDirectory { root ->
+            val receiver = CalibrationCaptureStreamReceiver(root)
+            val pcm = floats(0.25f, -0.5f)
+            val hash = pcm.sha256()
+            val beginMetadata = "{\"jobId\":\"job-1\",\"captureId\":\"capture-1\"}"
+            val endMetadata = "{\"jobId\":\"job-1\",\"captureId\":\"capture-1\",\"sampleCount\":2,\"byteCount\":8,\"contentSha256\":\"$hash\"}"
+            val begin = CalibrationCaptureStreamFrame.Begin(
+                sessionId = "session-1",
+                captureId = "capture-1",
+                metadataJson = beginMetadata,
+                expectedSampleCount = null,
+                expectedByteCount = null,
+                captureAttemptId = "attempt-1",
+            )
+            receiver.accept(begin)
+            receiver.accept(CalibrationCaptureStreamFrame.Chunk("session-1", "capture-1", 0, 2, pcm, "attempt-1"))
+            val end = CalibrationCaptureStreamFrame.End(
+                sessionId = "session-1",
+                captureId = "capture-1",
+                chunkCount = 1,
+                finalSampleCount = 2,
+                finalByteCount = 8,
+                finalSha256 = hash,
+                metadataJson = endMetadata,
+                captureAttemptId = "attempt-1",
+            )
+            val completed = receiver.accept(end) ?: error("expected completed capture")
+            receiver.delete(completed)
+
+            val duplicateBegin = receiver.accept(begin) ?: error("expected duplicate capture receipt")
+            assertTrue(duplicateBegin.duplicate)
+            assertEquals(hash, duplicateBegin.sha256)
+            assertNull(receiver.accept(CalibrationCaptureStreamFrame.Chunk("session-1", "capture-1", 0, 2, pcm, "attempt-1")))
+            val duplicateEnd = receiver.accept(end) ?: error("expected duplicate capture receipt")
+            assertTrue(duplicateEnd.duplicate)
+            assertEquals(hash, duplicateEnd.sha256)
+        }
+    }
+
+    @Test
     fun receiverRejectsAConflictingDuplicateChunk() {
         withTempDirectory { root ->
             val receiver = CalibrationCaptureStreamReceiver(root)
@@ -127,6 +170,83 @@ class CalibrationCaptureStreamTest {
                     floats(-0.25f),
                 ))
             }
+            receiver.cancel()
+            assertEquals(0, root.listFiles()?.size ?: 0)
+        }
+    }
+
+    @Test
+    fun staleSessionCancellationCannotDeleteTheCurrentStream() {
+        withTempDirectory { root ->
+            val receiver = CalibrationCaptureStreamReceiver(root)
+            receiver.accept(CalibrationCaptureStreamFrame.Begin(
+                "session-current",
+                "capture-current",
+                "{\"jobId\":\"job-1\",\"captureId\":\"capture-current\"}",
+                null,
+                null,
+            ))
+
+            assertFalse(receiver.cancel("session-old", "capture-current"))
+            assertNull(receiver.accept(CalibrationCaptureStreamFrame.Chunk(
+                "session-current",
+                "capture-current",
+                0,
+                1,
+                floats(0.25f),
+            )))
+            receiver.cancel()
+        }
+    }
+
+    @Test
+    fun newAttemptReplacesAStalePartialForTheSameCapture() {
+        withTempDirectory { root ->
+            val receiver = CalibrationCaptureStreamReceiver(root)
+            val metadata = "{\"jobId\":\"job-1\",\"captureId\":\"capture-1\"}"
+            receiver.accept(CalibrationCaptureStreamFrame.Begin(
+                sessionId = "session-1",
+                captureId = "capture-1",
+                metadataJson = metadata,
+                expectedSampleCount = null,
+                expectedByteCount = null,
+                captureAttemptId = "attempt-old",
+            ))
+            receiver.accept(CalibrationCaptureStreamFrame.Chunk(
+                sessionId = "session-1",
+                captureId = "capture-1",
+                sequence = 0,
+                sampleCount = 1,
+                pcm = floats(0.25f),
+                captureAttemptId = "attempt-old",
+            ))
+
+            assertNull(receiver.accept(CalibrationCaptureStreamFrame.Begin(
+                sessionId = "session-1",
+                captureId = "capture-1",
+                metadataJson = metadata,
+                expectedSampleCount = null,
+                expectedByteCount = null,
+                captureAttemptId = "attempt-new",
+            )))
+            assertThrows(java.io.IOException::class.java) {
+                receiver.accept(CalibrationCaptureStreamFrame.Chunk(
+                    sessionId = "session-1",
+                    captureId = "capture-1",
+                    sequence = 1,
+                    sampleCount = 1,
+                    pcm = floats(0.5f),
+                    captureAttemptId = "attempt-old",
+                ))
+            }
+            assertNull(receiver.accept(CalibrationCaptureStreamFrame.Chunk(
+                sessionId = "session-1",
+                captureId = "capture-1",
+                sequence = 0,
+                sampleCount = 1,
+                pcm = floats(0.5f),
+                captureAttemptId = "attempt-new",
+            )))
             receiver.cancel()
             assertEquals(0, root.listFiles()?.size ?: 0)
         }

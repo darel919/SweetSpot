@@ -2,11 +2,12 @@
 
 ## Definition of done
 
-The generated scenario accepts center, left, right, and forward, rejects backward twice, preserves the four-position best solution, stages it, validates it at center, and survives reload after each milestone. A worse validation rolls back and asks only for another center capture with a gentler solution. Android tests and `assembleDebug` pass. Web tests, typecheck, and static generation pass.
+Auto Room Calibration accepts the mandatory center, left, and right positions, may stop once the minimum trustworthy solution is available, and preserves that solution through optional-position failures. Advanced Room Calibration continues through the optional forward and backward positions when they are usable, without mutating the EQ during a deterministic sweep. Both modes stage and validate the TV-owned best solution, survive browser reload and transport loss, and retain accepted evidence. A worse validation rolls back and asks only for another center capture with a gentler solution. Android tests and builds pass. Web tests, typecheck, lint, protocol/transport checks, and static generation pass. Hardware and cloud-independence acceptance remain separate evidence requirements.
 
 ## Global constraints
 
 - Android owns every calibration decision and persistent job field.
+- `auto` and `advanced` are persisted job modes. Auto may stop after a sufficient mandatory solution; advanced continues optional room positions before staging.
 - Browser code records and uploads PCM but cannot accept evidence, optimize, validate, or finalize a candidate.
 - Minimum viability and the best solution remain monotonic after three complete required positions.
 - Only complete accepted physical positions enter solutions.

@@ -56,17 +56,17 @@ class ProfileStore private constructor(
         if (isEnabled() != enabled) editor.commit() else editor.apply()
     }
 
-    fun saveNamed(name: String, enabled: Boolean, preset: Int, levels: IntArray?) {
+    fun saveNamed(name: String, enabled: Boolean, preset: Int, levels: IntArray?): Boolean {
+        if (!validProfileName(name)) return false
         val key = profileKey(name)
-        prefs.edit().apply {
+        return prefs.edit().apply {
             putBoolean(key + SUFFIX_ENABLED, enabled)
             putInt(key + SUFFIX_PRESET, preset)
             putString(key + SUFFIX_LEVELS, levels?.joinToString(","))
             val names = listNames().toMutableSet()
             names.add(name)
             putStringSet(KEY_NAMES, names)
-            apply()
-        }
+        }.commit()
     }
 
     fun loadNamed(name: String): SavedProfile? {
@@ -84,17 +84,17 @@ class ProfileStore private constructor(
     fun listNames(): List<String> =
         prefs.getStringSet(KEY_NAMES, emptySet())?.toList()?.sorted() ?: emptyList()
 
-    fun deleteNamed(name: String) {
+    fun deleteNamed(name: String): Boolean {
+        if (!validProfileName(name)) return false
         val key = profileKey(name)
-        prefs.edit().apply {
+        return prefs.edit().apply {
             remove(key + SUFFIX_ENABLED)
             remove(key + SUFFIX_PRESET)
             remove(key + SUFFIX_LEVELS)
             val names = listNames().toMutableList()
             names.remove(name)
             putStringSet(KEY_NAMES, names.toSet())
-            apply()
-        }
+        }.commit()
     }
 
     fun loadCalibration(): FloatArray? = loadCalibrationArray(KEY_CALIBRATION)
@@ -320,6 +320,11 @@ class ProfileStore private constructor(
     }
 
     private fun profileKey(name: String) = "p_$name"
+
+    private fun validProfileName(name: String): Boolean = name.isNotBlank()
+        && name.length <= 128
+        && name.toByteArray(Charsets.UTF_8).size <= 128
+        && name.none(Char::isISOControl)
 
     companion object {
         private const val PREFS_NAME = "sweetspot"

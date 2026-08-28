@@ -22,8 +22,10 @@ internal interface SweetSpotPeerCommandHost {
     fun deviceInfoJson(): JSONObject
     fun transportDiagnosticsJson(): JSONObject
     fun replyCalibrationJobResult(result: CalibrationEngineResult?, replyTo: (String, JSONObject) -> Unit)
-    fun publishCalibrationCaptureResult(result: CalibrationEngineResult, capture: CalibrationCaptureStreamReceiver.Completed)
-    fun publishCalibrationCaptureRejection(captureId: String, reason: String)
+    fun publishCalibrationCaptureResult(result: CalibrationEngineResult?, capture: CalibrationCaptureStreamReceiver.Completed)
+    fun publishCalibrationCaptureStarted(jobId: String, captureId: String, captureAttemptId: String)
+    fun publishCalibrationCaptureWindow(captureId: String, captureAttemptId: String, nextSequence: Long, windowSize: Int)
+    fun publishCalibrationCaptureRejection(captureId: String, captureAttemptId: String, reason: String)
     fun dpEq(): DynamicsProcessingEq?
     fun applyPresetWithFeedback(preset: Int): Boolean
     fun loadProfileWithFeedback(name: String): Boolean

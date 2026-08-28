@@ -75,9 +75,11 @@ class PairingSessionManager {
         activePeerGeneration == null && (session?.let { now >= it.expiresAt } ?: true)
 
     @Synchronized
-    fun markPeerConnected(generation: String) {
+    fun markPeerConnected(generation: String): Boolean {
         require(generation.isNotBlank())
+        if (activePeerGeneration != null && activePeerGeneration != generation) return false
         activePeerGeneration = generation
+        return true
     }
 
     @Synchronized

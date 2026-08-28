@@ -1,4 +1,4 @@
 package com.darelisme.sweetspot
 
-internal fun shouldShowPairingQr(pairCode: String?, relayState: String): Boolean =
-    !pairCode.isNullOrBlank() && relayState == OverlayController.RELAY_WAITING
+internal fun shouldShowPairingQr(pairCode: String?, connectionState: String): Boolean =
+    !pairCode.isNullOrBlank() && connectionState == OverlayController.CONNECTION_WAITING

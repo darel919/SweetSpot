@@ -1,137 +1,85 @@
 # SweetSpot
 
-SweetSpot is a lightweight native Android TV application for tuning the TV's global audio output.
-
-The project is currently being developed for a resource-constrained TCL Android TV and is designed to run continuously with minimal CPU and memory overhead. Calibration is a short-lived, TV-owned job: it may temporarily allocate PCM, FFT, and optimizer buffers, then releases them and returns to the lean always-on runtime.
-
-## Status
-
-The current build targets Android global audio session `0` and the TV's
-system-wide audio effect chain. Hardware validation is separate from the source
-tests and build checks listed below.
+SweetSpot is a lightweight native Android TV application for system-wide audio tuning. It targets resource-constrained TCL Android TV hardware and is designed to stay active with low CPU, memory, and thread use.
 
 ## Architecture
 
-SweetSpot is intentionally designed without Flutter or Compose.
-
-Android is the DSP/device backend. The browser frontend lives in the separate [sweetspot-web](https://github.com/darel919/sweetspot-web) project (hosted at https://sweetspot.darelisme.my.id). It owns dashboard presentation, EQ controls, profile presentation, diagnostics, and the remote microphone surface. The Android TV owns the calibration job, acoustic analysis, position ledger, confidence, correction, candidate transaction, validation, persistence, and recovery.
+The Android TV owns the audio engine and all calibration decisions. The separate [sweetspot-web](https://github.com/darel919/sweetspot-web) dashboard is a secure HTTPS remote microphone and control surface.
 
 ```text
-Android TV SweetSpot
-    |
-    v
-SweetSpotService
-    |
-    +-- AudioEngine
-    |     |
-    |     +-- global audio session 0 DSP (DynamicsProcessing)
-    |     +-- 64-band calibration state
-    |     +-- 24-band user EQ
-    |     +-- profiles
-    |
-    +-- local HTTP API server (API/debugging interface only)
-    +-- native TV controls / status / pairing overlay
-    +-- TV-owned CalibrationEngine
-          +-- binary PCM capture store
-          +-- marker, clock, ESS, impulse, response analysis
-          +-- physical-position ledger and spatial confidence
-          +-- best-so-far optimizer and candidate validation
+phone Safari  -- WebRTC DataChannels, direct when possible --  Android TV
+     |                                                       |
+ HTTPS signaling bootstrap only                         DSP + calibration
+     |                                                       |
+ Cloudflare Worker: static dashboard and short-lived SDP/ICE signaling
 ```
 
-Normal user control comes through the hosted dashboard at https://sweetspot.darelisme.my.id or the small native TV overlay. The TV's local HTTP server exposes a JSON API for device control and debugging; it does not host any browser UI. Pairing and control use the current WebSocket relay contract.
+The direct peer has two ordered, reliable DataChannels:
 
-## Calibration ownership and behavior
+- `control` carries commands, replies, TV state, calibration actions, diagnostics, cancellation, and capability negotiation.
+- `capture` carries bounded binary Float32 mono PCM chunks with explicit backpressure, counts, and SHA-256 verification.
 
-The TV issues every calibration job ID, capture action, position, and state
-revision. The browser opens the phone microphone only when requested, sends a
-binary Float32 mono PCM frame with actual capture metadata and a SHA-256 hash,
-and renders the returned TV state. It never accepts a marker, position,
-correction, convergence result, or validation result.
+Cloudflare is not in the active calibration or EQ data path after the channels open. It hosts the secure dashboard and brokers short-lived signaling only. The local Android HTTP server remains available for authenticated diagnostics, local API testing, and ADB workflows; it is not the browser control path.
 
-Microphone profiles are supplied by the capture device through the web client.
-Kotlin does not contain a growing profile registry. The complete versioned
-profile is sent with each capture, validated on the TV, and is correction
-eligible only when its capture path is marked `validated`.
+The native WebRTC peer factory is initialized lazily when a remote dashboard session needs it. The app creates no WebRTC media tracks, keeps capture data in bounded temporary files, and releases peer, factory, and native session resources when the session ends.
 
-Center setup is qualified before the walkaround. Center, left, and right are
-the minimum viable dataset; the TV persists a best solution immediately after
-they pass. Forward and backward are optional refinements. A failed optional
-measurement is excluded locally and cannot erase the usable solution already
-earned. Spatial disagreement reduces correction strength per band, and a
-worse validation rolls back and tries gentler/restricted solutions from the
-same saved room data instead of forcing another walkaround.
+The dashboard's collapsed developer details can request a redacted TV transport snapshot covering peer state, ICE state, traffic, capture buffering, reconnects, and the latest transport error.
 
-Raw PCM is temporary by default and is deleted after terminal success. Compact
-accepted evidence, analyzer/sweep revisions, confidence, validation history,
-and final correction state are retained so a browser reload or TV process
-restart can resume safely.
+## TV-owned calibration
 
-See [`docs/tv-owned-calibration-architecture.md`](docs/tv-owned-calibration-architecture.md)
-for the state model and hard invariants.
+The TV issues job IDs, actions, revisions, and capture timing. It owns microphone metadata validation, PCM integrity checks, acoustic analysis, accepted evidence, the position ledger, confidence, correction optimization, candidate staging, validation, rollback, persistence, and recovery.
 
-## Design Constraints
+The browser owns microphone permission, capture-path metadata, microphone profile selection, streamed PCM upload, remote UI, and cancellation requests. It never declares a marker, position, correction, convergence result, or validation result accepted.
 
-SweetSpot should remain:
+Center, left, and right form the minimum viable dataset. Optional position failures cannot erase that solution. Accepted evidence is persisted before the next action is published, so browser reloads and transport loss do not discard completed work. Raw PCM is temporary by default.
 
-- native Kotlin
-- lightweight
-- low-RAM
-- low-CPU
-- usable on 32-bit ARM Android TV hardware
-- independent of a large TV-side UI; the native overlay remains deliberately small and framework-free
+See [`docs/tv-owned-calibration-architecture.md`](docs/tv-owned-calibration-architecture.md) and [`AGENTS.md`](AGENTS.md) for the authoritative boundaries and invariants.
 
-Avoid adding large frameworks unless necessary. Do not bundle or serve a web dashboard from the APK.
+## Resource constraints
 
-## Build
+- Native Kotlin only. No Flutter, Compose, WebView, or large TV UI framework.
+- Global DSP stays on Android audio session `0`.
+- WebRTC has no audio or video tracks and no idle session allocation.
+- Capture chunks and partial files are bounded; successful temporary PCM is removed according to the existing retention policy.
+- Release builds keep R8/minification enabled. ABI and APK-size changes must be measured before release claims.
 
-Requirements:
+The current measured unsigned release APK is 5,119,505 bytes with only `armeabi-v7a` WebRTC native code, versus the 665,359-byte pre-WebRTC baseline. PSS, heap, CPU, and post-disconnect recovery still require measurements on the target TCL hardware.
 
-- macOS development environment
-- Android SDK
-- JDK 17
-- Gradle wrapper included with the project
+## Build and install
 
-Build the debug APK:
+Requirements: Android SDK, JDK 17, and the included Gradle wrapper.
 
 ```bash
+./gradlew test
 ./gradlew assembleDebug
+./gradlew assembleRelease
 ```
 
-APK output:
+The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`. Release output is written to `app/build/outputs/apk/release/`.
 
-```text
-app/build/outputs/apk/debug/app-debug.apk
-```
-
-## Install on TV
-
-Connect the TV through ADB:
+For device testing:
 
 ```bash
 adb connect <TV-IP>:5555
-```
-
-Check connection:
-
-```bash
-adb devices
-```
-
-Install:
-
-```bash
 adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n com.darelisme.sweetspot/.MainActivity
 ```
 
-Launch:
+Source tests and a successful build do not prove TV audio behavior, iPhone Safari microphone behavior, direct connectivity, or the cloud-independence acceptance test. Report those separately and only after running them on the target devices.
 
-```bash
-adb shell am start \
-  -n com.darelisme.sweetspot/.MainActivity
+## Repository layout
+
+```text
+app/src/main/java/com/darelisme/sweetspot/
+├── audio/                 DSP and audio diagnostics
+├── calibration/           analysis, capture, persistence, playback, transport adapters
+├── pairing/               rendezvous credentials and lifetime
+├── transport/             protocol, signaling, and WebRTC implementation
+├── server/                local authenticated HTTP API
+├── ui/                    native overlay and TV controls
+└── SweetSpotService.kt    lifecycle orchestration
 ```
 
-## Project guidance
+Calibration policy and analysis stay under `calibration/`. Generic peer and signaling code stays under `transport/`. The service coordinates ownership and lifecycle without implementing WebRTC or acoustic analysis.
 
-[`AGENTS.md`](AGENTS.md) contains the current ownership, resource, layout, and
-verification rules. [`IDEA.md`](IDEA.md) points to that file instead of
-duplicating architecture rules.
+The Android app and `sweetspot-web` are released as one protocol. When the wire contract changes, update the shared fixtures and the paired web repository's `shared/types/README.md` and `shared/types/TRANSPORT.md` before reporting the change complete.

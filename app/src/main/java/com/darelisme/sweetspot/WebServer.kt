@@ -1,5 +1,6 @@
 package com.darelisme.sweetspot
 
+import com.darelisme.sweetspot.pairing.PairingSessionManager
 import android.os.Debug
 import android.system.Os
 import android.system.OsConstants
@@ -88,8 +89,8 @@ class WebServer(
     private val port: Int = Config.WEB_PORT,
     private val eqAppliedNotifier: ((String) -> Unit)? = null,
     private val authTokenProvider: () -> String,
-    private val pairCodeProvider: () -> String,
-    private val pairCodeRotateProvider: () -> PairCodeManager.RotationResult,
+    private val pairingSessionProvider: () -> PairingSessionManager.Session,
+    private val pairCodeRotateProvider: () -> PairingSessionManager.RotationResult,
 ) {
     companion object {
         private const val TAG = "SweetSpotWeb"
@@ -101,8 +102,8 @@ class WebServer(
         private const val HTTP_WORKER_COUNT = 2
         private const val HTTP_QUEUE_CAPACITY = 16
 
-        internal fun rootRedirectResponse(pairCodeProvider: () -> String): HttpResponse =
-            redirectResponse(PairCodeManager.connectUrl(pairCodeProvider()))
+        internal fun rootRedirectResponse(pairingSessionProvider: () -> PairingSessionManager.Session): HttpResponse =
+            redirectResponse(PairingSessionManager.connectUrl(pairingSessionProvider()))
 
         internal fun isAuthorized(headers: Map<String, String>, expectedToken: String): Boolean {
             if (expectedToken.isBlank()) return false
@@ -329,7 +330,7 @@ class WebServer(
     private fun route(client: Socket, method: String, path: String, body: String) {
         when {
             method == "GET" && path == "/" ->
-                sendResponse(client, rootRedirectResponse(pairCodeProvider))
+                sendResponse(client, rootRedirectResponse(pairingSessionProvider))
 
             method == "GET" && path == "/api/health" ->
                 sendJson(client, JSONObject().put("ok", true).put("service", "SweetSpot").put("apiVersion", 1).toString())
@@ -501,10 +502,12 @@ class WebServer(
                 sendJson(client, deviceInfoJson())
 
             method == "GET" && path == "/api/paircode" -> {
-                val code = pairCodeProvider()
+                val session = pairingSessionProvider()
                 sendJson(client, JSONObject().apply {
-                    put("pairCode", code)
-                    put("url", PairCodeManager.connectUrl(code))
+                    put("pairCode", session.code)
+                    put("rendezvousId", session.rendezvousId)
+                    put("url", PairingSessionManager.connectUrl(session))
+                    put("expiresAt", session.expiresAt)
                 }.toString())
             }
 

@@ -8,7 +8,7 @@ internal const val MAX_CALIBRATION_ABORT_MESSAGE_LENGTH = 1024
  * Error codes accepted on the calibration session protocol boundary.
  *
  * This mirrors the web protocol's closed set. Keeping the check here prevents
- * an arbitrary mailbox string from becoming a controller state transition or
+ * an arbitrary transport string from becoming a controller state transition or
  * TV status message.
  */
 internal val CALIBRATION_ERROR_CODES: Set<String> = setOf(

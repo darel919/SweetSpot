@@ -1,5 +1,6 @@
 package com.darelisme.sweetspot
 
+import com.darelisme.sweetspot.pairing.PairingSessionManager
 import java.nio.charset.StandardCharsets
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
@@ -8,17 +9,23 @@ import org.junit.Test
 
 class WebServerRedirectTest {
     @Test
-    fun rootRedirectReadsPairCodeOnceAndSerializesExpectedResponse() {
+    fun rootRedirectReadsPairingSessionOnceAndSerializesExpectedResponse() {
         var reads = 0
+        val session = PairingSessionManager.Session(
+            code = "ABCD2345",
+            rendezvousId = "0123456789abcdef0123456789abcdef",
+            pairSecret = "secret-secret-secret-secret-secret-secret",
+            expiresAt = 10_000L,
+        )
         val response = WebServer.rootRedirectResponse {
             reads++
-            " ab-cd-2345 "
+            session
         }
 
         val serialized = WebServer.serializeResponse(response).toString(StandardCharsets.UTF_8)
         val expected = buildString {
             append("HTTP/1.1 302 Found\r\n")
-            append("Location: ${Config.DASHBOARD_URL}/connect/ABCD2345\r\n")
+            append("Location: ${PairingSessionManager.connectUrl(session)}\r\n")
             append("Content-Length: 0\r\n")
             append("Connection: close\r\n")
             append("Cache-Control: no-store\r\n")

@@ -1,6 +1,6 @@
 package com.darelisme.sweetspot.calibration
 
-import java.io.ByteArrayInputStream
+import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.UUID
@@ -177,15 +177,22 @@ class CalibrationEngine(
         }
     }
 
-    fun submitCaptureFrame(frame: ByteArray): CalibrationEngineResult = runOnWorker {
-        val decoded = try {
-            CalibrationCaptureWire.decode(frame)
-        } catch (error: IllegalArgumentException) {
-            return@runOnWorker rejected("invalid_pcm_frame", error.message ?: "Invalid calibration capture frame")
+    /**
+     * Accepts a verified stream from the direct capture transport. The stream
+     * is consumed by [CalibrationCaptureStore], so the engine never needs a
+     * network-sized PCM buffer.
+     */
+    fun submitCaptureStream(
+        metadataJson: String,
+        pcm: InputStream,
+        pcmBytes: Long,
+    ): CalibrationEngineResult = runOnWorker {
+        if (pcmBytes <= 0L || pcmBytes > Int.MAX_VALUE) {
+            return@runOnWorker rejected("invalid_pcm_stream", "Calibration capture size is invalid")
         }
         val metadata = try {
-            metadataParser?.parse(decoded.metadataJson, decoded.pcm.size)
-                ?: parseMetadata(decoded.metadataJson, decoded.pcm.size)
+            metadataParser?.parse(metadataJson, pcmBytes.toInt())
+                ?: parseMetadata(metadataJson, pcmBytes.toInt())
         } catch (error: Exception) {
             return@runOnWorker rejected("invalid_capture_metadata", error.message ?: "Invalid calibration capture metadata")
         }
@@ -193,9 +200,8 @@ class CalibrationEngine(
             ?: return@runOnWorker rejected("no_job", "No matching calibration job")
         val priorAttempt = current.ledger.attempts.firstOrNull { it.request.captureId == metadata.captureId }
         if (priorAttempt != null) {
-            if (terminal(current)) return@runOnWorker CalibrationEngineResult.Updated(current)
             try {
-                captureStore.store(metadata, ByteArrayInputStream(decoded.pcm))
+                captureStore.store(metadata, pcm)
             } catch (error: CaptureStoreException) {
                 return@runOnWorker rejected("capture_store_failed", error.message ?: "Calibration capture could not be stored")
             }
@@ -211,12 +217,23 @@ class CalibrationEngine(
             return@runOnWorker rejected("stale_action", "Capture metadata does not match the TV action")
         }
         if (activePlaybackCapture == metadata.captureId) activePlaybackCapture = null
-        try {
-            captureStore.store(metadata, ByteArrayInputStream(decoded.pcm))
+        val stored = try {
+            captureStore.store(metadata, pcm)
         } catch (error: CaptureStoreException) {
             return@runOnWorker rejected("capture_store_failed", error.message ?: "Calibration capture could not be stored")
         }
-        return@runOnWorker processStoredCapture(current, metadata, decoded.pcm, captureAction, validationAction)
+        val storedCapture = when (stored) {
+            is CaptureStoreResult.Stored -> stored.capture
+            is CaptureStoreResult.Duplicate -> stored.capture
+        }
+        val verifiedSamples = try {
+            captureStore.openPcm(storedCapture).use { readFloat32(it, storedCapture.metadata.byteCount) }
+        } catch (error: CaptureStoreException) {
+            return@runOnWorker rejected("capture_store_failed", error.message ?: "Calibration capture could not be read")
+        } catch (error: IllegalArgumentException) {
+            return@runOnWorker rejected("capture_store_failed", error.message ?: "Calibration capture could not be read")
+        }
+        processStoredCapture(current, metadata, verifiedSamples, captureAction, validationAction)
     }
 
     fun finishWithBest(jobId: CalibrationJobId): CalibrationEngineResult = runOnWorker {
@@ -289,7 +306,7 @@ class CalibrationEngine(
         val result = processStoredCapture(
             current,
             metadata,
-            captureStore.openPcm(stored).use { it.readBytes() },
+            captureStore.openPcm(stored).use { readFloat32(it, stored.metadata.byteCount) },
             captureAction,
             validationAction,
         )
@@ -299,7 +316,7 @@ class CalibrationEngine(
     private fun processStoredCapture(
         current: CalibrationJob,
         metadata: CaptureUploadMetadata,
-        pcm: ByteArray,
+        samples: FloatArray,
         captureAction: CalibrationAction.Capture?,
         validationAction: CalibrationAction.Validate?,
     ): CalibrationEngineResult {
@@ -329,24 +346,6 @@ class CalibrationEngine(
                 return autoStageWhenReady(commit(transition))
             }
             return retryValidationAfterCaptureProblem(current, "The selected microphone profile is not validated for this capture path")
-        }
-        val samples = try {
-            decodeFloat32(pcm)
-        } catch (_: Throwable) {
-            if (validationAction != null) {
-                val transition = stateMachine.reduce(
-                    current,
-                    CalibrationEvent.ValidationClassified(ValidationOutcome.INCONCLUSIVE_CAPTURE),
-                )
-                commit(transition)
-                return CalibrationEngineResult.Updated(transition.job)
-            }
-            val request = requireNotNull(captureAction).request
-            val transition = stateMachine.reduce(
-                current,
-                CalibrationEvent.CaptureRejected(request, CaptureRejectionReason.INVALID_PCM),
-            )
-            return autoStageWhenReady(commit(transition))
         }
         val analysis = try {
             analyzer.analyze(
@@ -929,10 +928,60 @@ class CalibrationEngine(
         CaptureChannel.BOTH -> AnalysisChannel.BOTH
     }
 
-    private fun decodeFloat32(bytes: ByteArray): FloatArray {
-        require(bytes.size % 4 == 0)
-        val input = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-        return FloatArray(bytes.size / 4) { input.float }
+    private fun readFloat32(input: InputStream, expectedByteCount: Long): FloatArray {
+        require(expectedByteCount > 0L && expectedByteCount % 4L == 0L) {
+            "Calibration capture byte count is not aligned to Float32 samples"
+        }
+        require(expectedByteCount <= Int.MAX_VALUE.toLong()) {
+            "Calibration capture is too large to analyze"
+        }
+        val samples = FloatArray((expectedByteCount / 4L).toInt())
+        val buffer = ByteArray(16 * 1024)
+        val carry = ByteArray(3)
+        var carryBytes = 0
+        var bytesRead = 0L
+        var sampleIndex = 0
+        while (bytesRead < expectedByteCount) {
+            val requested = minOf(buffer.size.toLong(), expectedByteCount - bytesRead).toInt()
+            val read = input.read(buffer, 0, requested)
+            if (read < 0) break
+            if (read == 0) continue
+            bytesRead += read
+            var offset = 0
+            if (carryBytes > 0) {
+                val needed = 4 - carryBytes
+                if (read < needed) {
+                    buffer.copyInto(carry, carryBytes, 0, read)
+                    carryBytes += read
+                    continue
+                }
+                buffer.copyInto(carry, carryBytes, 0, needed)
+                carry.copyInto(buffer, 0, 0, carryBytes)
+                samples[sampleIndex++] = ByteBuffer.wrap(buffer, 0, 4)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .float
+                carryBytes = 0
+                offset = needed
+            }
+            val completeBytes = (read - offset) / 4 * 4
+            if (completeBytes > 0) {
+                ByteBuffer.wrap(buffer, offset, completeBytes)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .asFloatBuffer()
+                    .get(samples, sampleIndex, completeBytes / 4)
+                sampleIndex += completeBytes / 4
+            }
+            val remainder = read - offset - completeBytes
+            if (remainder > 0) {
+                buffer.copyInto(carry, 0, offset + completeBytes, offset + completeBytes + remainder)
+                carryBytes = remainder
+            }
+        }
+        require(bytesRead == expectedByteCount && carryBytes == 0 && sampleIndex == samples.size) {
+            "Calibration capture ended before the expected sample count"
+        }
+        require(input.read() == -1) { "Calibration capture contains trailing bytes" }
+        return samples
     }
 
     private fun rejectionReason(analysis: CalibrationAnalysis): CaptureRejectionReason = when (analysis.status) {

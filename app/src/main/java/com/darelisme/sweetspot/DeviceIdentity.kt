@@ -6,7 +6,7 @@ import android.util.Base64
 import java.security.SecureRandom
 
 /**
- * Persistent device identity for relay pairing.
+ * Persistent device identity for direct pairing and local diagnostics.
  *
  * A random `tv_`-prefixed hex id is generated on first run and reused forever.
  * Hardware identifiers (MAC, serial, ANDROID_ID) are deliberately not used.

@@ -11,6 +11,10 @@ android {
         minSdk = 28
         targetSdk = 36
 
+        ndk {
+            abiFilters += "armeabi-v7a"
+        }
+
         versionCode = 1
         versionName = "0.1.0"
 
@@ -48,5 +52,6 @@ dependencies {
     implementation(libs.androidsvg)
     implementation(libs.okhttp)
     implementation(libs.zxing.core)
+    implementation(libs.webrtc.android)
     testImplementation(libs.junit)
 }

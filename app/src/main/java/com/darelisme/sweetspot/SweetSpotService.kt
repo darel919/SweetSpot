@@ -17,7 +17,8 @@ import android.util.Log
 import android.widget.Toast
 import com.darelisme.sweetspot.calibration.AndroidResponseV1Analyzer
 import com.darelisme.sweetspot.calibration.CalibrationCaptureStore
-import com.darelisme.sweetspot.calibration.CalibrationCaptureWire
+import com.darelisme.sweetspot.calibration.transport.CalibrationCaptureStreamFrame
+import com.darelisme.sweetspot.calibration.transport.CalibrationCaptureStreamReceiver
 import com.darelisme.sweetspot.calibration.CalibrationEngine
 import com.darelisme.sweetspot.calibration.CalibrationEngineListener
 import com.darelisme.sweetspot.calibration.CalibrationEngineResult
@@ -31,9 +32,15 @@ import com.darelisme.sweetspot.calibration.CaptureId
 import com.darelisme.sweetspot.calibration.CaptureChannel
 import com.darelisme.sweetspot.calibration.TvCalibrationDsp
 import com.darelisme.sweetspot.calibration.TvCalibrationPlayback
+import com.darelisme.sweetspot.pairing.PairingSessionManager
+import com.darelisme.sweetspot.transport.PeerTransport
+import com.darelisme.sweetspot.transport.PeerTransportDiagnostics
+import com.darelisme.sweetspot.transport.PeerTransportState
+import com.darelisme.sweetspot.transport.webrtc.WebRtcPeerTransport
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileInputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
@@ -113,7 +120,7 @@ class SweetSpotService : Service(), ServiceActions {
     private var engine: AudioEngine? = null
     private var webServer: WebServer? = null
     private var overlay: OverlayController? = null
-    private var relay: MailboxClient? = null
+    private var peerTransport: PeerTransport? = null
     private var measurementController: MeasurementController? = null
     private var calibrationEngine: CalibrationEngine? = null
     private var calibrationPlayback: TvCalibrationPlayback? = null
@@ -122,14 +129,22 @@ class SweetSpotService : Service(), ServiceActions {
     private val stateRevision = AtomicLong(0)
     private val stateRevisionLock = Any()
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val pairCodes = PairCodeManager()
+    private val pairCodes = PairingSessionManager()
     private val pairingRotation = Runnable { rotatePairingSession() }
     @Volatile
     private var pairingRotationPending = false
     @Volatile
-    private var relayClientPresent = false
+    private var peerClientPresent = false
+    @Volatile
+    private var latestPeerDiagnostics = PeerTransportDiagnostics()
+    @Volatile
+    private var pendingDisconnectedPeerGeneration: String? = null
+    private var captureStreamReceiver: CalibrationCaptureStreamReceiver? = null
     private val clientDisconnectGrace = Runnable {
+        pendingDisconnectedPeerGeneration?.let { pairCodes.markPeerDisconnected(it) }
+        pendingDisconnectedPeerGeneration = null
         measurementController?.clientPresenceChanged(false)
+        rotatePairingSession(force = true)
     }
     private lateinit var profileStore: ProfileStore
 
@@ -178,7 +193,8 @@ class SweetSpotService : Service(), ServiceActions {
         var createdEngine: AudioEngine? = null
         var createdOverlay: OverlayController? = null
         var createdWebServer: WebServer? = null
-        var createdRelay: MailboxClient? = null
+        var createdPeerTransport: PeerTransport? = null
+        var createdCaptureStreamReceiver: CalibrationCaptureStreamReceiver? = null
         var createdMeasurementController: MeasurementController? = null
         var createdCalibrationPlayback: TvCalibrationPlayback? = null
         var createdCalibrationEngine: CalibrationEngine? = null
@@ -192,6 +208,9 @@ class SweetSpotService : Service(), ServiceActions {
                 expectedSweepRevision = com.darelisme.sweetspot.calibration.SweepRevision(calibrationSweep.sweepRevision),
             )
             val calibrationCaptureStore = CalibrationCaptureStore(File(filesDir, "calibration/captures"))
+            createdCaptureStreamReceiver = CalibrationCaptureStreamReceiver(
+                File(filesDir, "calibration/stream-captures"),
+            ).also { it.cleanup() }
             createdCalibrationPlayback = TvCalibrationPlayback(
                 this,
                 createdEngine,
@@ -207,11 +226,11 @@ class SweetSpotService : Service(), ServiceActions {
                 dsp = TvCalibrationDsp(createdEngine),
                 listener = object : CalibrationEngineListener {
                     override fun onJobChanged(job: CalibrationJob) {
-                        relay?.publish("calibration.job.state", CalibrationJobJson.view(job))
+                        peerTransport?.publish("calibration.job.state", CalibrationJobJson.view(job))
                     }
 
                     override fun onCaptureFinished(jobId: CalibrationJobId, captureId: CaptureId) {
-                        relay?.publish(
+                        peerTransport?.publish(
                             "calibration.capture.finished",
                             JSONObject().put("jobId", jobId.value).put("captureId", captureId.value),
                         )
@@ -230,7 +249,8 @@ class SweetSpotService : Service(), ServiceActions {
                 stateProvider = ::overlayState,
                 actions = overlayActions(),
             ).also {
-                it.updatePairInfo(pairCodes.current())
+                val session = pairCodes.currentSession()
+                it.updatePairInfo(session.code, PairingSessionManager.connectUrl(session))
             }
             createdWebServer = WebServer(
                 createdEngine,
@@ -238,39 +258,53 @@ class SweetSpotService : Service(), ServiceActions {
                 this,
                 eqAppliedNotifier = ::showEqAppliedToast,
                 authTokenProvider = { DeviceIdentity.getLanApiToken(this) },
-                pairCodeProvider = { pairCodes.current() },
+                pairingSessionProvider = { pairCodes.currentSession() },
                 pairCodeRotateProvider = { rotatePairingSession(force = true) },
             )
-            createdRelay = MailboxClient(
-                roomProvider = { pairCodes.current() },
-                snapshotProvider = { stateSnapshotJson() },
-                effectsDiagnosticsProvider = { runEffectDiagnosticsBlocking() },
-                commandHandler = mailboxCommandHandler()
-            ).also { client ->
-                client.listener = object : MailboxClient.Listener {
-                    override fun onDeviceOnline(online: Boolean) {
-                        overlay?.updateRelayState(
-                            if (online) OverlayController.RELAY_WAITING else OverlayController.RELAY_CONNECTING
-                        )
-                    }
-
-                    override fun onRoomConnected(room: String) {
-                        if (room == pairCodes.current()) overlay?.updatePairInfo(room)
-                    }
-
-                    override fun onClientPresence(present: Boolean) {
-                        relayClientPresent = present
-                        if (present) {
-                            mainHandler.removeCallbacks(clientDisconnectGrace)
-                        } else {
-                            mainHandler.removeCallbacks(clientDisconnectGrace)
-                            mainHandler.postDelayed(clientDisconnectGrace, CLIENT_DISCONNECT_GRACE_MS)
+            createdPeerTransport = WebRtcPeerTransport(
+                context = this,
+                pairingSessionProvider = { pairCodes.currentSession() },
+                commandHandler = peerCommandHandler(),
+                onSessionConnected = pairCodes::markPeerConnected,
+                onSessionDisconnected = { generation -> pairCodes.markPeerDisconnected(generation) },
+            ).also { transport ->
+                transport.listener = object : PeerTransport.Listener {
+                    override fun onStateChanged(state: PeerTransportState, diagnostics: PeerTransportDiagnostics) {
+                        latestPeerDiagnostics = diagnostics
+                        if (state == PeerTransportState.RECONNECTING || state == PeerTransportState.FAILED) {
+                            captureStreamReceiver?.cancel()
                         }
-                        overlay?.updateRelayState(
-                            if (present) OverlayController.RELAY_CONNECTED else OverlayController.RELAY_WAITING
-                        )
-                        if (present) measurementController?.clientPresenceChanged(true)
-                        if (!present) rotatePairingSession()
+                        val overlayState = when (state) {
+                            PeerTransportState.DIRECT -> OverlayController.CONNECTION_CONNECTED
+                            PeerTransportState.PAIRING -> OverlayController.CONNECTION_WAITING
+                            PeerTransportState.SIGNALING,
+                            PeerTransportState.CONNECTING,
+                            PeerTransportState.RECONNECTING,
+                            -> OverlayController.CONNECTION_CONNECTING
+                            PeerTransportState.FAILED,
+                            PeerTransportState.IDLE,
+                            PeerTransportState.CLOSED,
+                            -> OverlayController.CONNECTION_DISCONNECTED
+                        }
+                        overlay?.updateConnectionState(overlayState)
+                    }
+
+                        override fun onPeerPresence(present: Boolean, sessionId: String?) {
+                            peerClientPresent = present
+                            if (present) {
+                                pendingDisconnectedPeerGeneration = null
+                                mainHandler.removeCallbacks(clientDisconnectGrace)
+                                measurementController?.clientPresenceChanged(true)
+                            } else {
+                                pendingDisconnectedPeerGeneration = sessionId
+                                mainHandler.removeCallbacks(clientDisconnectGrace)
+                                mainHandler.postDelayed(clientDisconnectGrace, CLIENT_DISCONNECT_GRACE_MS)
+                            }
+                    }
+
+                    override fun onError(message: String) {
+                        captureStreamReceiver?.cancel()
+                        Log.w(TAG, "Direct transport: $message")
                     }
                 }
             }
@@ -295,7 +329,8 @@ class SweetSpotService : Service(), ServiceActions {
             this@SweetSpotService.calibrationEngine = createdCalibrationEngine
             overlay = createdOverlay
             webServer = createdWebServer
-            relay = createdRelay
+            peerTransport = createdPeerTransport
+            captureStreamReceiver = createdCaptureStreamReceiver
             measurementController = createdMeasurementController
             synchronized(runtimeLock) {
                 runtimeStarted = true
@@ -304,12 +339,13 @@ class SweetSpotService : Service(), ServiceActions {
             Log.i(TAG, "Service runtime started (buildId=${BuildConfig.SWEETSPOT_BUILD_ID})")
 
             createdWebServer.start()
-            createdRelay.start()
+            createdPeerTransport.start()
             schedulePairingRotation()
-            Log.i(TAG, "Service runtime started (engine + web server + overlay + relay)")
+            Log.i(TAG, "Service runtime started (engine + web server + overlay + direct transport)")
         } catch (error: Throwable) {
             measurementController = null
-            relay = null
+            peerTransport = null
+            captureStreamReceiver = null
             webServer = null
             overlay = null
             engine = null
@@ -317,7 +353,8 @@ class SweetSpotService : Service(), ServiceActions {
             try { createdMeasurementController?.shutdown() } catch (_: Throwable) {}
             try { createdCalibrationEngine?.close() } catch (_: Throwable) {}
             try { createdCalibrationPlayback?.close() } catch (_: Throwable) {}
-            try { createdRelay?.stop() } catch (_: Throwable) {}
+            try { createdPeerTransport?.stop() } catch (_: Throwable) {}
+            try { createdCaptureStreamReceiver?.cleanup() } catch (_: Throwable) {}
             try { createdWebServer?.stop() } catch (_: Throwable) {}
             try { createdOverlay?.hide() } catch (_: Throwable) {}
             try { createdEngine?.release() } catch (_: Throwable) {}
@@ -327,28 +364,30 @@ class SweetSpotService : Service(), ServiceActions {
     }
 
     @Synchronized
-    private fun rotatePairingSession(force: Boolean = false): PairCodeManager.RotationResult {
+    private fun rotatePairingSession(force: Boolean = false): PairingSessionManager.RotationResult {
         val now = System.currentTimeMillis()
         val due = pairingRotationPending || pairCodes.isExpired(now) ||
-            now >= pairCodes.currentSession().expiresAt - PairCodeManager.ROTATION_MARGIN_MS
+            now >= pairCodes.currentSession().expiresAt - PairingSessionManager.ROTATION_MARGIN_MS
         if (!force && !due) {
             schedulePairingRotation()
-            return PairCodeManager.RotationResult(pairCodes.currentSession(), rotated = false)
+            return PairingSessionManager.RotationResult(pairCodes.currentSession(), rotated = false)
         }
-        val decision = PairCodeManager.rotationDecision(
-            clientConnected = relayClientPresent,
+        val decision = PairingSessionManager.rotationDecision(
+            clientConnected = peerClientPresent,
             calibrationCritical = measurementController?.isActive() == true || audioOperationGate.isHeld(),
+            peerSessionActive = pairCodes.hasActivePeer(),
         )
-        if (decision == PairCodeManager.RotationDecision.DEFER) {
+        if (decision == PairingSessionManager.RotationDecision.DEFER) {
             pairingRotationPending = true
             schedulePairingRotation()
-            return PairCodeManager.RotationResult(pairCodes.currentSession(), rotated = false)
+            return PairingSessionManager.RotationResult(pairCodes.currentSession(), rotated = false)
         }
         pairingRotationPending = false
         val session = pairCodes.rotate()
-        relay?.reconnectForPairingRotation()
+        peerTransport?.reconnectForPairingRotation()
         schedulePairingRotation()
-        return PairCodeManager.RotationResult(session, rotated = true)
+        overlay?.updatePairInfo(session.code, PairingSessionManager.connectUrl(session))
+        return PairingSessionManager.RotationResult(session, rotated = true)
     }
 
     private fun schedulePairingRotation() {
@@ -357,7 +396,7 @@ class SweetSpotService : Service(), ServiceActions {
         val delay = if (pairingRotationPending) {
             1_000L
         } else {
-            (session.expiresAt - System.currentTimeMillis() - PairCodeManager.ROTATION_MARGIN_MS)
+            (session.expiresAt - System.currentTimeMillis() - PairingSessionManager.ROTATION_MARGIN_MS)
                 .coerceAtLeast(1_000L)
         }
         mainHandler.postDelayed(pairingRotation, delay)
@@ -440,12 +479,20 @@ class SweetSpotService : Service(), ServiceActions {
     }
 
     override fun onDestroy() {
-        Log.i(TAG, "Service onDestroy — hiding overlay, stopping web server, releasing engine, closing relay")
+        Log.i(TAG, "Service onDestroy — hiding overlay, stopping web server, releasing engine, closing direct transport")
         synchronized(runtimeLock) {
             runtimeStarted = false
         }
         mainHandler.removeCallbacks(pairingRotation)
         mainHandler.removeCallbacks(clientDisconnectGrace)
+        val transport = peerTransport
+        peerTransport = null
+        transport?.listener = null
+        val receiver = captureStreamReceiver
+        captureStreamReceiver = null
+        transport?.stop()
+        receiver?.cancel()
+        receiver?.cleanup()
         measurementController?.shutdown()
         measurementController = null
         calibrationEngine?.close()
@@ -454,8 +501,6 @@ class SweetSpotService : Service(), ServiceActions {
         calibrationPlayback = null
         releasePersistentProbeBlocking()
         stopForeground(STOP_FOREGROUND_REMOVE)
-        relay?.stop()
-        relay = null
         webServer?.stop()
         webServer = null
         overlay?.hide()
@@ -576,11 +621,11 @@ class SweetSpotService : Service(), ServiceActions {
     override fun getPersistentProbeError(): String? = persistentProbeError
 
     /**
-     * Dispatches dashboard control commands arriving via the mailbox. Runs on
-     * the mailbox worker thread, so probe work is submitted to [probeExecutor]
+     * Dispatches dashboard control commands arriving via the control channel.
+     * Runs on the transport control thread, so probe work is submitted to [probeExecutor]
      * and answered with a follow-up probe.status message.
      */
-    private fun mailboxCommandHandler() = object : MailboxClient.CommandHandler {
+    private fun peerCommandHandler() = object : PeerTransport.CommandHandler {
         override fun onCommand(type: String, payload: JSONObject, replyTo: (String, JSONObject) -> Unit) {
             val engine = this@SweetSpotService.engine
             var commandOk = true
@@ -620,9 +665,22 @@ class SweetSpotService : Service(), ServiceActions {
                     val result = when (payload.optString("scope")) {
                         "capture" -> {
                             val captureId = payload.optString("captureId").takeIf { it.isNotBlank() }?.let(::CaptureId)
+                            val currentJob = calibrationEngine?.currentJob()
+                            val currentCaptureId = when (val action = currentJob?.nextAction) {
+                                is com.darelisme.sweetspot.calibration.CalibrationAction.Capture -> action.request.captureId.value
+                                is com.darelisme.sweetspot.calibration.CalibrationAction.Validate -> action.captureId.value
+                                else -> null
+                            }
+                            if (jobId != null && captureId != null
+                                && currentJob?.id?.value == jobId.value
+                                && currentCaptureId == captureId.value
+                            ) captureStreamReceiver?.cancel()
                             if (jobId != null && captureId != null) calibrationEngine?.cancelCapture(jobId, captureId) else null
                         }
-                        "optional_refinement" -> jobId?.let { calibrationEngine?.cancelOptionalRefinement(it) }
+                        "optional_refinement" -> jobId?.let {
+                            if (calibrationEngine?.currentJob()?.id?.value == it.value) captureStreamReceiver?.cancel()
+                            calibrationEngine?.cancelOptionalRefinement(it)
+                        }
                         else -> null
                     }
                     replyCalibrationJobResult(result ?: CalibrationEngineResult.Rejected(null, "invalid_cancel", "Invalid calibration cancel scope"), replyTo)
@@ -630,6 +688,7 @@ class SweetSpotService : Service(), ServiceActions {
                 }
                 "calibration.job.discard" -> {
                     val jobId = payload.optString("jobId").takeIf { it.isNotBlank() }?.let(::CalibrationJobId)
+                    if (jobId != null && calibrationEngine?.currentJob()?.id == jobId) captureStreamReceiver?.cancel()
                     replyCalibrationJobResult(
                         jobId?.let { calibrationEngine?.discardJob(it) }
                             ?: CalibrationEngineResult.Rejected(null, "invalid_job", "A calibration job ID is required"),
@@ -972,7 +1031,7 @@ class SweetSpotService : Service(), ServiceActions {
                             probeRunning.set(true)
                             lastProbeResults = DynamicsProcessingProbe().runFor(bands)
                         } catch (e: Throwable) {
-                            Log.e(TAG, "Mailbox probe failed", e)
+                            Log.e(TAG, "Control probe failed", e)
                         } finally {
                             probeRunning.set(false)
                             resumeProduction()
@@ -1012,6 +1071,10 @@ class SweetSpotService : Service(), ServiceActions {
                     replyTo("diagnostics.deviceInfo", deviceInfoJson())
                     return
                 }
+                "diagnostics.transport" -> {
+                    replyTo("diagnostics.transport", transportDiagnosticsJson())
+                    return
+                }
                 "diagnostics.effects" -> {
                     val diagnostics = runEffectDiagnosticsBlocking()
                     if (diagnostics.has("error")) {
@@ -1023,17 +1086,36 @@ class SweetSpotService : Service(), ServiceActions {
                     }
                 }
                 else -> {
-                    Log.d(TAG, "mailbox: unknown command $type")
+                    Log.d(TAG, "control: unknown command $type")
                     return
                 }
             }
             replyTo("state.snapshot", stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
         }
 
-        override fun onBinary(payload: ByteArray) {
-            val result = calibrationEngine?.submitCaptureFrame(payload)
-            if (result == null) return
-            publishCalibrationCaptureResult(result, payload)
+        override fun onCaptureFrame(frame: CalibrationCaptureStreamFrame) {
+            val receiver = captureStreamReceiver ?: return
+            var completed: CalibrationCaptureStreamReceiver.Completed? = null
+            try {
+                val finished = receiver.accept(frame) ?: return
+                completed = finished
+                val result = FileInputStream(finished.pcmFile).use { input ->
+                    calibrationEngine?.submitCaptureStream(
+                        metadataJson = finished.metadataJson,
+                        pcm = input,
+                        pcmBytes = finished.byteCount,
+                    )
+                }
+                if (result != null) publishCalibrationCaptureResult(result, finished)
+                receiver.delete(finished)
+            } catch (error: Throwable) {
+                Log.e(TAG, "Direct calibration capture failed", error)
+                completed?.let { finished ->
+                    try { receiver.delete(finished) } catch (_: Throwable) {}
+                }
+                receiver.cancel()
+                publishCalibrationCaptureRejection(frame.captureId, error.message ?: "The TV rejected this calibration recording")
+            }
         }
 
 
@@ -1105,9 +1187,11 @@ class SweetSpotService : Service(), ServiceActions {
         }
     }
 
-    private fun publishCalibrationCaptureResult(result: CalibrationEngineResult, frame: ByteArray) {
-        val decoded = try { CalibrationCaptureWire.decode(frame) } catch (_: Throwable) { return }
-        val metadata = try { JSONObject(decoded.metadataJson) } catch (_: Throwable) { return }
+    private fun publishCalibrationCaptureResult(
+        result: CalibrationEngineResult,
+        capture: CalibrationCaptureStreamReceiver.Completed,
+    ) {
+        val metadata = try { JSONObject(capture.metadataJson) } catch (_: Throwable) { return }
         val job = result.job
         val lastValidationOutcome = job?.validationHistory?.lastOrNull()?.outcome
         val accepted = when (result) {
@@ -1125,14 +1209,14 @@ class SweetSpotService : Service(), ServiceActions {
                 }
             }
         }
-        relay?.publish(
+        peerTransport?.publish(
             "calibration.capture.uploaded",
             JSONObject().apply {
                 put("jobId", metadata.optString("jobId"))
                 put("captureId", metadata.optString("captureId"))
                 put("contentSha256", metadata.optString("contentSha256"))
                 put("sampleCount", metadata.optLong("sampleCount"))
-                put("byteCount", decoded.pcm.size)
+                put("byteCount", capture.byteCount)
                 put("status", if (accepted) "accepted" else "rejected")
                 if (!accepted) {
                     val reason = when (result) {
@@ -1143,10 +1227,28 @@ class SweetSpotService : Service(), ServiceActions {
                 }
             },
         )
-        job?.let { relay?.publish("calibration.job.state", CalibrationJobJson.view(it)) }
+        job?.let { peerTransport?.publish("calibration.job.state", CalibrationJobJson.view(it)) }
     }
 
-    /** Mirrors WebServer.deviceInfoJson; runs on the mailbox worker thread (~400ms sample window). */
+    private fun publishCalibrationCaptureRejection(captureId: String, reason: String) {
+        val job = calibrationEngine?.currentJob() ?: return
+        val actionCaptureId = when (val action = job.nextAction) {
+            is com.darelisme.sweetspot.calibration.CalibrationAction.Capture -> action.request.captureId.value
+            is com.darelisme.sweetspot.calibration.CalibrationAction.Validate -> action.captureId.value
+            else -> null
+        }
+        if (actionCaptureId != captureId) return
+        peerTransport?.publish(
+            "calibration.capture.rejected",
+            JSONObject()
+                .put("jobId", job.id.value)
+                .put("captureId", captureId)
+                .put("status", "rejected")
+                .put("reason", reason),
+        )
+    }
+
+    /** Mirrors WebServer.deviceInfoJson; runs on the control thread (~400ms sample window). */
     private fun deviceInfoJson(): JSONObject {
         val rt = Runtime.getRuntime()
         val memInfo = Debug.MemoryInfo()
@@ -1177,6 +1279,28 @@ class SweetSpotService : Service(), ServiceActions {
             put("audioserverPid", asPid ?: JSONObject.NULL)
             put("persistentProbeActive", isPersistentProbeActive())
             put("persistentProbeBands", getPersistentProbeBands())
+        }
+    }
+
+    private fun transportDiagnosticsJson(): JSONObject {
+        val diagnostics = latestPeerDiagnostics
+        return JSONObject().apply {
+            put("state", diagnostics.state.name.lowercase(java.util.Locale.ROOT))
+            put("sessionId", diagnostics.sessionId?.takeLast(8) ?: JSONObject.NULL)
+            put("iceConnectionState", diagnostics.iceConnectionState ?: JSONObject.NULL)
+            put("iceGatheringState", diagnostics.iceGatheringState ?: JSONObject.NULL)
+            put("peerConnectionState", diagnostics.peerConnectionState ?: JSONObject.NULL)
+            put("selectedCandidateType", diagnostics.selectedCandidateType ?: JSONObject.NULL)
+            put("selectedCandidateProtocol", diagnostics.selectedCandidateProtocol ?: JSONObject.NULL)
+            put("rttMs", diagnostics.rttMs ?: JSONObject.NULL)
+            put("bytesSent", diagnostics.bytesSent)
+            put("bytesReceived", diagnostics.bytesReceived)
+            put("captureBufferedBytes", diagnostics.captureBufferedBytes)
+            put("reconnectCount", diagnostics.reconnectCount)
+            put("signalingRoundTripMs", JSONObject.NULL)
+            put("lastControlMessageAt", diagnostics.lastControlMessageAt ?: JSONObject.NULL)
+            put("lastPeerTrafficAt", diagnostics.lastPeerTrafficAt ?: JSONObject.NULL)
+            put("lastError", diagnostics.lastError ?: JSONObject.NULL)
         }
     }
 
@@ -1258,7 +1382,7 @@ class SweetSpotService : Service(), ServiceActions {
     @Volatile private var effectInventory: List<AudioEffectDiagnostics.EffectInventoryEntry>? = null
     @Volatile private var sessionProbes: List<AudioEffectDiagnostics.SessionProbe>? = null
 
-    /** Runs diagnostics synchronously; called from the mailbox worker thread. */
+    /** Runs diagnostics synchronously; called from the control thread. */
     fun runEffectDiagnosticsBlocking(): JSONObject {
         if (!tryAcquireDiagnosticOperation()) {
             return JSONObject().put("error", "Diagnostics are unavailable while calibration is active")
@@ -1470,7 +1594,7 @@ class SweetSpotService : Service(), ServiceActions {
 
     /**
      * Creates (once) and enables or disables the persistent session-0
-     * Virtualizer at max strength. Called from the mailbox worker thread.
+     * Virtualizer at max strength. Called from the control thread.
      */
     private fun setVirtualizer(on: Boolean) {
         try {

@@ -5,8 +5,8 @@
 The TV owns sweep playback, PCM ingest, acoustic acceptance, the position ledger,
 convergence, correction generation, validation, candidate transactions, and
 recovery. The browser is a remote microphone and renderer: it opens the mic when
-the TV requests a capture, sends a binary frame, and renders the next TV job
-state.
+the TV requests a capture, streams bounded binary chunks over the direct capture
+DataChannel, and renders the next TV job state.
 
 The old split created two sources of truth. The browser could retain accepted
 evidence that the TV could not resume, while the TV could retain a pending DSP
@@ -30,10 +30,11 @@ center/left/right set and stages that solution when optional work is exhausted.
 
 ## Transport boundary
 
-The relay continues to carry small JSON control envelopes. Calibration PCM uses a
-separate `SSCP` binary frame with bounded metadata, Float32 mono payload, and a
-SHA-256 digest. The relay validates and forwards the frame without analyzing or
-rewriting it; the TV stores and verifies it before analysis.
+Cloudflare provides HTTPS hosting and a short-lived SDP/ICE rendezvous only.
+After the ordered, reliable `control` and `capture` DataChannels open, the
+browser sends envelopes and bounded `SSCP` Float32 mono PCM chunks directly to
+the TV. The TV stores the chunks in a partial file, verifies ordering, counts,
+metadata, and SHA-256, then passes only the finalized capture to the analyzer.
 
 ## Design constraints
 
@@ -45,7 +46,8 @@ rewriting it; the TV stores and verifies it before analysis.
 - Optional failure changes diagnostics and next action. It does not clear usable state.
 - Browser presence does not own job lifetime.
 - Startup reconciles the persisted job with the persisted DSP transaction before publishing state.
-- Control JSON and binary PCM have separate validation and size limits.
+- Control JSON and binary PCM have separate validation and size limits. The
+  control channel remains independent while the capture channel is backpressured.
 - Calibration uses one bounded worker. Terminal paths close playback, streams, temporary files, and the worker.
 
 ## Migration order
@@ -54,11 +56,12 @@ rewriting it; the TV stores and verifies it before analysis.
 2. Add job persistence and restart tests.
 3. Port the analyzer in numerical slices against generated PCM vectors. Keep
    the browser analyzer only as a temporary parity/debug oracle.
-4. Add bounded binary PCM storage and upload receipts.
+4. Add bounded binary PCM storage, stream receipts, and direct-transport backpressure.
 5. Connect the engine to playback and the existing DSP transaction API.
 6. Add TV-owned matched-center validation and deterministic fallback modes.
 7. Add the job protocol and state snapshot.
-8. Replace browser policy with remote microphone capture and job rendering.
+8. Replace browser policy with remote microphone capture and job rendering over
+   WebRTC DataChannels. Use Cloudflare only for pairing rendezvous and SDP/ICE.
 9. Remove old production authority after parity and end-to-end tests pass. The
    Auto Room Calibration route already renders only the TV-owned remote-mic
    component; legacy browser analysis remains diagnostic until parity fixtures

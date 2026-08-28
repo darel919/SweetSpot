@@ -11,6 +11,10 @@ The generated scenario accepts center, left, right, and forward, rejects backwar
 - Minimum viability and the best solution remain monotonic after three complete required positions.
 - Only complete accepted physical positions enter solutions.
 - PCM is binary Float32 mono little-endian with SHA-256 integrity.
+- Runtime browser/TV communication uses direct ordered WebRTC DataChannels;
+  Cloudflare is limited to HTTPS hosting and short-lived SDP/ICE signaling.
+- PCM uses bounded stream frames with capture-channel backpressure; it is never
+  sent as one giant message or through a production relay.
 - The engine uses one bounded worker and releases it on every terminal path.
 - `DynamicsProcessingEq` retains candidate transaction safety and verified readback.
 - Analyzer and sweep revisions are persisted and incompatible jobs do not silently resume.
@@ -31,7 +35,7 @@ Add atomic versioned job snapshots, restart validation, bounded capture storage,
 
 ## Task 4: Engine, playback, DSP, and protocol integration
 
-Add the serialized `CalibrationEngine`, adapt `MeasurementController` to engine-issued actions, add the narrow DSP transaction port, reconcile job and DSP state at startup, add TV job protocol messages and snapshots, and add the binary upload transport. Remove disconnect-to-cancel ownership.
+Add the serialized `CalibrationEngine`, adapt `MeasurementController` to engine-issued actions, add the narrow DSP transaction port, reconcile job and DSP state at startup, add TV job protocol messages and snapshots, and add the bounded direct capture stream transport. Remove disconnect-to-cancel ownership.
 
 ## Task 5: TV-owned validation and recovery
 
@@ -39,8 +43,8 @@ Stage the best solution, validate against the original center baseline, retry in
 
 ## Task 6: Browser remote microphone
 
-Update the shared protocol. Replace production browser planning, analysis, optimization, staging, validation, recovery, and checkpoint authority with `useCalibrationRemoteMic()`. Render only the TV job and next action. Upload PCM with actual metadata and SHA-256. Keep old analyzer code only in parity tooling until Android fixtures pass.
+Update the shared protocol. Replace production browser planning, analysis, optimization, staging, validation, recovery, and checkpoint authority with `useCalibrationRemoteMic()`. Render only the TV job and next action. Upload PCM with actual metadata and SHA-256 over direct WebRTC DataChannels; keep Cloudflare signaling-only. Keep old analyzer code only in parity tooling until Android fixtures pass.
 
 ## Task 7: Whole-product verification and subtraction
 
-Run protocol parity, Android tests, Android build, web tests, typecheck, and generation. Exercise deterministic reload, optional-failure, worse-validation, rollback, cleanup, and incompatible-revision scenarios. Remove old production authority imports and stale all-or-nothing UI copy. Audit final diffs in both repositories.
+Run protocol parity, transport-fixture parity, Android tests, Android build, web tests, typecheck, and generation. Exercise deterministic reload, optional-failure, worse-validation, rollback, cleanup, and incompatible-revision scenarios. Remove old production authority imports, relay runtime, and stale all-or-nothing UI copy. Audit final diffs in both repositories.

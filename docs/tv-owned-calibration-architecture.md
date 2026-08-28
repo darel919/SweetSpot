@@ -24,7 +24,7 @@ val calibrationEngine = CalibrationEngine(
 
 calibrationEngine.startNewJob()
 calibrationEngine.captureReady(jobId, captureId)
-calibrationEngine.submitCaptureFrame(frame)
+calibrationEngine.submitCaptureStream(metadataJson, pcmInput, pcmBytes)
 calibrationEngine.currentJob()
 calibrationEngine.close()
 ```
@@ -109,11 +109,19 @@ Startup performs these steps before it publishes state:
 
 ## Capture boundary
 
-The TV issues the job ID, capture ID, action, and a short-lived upload capability. `submitCapture()` validates metadata, streams Float32 mono little-endian PCM to a partial file, calculates SHA-256, verifies byte and sample counts, and atomically renames the file.
+The TV issues the job ID, capture ID, and action. The browser sends a `capture.begin`
+header, bounded `capture.chunk` frames, and a `capture.end` header over the direct
+capture DataChannel. `CalibrationCaptureStreamReceiver` validates session and
+capture identity, writes Float32 mono little-endian PCM to a partial file,
+calculates SHA-256, verifies byte and sample counts, and atomically renames the
+file. `submitCaptureStream()` then reopens that verified file for analysis.
 
 The same capture ID and hash returns the prior receipt and analysis result. A different hash for the same capture ID returns a conflict. The analyzer only receives a verified stored capture.
 
-Control JSON retains its existing size limit. PCM uses a separate binary transport adapter. The engine receives the same `CalibrationCapture` from a direct local route or a relayed binary route.
+Control JSON retains its existing size limit. PCM uses a separate binary transport
+adapter. Cloudflare signaling never carries either application envelopes or PCM;
+the engine receives only a verified finalized capture from the TV-side stream
+receiver.
 
 ## Analyzer and correction boundaries
 
@@ -148,7 +156,9 @@ Validation transitions never remove accepted room evidence.
 
 ## Protocol and browser
 
-The TV publishes a compact `CalibrationJobView` in the state snapshot. Curves and full debug details use a separate detail response if the compact view approaches the relay limit.
+The TV publishes a compact `CalibrationJobView` in the state snapshot. Curves and
+full debug details use a separate detail response if the compact view approaches
+the control-message limit.
 
 The browser can start, get, resume, cancel a capture, finish with the best solution, cancel optional refinement, or explicitly discard the job. It cannot submit marker decisions, convergence, a correction, validation classification, or candidate finalization.
 
@@ -164,7 +174,8 @@ com.darelisme.sweetspot.calibration/
   CalibrationJobStore.kt
   CalibrationJobJson.kt
   CalibrationCaptureStore.kt
-  CalibrationCaptureWire.kt
+  transport/CalibrationCaptureStreamReceiver.kt
+  transport/CalibrationCaptureStreamWire.kt
   CalibrationAnalyzer.kt
   CalibrationMicrophoneProfilePayload.kt
   PositionLedger.kt
@@ -193,6 +204,11 @@ registry.
 8. A worse validation persists rollback intent before any other candidate action.
 9. Optional failure changes attempt history and planning only.
 10. Validation failure changes validation attempts and correction mode only.
+11. Signaling loss after direct setup does not terminate an active peer.
+12. Pairing expiry does not terminate an authenticated direct peer.
+13. Control traffic remains independent from capture backpressure.
+14. Incomplete or unverified PCM never becomes calibration evidence.
+15. A stale peer generation or capture ID cannot mutate the current job.
 
 ## Synthesis decision
 
@@ -207,6 +223,8 @@ file-per-event journal.
 - We accept one calibration executor in exchange for deterministic ordering and bounded memory.
 - We accept compact derived evidence on TV in exchange for resume and re-optimization without another walkaround.
 - We accept a dedicated binary route in exchange for keeping control messages small.
+- We accept a short-lived signaling WebSocket in exchange for direct runtime
+  traffic and no central PCM relay.
 - We accept snapshot schema migration code in exchange for avoiding Room or another database dependency.
 
 ## Implementation status

@@ -7,11 +7,11 @@ import org.junit.Test
 class PairingVisibilityTest {
     @Test
     fun onlyWaitingWithANonBlankCodeShowsPairingQr() {
-        assertTrue(shouldShowPairingQr("ABCD", OverlayController.RELAY_WAITING))
-        assertFalse(shouldShowPairingQr(null, OverlayController.RELAY_WAITING))
-        assertFalse(shouldShowPairingQr("   ", OverlayController.RELAY_WAITING))
-        assertFalse(shouldShowPairingQr("ABCD", OverlayController.RELAY_DISCONNECTED))
-        assertFalse(shouldShowPairingQr("ABCD", OverlayController.RELAY_CONNECTING))
-        assertFalse(shouldShowPairingQr("ABCD", OverlayController.RELAY_CONNECTED))
+        assertTrue(shouldShowPairingQr("ABCD", OverlayController.CONNECTION_WAITING))
+        assertFalse(shouldShowPairingQr(null, OverlayController.CONNECTION_WAITING))
+        assertFalse(shouldShowPairingQr("   ", OverlayController.CONNECTION_WAITING))
+        assertFalse(shouldShowPairingQr("ABCD", OverlayController.CONNECTION_DISCONNECTED))
+        assertFalse(shouldShowPairingQr("ABCD", OverlayController.CONNECTION_CONNECTING))
+        assertFalse(shouldShowPairingQr("ABCD", OverlayController.CONNECTION_CONNECTED))
     }
 }

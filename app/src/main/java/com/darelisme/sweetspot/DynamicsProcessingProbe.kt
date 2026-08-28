@@ -47,7 +47,7 @@ class DynamicsProcessingProbe {
         return results
     }
 
-    /** Probes the standard candidate ladder capped at [cap]; used by mailbox-driven probes. */
+    /** Probes the standard candidate ladder capped at [cap]; used by transport-driven probes. */
     fun runFor(cap: Int): List<ProbeResult> =
         CANDIDATE_BANDS.filter { it <= cap }.map { testBandCount(it) }
 

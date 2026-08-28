@@ -42,7 +42,7 @@ class AudioEffectDiagnostics {
             put(AudioEffect.EFFECT_TYPE_VIRTUALIZER.toString(), "Virtualizer")
         }
 
-        /** Canonical JSON payload shared by the LAN API and the mailbox relay reply. */
+        /** Canonical JSON payload shared by the LAN API and the direct control reply. */
         fun payloadJson(
             inv: List<EffectInventoryEntry>,
             probes: List<SessionProbe>

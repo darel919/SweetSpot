@@ -54,10 +54,10 @@ class OverlayController(
         private const val DISMISS_AFTER_CONNECT_MS = 5_000L
         private const val INACTIVITY_DISMISS_MS = 30_000L
 
-        const val RELAY_DISCONNECTED = "disconnected"
-        const val RELAY_CONNECTING = "connecting"
-        const val RELAY_WAITING = "waiting"
-        const val RELAY_CONNECTED = "connected"
+        const val CONNECTION_DISCONNECTED = "disconnected"
+        const val CONNECTION_CONNECTING = "connecting"
+        const val CONNECTION_WAITING = "waiting"
+        const val CONNECTION_CONNECTED = "connected"
     }
 
     private enum class Page { HOME, PAIRING, CALIBRATION }
@@ -69,7 +69,8 @@ class OverlayController(
     @Volatile private var overlayView: View? = null
     @Volatile private var shown = false
     @Volatile private var pairCode: String? = null
-    @Volatile private var relayState: String = RELAY_DISCONNECTED
+    @Volatile private var pairingUrl: String? = null
+    @Volatile private var connectionState: String = CONNECTION_DISCONNECTED
     private var page = Page.HOME
     private var forcePairingQr = false
     private var shownAtMs: Long = 0
@@ -94,14 +95,15 @@ class OverlayController(
 
     fun isShown(): Boolean = shown
 
-    fun updatePairInfo(code: String) = mainHandler.post {
+    fun updatePairInfo(code: String, url: String? = null) = mainHandler.post {
         pairCode = code
+        pairingUrl = url
         if (shown) refreshContent()
     }
 
-    fun updateRelayState(state: String) = mainHandler.post {
-        relayState = state
-        if (state == RELAY_CONNECTED && shown && connectedAtMs == 0L) {
+    fun updateConnectionState(state: String) = mainHandler.post {
+        connectionState = state
+        if (state == CONNECTION_CONNECTED && shown && connectedAtMs == 0L) {
             connectedAtMs = SystemClock.elapsedRealtime()
             if (page == Page.PAIRING || forcePairingQr) scheduleConnectDismiss()
         }
@@ -179,11 +181,11 @@ class OverlayController(
         }
     }
 
-    private fun statusText(): String = when (relayState) {
-        RELAY_CONNECTED -> "Dashboard connected"
-        RELAY_WAITING -> "Scan the QR code to open the dashboard"
-        RELAY_CONNECTING -> "Connecting to SweetSpot…"
-        else -> "Offline — check the TV network"
+    private fun statusText(): String = when (connectionState) {
+        CONNECTION_CONNECTED -> "Dashboard connected directly"
+        CONNECTION_WAITING -> "Scan the QR code to open the dashboard"
+        CONNECTION_CONNECTING -> "Connecting directly to SweetSpot…"
+        else -> "Offline. Check the TV network"
     }
 
     private fun buildView(): View {
@@ -210,7 +212,7 @@ class OverlayController(
     private fun buildHome(container: LinearLayout) {
         val state = stateProvider()
         val code = pairCode.orEmpty()
-        if (forcePairingQr || shouldShowPairingQr(code, relayState)) buildPairingSection(container, compact = true)
+        if (forcePairingQr || shouldShowPairingQr(code, connectionState)) buildPairingSection(container, compact = true)
 
         addButton(container, "DSP: ${if (state.dspEnabled) "ON" else "OFF"}") {
             actions.setDspEnabled(!state.dspEnabled)
@@ -291,7 +293,7 @@ class OverlayController(
                 if (compact) dp(230) else dp(280),
             ).apply { gravity = Gravity.CENTER; bottomMargin = dp(8) })
         } catch (_: Exception) {}
-        addText(container, connectUrl.removePrefix("https://"), 14f, 0xFFB8B8BC.toInt(), Gravity.CENTER, bottom = 4)
+        addText(container, "Scan this QR code with Safari. The secure link is encoded in the QR.", 14f, 0xFFB8B8BC.toInt(), Gravity.CENTER, bottom = 4)
         addText(container, "Code: $code", 16f, 0xFFFFFFFF.toInt(), Gravity.CENTER, bottom = 10)
     }
 
@@ -337,5 +339,5 @@ class OverlayController(
 
     private fun dp(value: Int): Int = (value * density).roundToInt()
 
-    private fun pairUrl(code: String): String = PairCodeManager.connectUrl(code)
+    private fun pairUrl(code: String): String = pairingUrl ?: code
 }

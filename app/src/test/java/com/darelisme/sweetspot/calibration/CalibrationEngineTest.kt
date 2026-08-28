@@ -1,6 +1,7 @@
 package com.darelisme.sweetspot.calibration
 
 import com.darelisme.sweetspot.MeasurementSweep
+import java.io.ByteArrayInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.file.Files
@@ -79,11 +80,10 @@ class CalibrationEngineTest {
             val started = (first.startNewJob() as CalibrationEngineResult.Updated).job
             val action = started.nextAction as CalibrationAction.Capture
             val rawFrame = frame(started.id, action.request.captureId, action.request.position, action.request.channel, action.request.attemptIndex)
-            val decoded = CalibrationCaptureWire.decode(rawFrame)
-            val metadata = FixtureMetadataParser.parse(decoded.metadataJson, decoded.pcm.size)
+            val metadata = FixtureMetadataParser.parse(rawFrame.metadataJson, rawFrame.pcm.size)
             first.close()
 
-            captures.store(metadata, java.io.ByteArrayInputStream(decoded.pcm))
+            captures.store(metadata, ByteArrayInputStream(rawFrame.pcm))
 
             val resumed = CalibrationEngine(store, captures, analyzer, sweep, playback = ImmediatePlayback, metadataParser = FixtureMetadataParser)
             val recovered = (resumed.resumeJob() as CalibrationEngineResult.Updated).job
@@ -120,7 +120,7 @@ class CalibrationEngineTest {
             val staged = first.finishWithBest(jobId) as CalibrationEngineResult.Updated
             val validation = staged.job.nextAction as CalibrationAction.Validate
             analyzer.lastAction = null
-            first.submitCaptureFrame(frame(jobId, validation.captureId, validation.position, CaptureChannel.BOTH, validation.attemptIndex))
+            submit(first, frame(jobId, validation.captureId, validation.position, CaptureChannel.BOTH, validation.attemptIndex))
             val completed = requireNotNull(first.currentJob())
             assertEquals(CalibrationPhase.Complete, completed.phase)
             first.close()
@@ -155,11 +155,11 @@ class CalibrationEngineTest {
             val firstAction = requireNotNull(engine.currentJob()).nextAction as CalibrationAction.Capture
             val firstFrame = frame(jobId, firstAction.request.captureId, firstAction.request.position, firstAction.request.channel, firstAction.request.attemptIndex)
             analyzer.lastAction = firstAction
-            engine.submitCaptureFrame(firstFrame)
+            submit(engine, firstFrame)
             captureMandatory(engine, analyzer)
 
             val current = requireNotNull(engine.currentJob())
-            val duplicate = engine.submitCaptureFrame(firstFrame)
+            val duplicate = submit(engine, firstFrame)
 
             assertEquals(current, (duplicate as CalibrationEngineResult.Updated).job)
             assertEquals(current.ledger, requireNotNull(engine.currentJob()).ledger)
@@ -219,7 +219,7 @@ class CalibrationEngineTest {
             val job = (engine.startNewJob() as CalibrationEngineResult.Updated).job
             val action = job.nextAction as CalibrationAction.Capture
 
-            val submitted = engine.submitCaptureFrame(
+            val submitted = submit(engine,
                 frame(
                     job.id,
                     action.request.captureId,
@@ -261,7 +261,7 @@ class CalibrationEngineTest {
             val validation = staged.job.nextAction as CalibrationAction.Validate
             assertEquals(validation.candidateId, dsp.candidateId)
             analyzer.lastAction = null
-            val result = engine.submitCaptureFrame(frame(jobId, validation.captureId, validation.position, CaptureChannel.BOTH, validation.attemptIndex))
+            val result = submit(engine, frame(jobId, validation.captureId, validation.position, CaptureChannel.BOTH, validation.attemptIndex))
             val completed = (result as CalibrationEngineResult.Updated).job
             assertEquals(CalibrationPhase.Complete, completed.phase)
             assertEquals(null, completed.candidate)
@@ -357,9 +357,12 @@ class CalibrationEngineTest {
         val job = requireNotNull(engine.currentJob())
         val action = job.nextAction as CalibrationAction.Capture
         analyzer.lastAction = action
-        val result = engine.submitCaptureFrame(frame(job.id, action.request.captureId, action.request.position, action.request.channel, action.request.attemptIndex))
+        val result = submit(engine, frame(job.id, action.request.captureId, action.request.position, action.request.channel, action.request.attemptIndex))
         assertTrue(result is CalibrationEngineResult.Updated)
     }
+
+    private fun submit(engine: CalibrationEngine, capture: FixtureCapture): CalibrationEngineResult =
+        engine.submitCaptureStream(capture.metadataJson, ByteArrayInputStream(capture.pcm), capture.pcm.size.toLong())
 
     private fun frame(
         jobId: CalibrationJobId,
@@ -367,14 +370,16 @@ class CalibrationEngineTest {
         position: CalibrationPosition,
         channel: CaptureChannel,
         attemptIndex: Int,
-    ): ByteArray {
+    ): FixtureCapture {
         val pcm = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
             .putFloat(0.01f).putFloat(0.02f).putFloat(0.03f).putFloat(0.04f).array()
         val metadata = """
             {"jobId":"${jobId.value}","captureId":"${captureId.value}","positionId":"${position.name.lowercase()}","attemptIndex":$attemptIndex,"channel":"${channel.name.lowercase()}","sampleRate":48000,"channelCount":1,"sampleCount":4,"byteCount":16,"settings":{},"userAgent":"fixture","microphoneProfileId":"fixture-mic","microphoneProfileRevision":"v1","microphoneProfile":{"id":"fixture-mic","revision":"v1","capturePathStatus":"validated","frequenciesHz":[20,20000],"responseDb":[0,0],"normalizeAtHz":1000,"trustMinHz":30,"trustFullMaxHz":8000,"trustTaperToHz":12000},"capturedAtMs":1,"contentSha256":"${sha256(pcm)}"}
         """.trimIndent()
-        return CalibrationCaptureWire.encode(metadata, pcm)
+        return FixtureCapture(metadata, pcm)
     }
+
+    private data class FixtureCapture(val metadataJson: String, val pcm: ByteArray)
 
     private class FixtureAnalyzer : CalibrationAnalyzer {
         override val revision = AnalyzerRevision("android-response-v1")

@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot.calibration
+package com.darelisme.sweetspot.calibration.model
 
 import kotlin.math.pow
 import kotlin.math.sqrt

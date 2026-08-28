@@ -1,8 +1,9 @@
-package com.darelisme.sweetspot.calibration
+package com.darelisme.sweetspot.calibration.analysis
 
-import com.darelisme.sweetspot.MeasurementSweep
-import com.darelisme.sweetspot.MeasurementSweepGenerator
-import com.darelisme.sweetspot.SyncMarkerKind
+import com.darelisme.sweetspot.calibration.model.*
+import com.darelisme.sweetspot.calibration.playback.MeasurementSweep
+import com.darelisme.sweetspot.calibration.playback.MeasurementSweepGenerator
+import com.darelisme.sweetspot.calibration.playback.SyncMarkerKind
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.hypot

@@ -1,16 +1,18 @@
 package com.darelisme.sweetspot.calibration
 
+import com.darelisme.sweetspot.calibration.analysis.*
+import com.darelisme.sweetspot.calibration.capture.*
+import com.darelisme.sweetspot.calibration.model.*
+import com.darelisme.sweetspot.calibration.persistence.*
+import com.darelisme.sweetspot.calibration.playback.*
+import com.darelisme.sweetspot.calibration.playback.MeasurementSweep
 import java.io.InputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.UUID
 import java.util.concurrent.Callable
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
-import kotlin.math.abs
-import kotlin.math.log10
 
 sealed interface CalibrationEngineResult {
     val job: CalibrationJob?
@@ -29,17 +31,13 @@ interface CalibrationEngineListener {
     fun onCaptureFinished(jobId: CalibrationJobId, captureId: CaptureId) {}
 }
 
-fun interface CalibrationCaptureMetadataParser {
-    fun parse(metadataJson: String, pcmBytes: Int): CaptureUploadMetadata
-}
-
 object NoopCalibrationEngineListener : CalibrationEngineListener
 
 class CalibrationEngine(
     private val jobStore: CalibrationJobStore,
     private val captureStore: CalibrationCaptureStore,
     private val analyzer: CalibrationAnalyzer,
-    private val sweep: com.darelisme.sweetspot.MeasurementSweep,
+    private val sweep: MeasurementSweep,
     private val playback: CalibrationPlaybackPort = NoopCalibrationPlayback,
     private val dsp: CalibrationDspPort = NoopCalibrationDsp,
     private val listener: CalibrationEngineListener = NoopCalibrationEngineListener,
@@ -62,6 +60,7 @@ class CalibrationEngine(
     private val startupError: String?
     private val stateMachine = CalibrationStateMachine()
     private val spatialCorrection = SpatialCorrection()
+    private val captureReader = CalibrationCaptureReader(nowMs, metadataParser)
 
     init {
         startupError = try {
@@ -191,8 +190,7 @@ class CalibrationEngine(
             return@runOnWorker rejected("invalid_pcm_stream", "Calibration capture size is invalid")
         }
         val metadata = try {
-            metadataParser?.parse(metadataJson, pcmBytes.toInt())
-                ?: parseMetadata(metadataJson, pcmBytes.toInt())
+            captureReader.parse(metadataJson, pcmBytes.toInt())
         } catch (error: Exception) {
             return@runOnWorker rejected("invalid_capture_metadata", error.message ?: "Invalid calibration capture metadata")
         }
@@ -227,7 +225,7 @@ class CalibrationEngine(
             is CaptureStoreResult.Duplicate -> stored.capture
         }
         val verifiedSamples = try {
-            captureStore.openPcm(storedCapture).use { readFloat32(it, storedCapture.metadata.byteCount) }
+            captureStore.openPcm(storedCapture).use { captureReader.readFloat32(it, storedCapture.metadata.byteCount) }
         } catch (error: CaptureStoreException) {
             return@runOnWorker rejected("capture_store_failed", error.message ?: "Calibration capture could not be read")
         } catch (error: IllegalArgumentException) {
@@ -306,7 +304,7 @@ class CalibrationEngine(
         val result = processStoredCapture(
             current,
             metadata,
-            captureStore.openPcm(stored).use { readFloat32(it, stored.metadata.byteCount) },
+            captureStore.openPcm(stored).use { captureReader.readFloat32(it, stored.metadata.byteCount) },
             captureAction,
             validationAction,
         )
@@ -865,125 +863,6 @@ class CalibrationEngine(
         else -> null
     }
 
-    private fun parseMetadata(json: String, pcmBytes: Int): CaptureUploadMetadata {
-        val value = org.json.JSONObject(json)
-        val settingsValue = value.optJSONObject("browserCaptureSettings") ?: value.optJSONObject("settings") ?: org.json.JSONObject()
-        val settings = buildMap {
-            val keys = settingsValue.keys()
-            while (keys.hasNext()) {
-                val key = keys.next()
-                put(key, settingsValue.opt(key)?.toString() ?: "")
-            }
-        }
-        val sampleCount = value.getLong("sampleCount")
-        val byteCount = value.optLong("byteCount", pcmBytes.toLong())
-        val microphoneProfile = value.getJSONObject("microphoneProfile").let(::parseMicrophoneProfile)
-        val metadata = CaptureUploadMetadata(
-            jobId = CalibrationJobId(value.getString("jobId")),
-            captureId = CaptureId(value.getString("captureId")),
-            position = enumValue(value.optString("positionId", value.optString("position")), CalibrationPosition.entries),
-            attemptIndex = value.getInt("attemptIndex"),
-            channel = enumValue(value.optString("channel"), CaptureChannel.entries),
-            sampleRateHz = value.getInt("sampleRate"),
-            channelCount = value.getInt("channelCount"),
-            sampleCount = sampleCount,
-            browserCaptureSettings = settings,
-            userAgent = value.optString("userAgent", value.optString("browserUserAgent")),
-            microphoneProfileId = value.optString("microphoneProfileId", value.optString("micProfileId")),
-            microphoneProfileRevision = value.optString("microphoneProfileRevision", value.optString("micProfileRevision", "unknown")),
-            microphoneProfile = microphoneProfile,
-            capturedAtMs = value.optLong("capturedAtMs", value.optLong("captureTimestamp", nowMs())),
-            contentSha256 = value.getString("contentSha256"),
-            byteCount = byteCount,
-        ).normalized()
-        require(metadata.byteCount == pcmBytes.toLong()) { "PCM byte count does not match payload" }
-        return metadata
-    }
-
-    private fun parseMicrophoneProfile(value: org.json.JSONObject): CalibrationMicrophoneProfilePayload {
-        val frequenciesValue = value.getJSONArray("frequenciesHz")
-        val responseValue = value.getJSONArray("responseDb")
-        require(frequenciesValue.length() == responseValue.length()) {
-            "Microphone profile frequency and response arrays must match"
-        }
-        require(frequenciesValue.length() in CalibrationMicrophoneProfilePayload.MIN_POINTS..CalibrationMicrophoneProfilePayload.MAX_POINTS) {
-            "Microphone profile point count is outside the supported range"
-        }
-        return CalibrationMicrophoneProfilePayload(
-            id = value.getString("id"),
-            revision = value.getString("revision"),
-            frequenciesHz = FloatArray(frequenciesValue.length()) { frequenciesValue.getDouble(it).toFloat() },
-            responseDb = FloatArray(responseValue.length()) { responseValue.getDouble(it).toFloat() },
-            normalizeAtHz = value.getDouble("normalizeAtHz").toFloat(),
-            trustMinHz = value.getDouble("trustMinHz").toFloat(),
-            trustFullMaxHz = value.getDouble("trustFullMaxHz").toFloat(),
-            trustTaperToHz = value.getDouble("trustTaperToHz").toFloat(),
-            capturePathStatus = value.getString("capturePathStatus"),
-        )
-    }
-
-    private fun CaptureUploadMetadata.analysisChannel(): AnalysisChannel = when (channel) {
-        CaptureChannel.LEFT -> AnalysisChannel.LEFT
-        CaptureChannel.RIGHT -> AnalysisChannel.RIGHT
-        CaptureChannel.BOTH -> AnalysisChannel.BOTH
-    }
-
-    private fun readFloat32(input: InputStream, expectedByteCount: Long): FloatArray {
-        require(expectedByteCount > 0L && expectedByteCount % 4L == 0L) {
-            "Calibration capture byte count is not aligned to Float32 samples"
-        }
-        require(expectedByteCount <= Int.MAX_VALUE.toLong()) {
-            "Calibration capture is too large to analyze"
-        }
-        val samples = FloatArray((expectedByteCount / 4L).toInt())
-        val buffer = ByteArray(16 * 1024)
-        val carry = ByteArray(3)
-        var carryBytes = 0
-        var bytesRead = 0L
-        var sampleIndex = 0
-        while (bytesRead < expectedByteCount) {
-            val requested = minOf(buffer.size.toLong(), expectedByteCount - bytesRead).toInt()
-            val read = input.read(buffer, 0, requested)
-            if (read < 0) break
-            if (read == 0) continue
-            bytesRead += read
-            var offset = 0
-            if (carryBytes > 0) {
-                val needed = 4 - carryBytes
-                if (read < needed) {
-                    buffer.copyInto(carry, carryBytes, 0, read)
-                    carryBytes += read
-                    continue
-                }
-                buffer.copyInto(carry, carryBytes, 0, needed)
-                carry.copyInto(buffer, 0, 0, carryBytes)
-                samples[sampleIndex++] = ByteBuffer.wrap(buffer, 0, 4)
-                    .order(ByteOrder.LITTLE_ENDIAN)
-                    .float
-                carryBytes = 0
-                offset = needed
-            }
-            val completeBytes = (read - offset) / 4 * 4
-            if (completeBytes > 0) {
-                ByteBuffer.wrap(buffer, offset, completeBytes)
-                    .order(ByteOrder.LITTLE_ENDIAN)
-                    .asFloatBuffer()
-                    .get(samples, sampleIndex, completeBytes / 4)
-                sampleIndex += completeBytes / 4
-            }
-            val remainder = read - offset - completeBytes
-            if (remainder > 0) {
-                buffer.copyInto(carry, 0, offset + completeBytes, offset + completeBytes + remainder)
-                carryBytes = remainder
-            }
-        }
-        require(bytesRead == expectedByteCount && carryBytes == 0 && sampleIndex == samples.size) {
-            "Calibration capture ended before the expected sample count"
-        }
-        require(input.read() == -1) { "Calibration capture contains trailing bytes" }
-        return samples
-    }
-
     private fun rejectionReason(analysis: CalibrationAnalysis): CaptureRejectionReason = when (analysis.status) {
         AnalysisStatus.CAPTURE_CLIPPED -> CaptureRejectionReason.CLIPPING
         AnalysisStatus.CAPTURE_TOO_SHORT -> CaptureRejectionReason.CAPTURE_TOO_SHORT
@@ -1007,74 +886,10 @@ class CalibrationEngine(
         return CalibrationEngineResult.Updated(commit(transition))
     }
 
-    private inline fun <reified T : Enum<T>> enumValue(raw: String, values: Iterable<T>): T {
-        val normalized = raw.trim().replace('-', '_').uppercase()
-        return values.firstOrNull { it.name == normalized }
-            ?: throw IllegalArgumentException("Unknown calibration enum $raw")
-    }
-
     private fun terminal(job: CalibrationJob): Boolean = when (job.phase) {
         CalibrationPhase.Complete,
         CalibrationPhase.Cancelled,
         is CalibrationPhase.Failed -> true
         else -> false
     }
-}
-
-private object ValidationScorer {
-    private const val TOLERANCE_DB = 0.5f
-
-    fun classify(job: CalibrationJob, analysis: CalibrationAnalysis): ValidationScore {
-        val center = job.ledger.complete(CalibrationPosition.CENTER)
-            ?: return ValidationScore(ValidationOutcome.INCONCLUSIVE_CAPTURE, null, null)
-        val baseline = FloatArray(CalibrationBandGrid.BAND_COUNT) { band ->
-            (center.left.responseDb[band] + center.right.responseDb[band]) / 2f
-        }
-        val response = when {
-            analysis.leftResponse.isNotEmpty() && analysis.rightResponse.isNotEmpty() -> {
-                val left = analysis.leftResponse.toBandCurve().toFloatArray()
-                val right = analysis.rightResponse.toBandCurve().toFloatArray()
-                FloatArray(left.size) { (left[it] + right[it]) / 2f }
-            }
-            analysis.leftResponse.isNotEmpty() -> analysis.leftResponse.toBandCurve().toFloatArray()
-            analysis.rightResponse.isNotEmpty() -> analysis.rightResponse.toBandCurve().toFloatArray()
-            else -> return ValidationScore(ValidationOutcome.INCONCLUSIVE_CAPTURE, null, null)
-        }
-        val before = baseline.map(::abs).average().toFloat()
-        val after = response.map(::abs).average().toFloat()
-        val outcome = when {
-            before - after > TOLERANCE_DB -> ValidationOutcome.IMPROVED
-            after - before > TOLERANCE_DB -> ValidationOutcome.WORSE
-            else -> ValidationOutcome.NEUTRAL
-        }
-        return ValidationScore(outcome, before, after)
-    }
-}
-
-private data class ValidationScore(
-    val outcome: ValidationOutcome,
-    val beforeDb: Float?,
-    val afterDb: Float?,
-)
-
-private fun List<ResponsePoint>.toBandCurve(): BandCurve {
-    require(isNotEmpty())
-    val ordered = sortedBy(ResponsePoint::frequencyHz)
-    return BandCurve.of(FloatArray(CalibrationBandGrid.BAND_COUNT) { band ->
-        val frequency = CalibrationBandGrid.centerFrequenciesHz[band]
-        val exact = ordered.firstOrNull { it.frequencyHz >= frequency }
-        when {
-            exact == null -> ordered.last().magnitudeDb
-            exact === ordered.first() -> exact.magnitudeDb
-            else -> {
-                val upper = ordered.indexOf(exact)
-                val lower = upper - 1
-                val low = ordered[lower]
-                val high = ordered[upper]
-                val fraction = ((log10(frequency) - log10(low.frequencyHz)) /
-                    (log10(high.frequencyHz) - log10(low.frequencyHz))).coerceIn(0f, 1f)
-                low.magnitudeDb + (high.magnitudeDb - low.magnitudeDb) * fraction
-            }
-        }
-    })
 }

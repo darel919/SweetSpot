@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.calibration.model
 
 internal data class ValidationRecoveryResult(
     val validationStateRestored: Boolean,

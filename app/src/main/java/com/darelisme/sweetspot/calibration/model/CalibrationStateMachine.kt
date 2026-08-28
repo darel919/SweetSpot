@@ -1,4 +1,9 @@
-package com.darelisme.sweetspot.calibration
+package com.darelisme.sweetspot.calibration.model
+
+import com.darelisme.sweetspot.calibration.analysis.CalibrationSolutionComparator
+import com.darelisme.sweetspot.calibration.analysis.CalibrationValidationFallbackPolicy
+import com.darelisme.sweetspot.calibration.analysis.OptimizationResult
+import com.darelisme.sweetspot.calibration.analysis.SpatialCorrection
 
 sealed interface CalibrationEvent {
     data class ChannelAccepted(val evidence: AcceptedChannelEvidence) : CalibrationEvent

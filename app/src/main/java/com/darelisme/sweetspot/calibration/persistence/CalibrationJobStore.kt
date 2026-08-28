@@ -1,5 +1,6 @@
-package com.darelisme.sweetspot.calibration
+package com.darelisme.sweetspot.calibration.persistence
 
+import com.darelisme.sweetspot.calibration.model.*
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream

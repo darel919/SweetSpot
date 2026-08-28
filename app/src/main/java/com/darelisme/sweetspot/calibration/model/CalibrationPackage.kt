@@ -1,5 +1,6 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.calibration.model
 
+import com.darelisme.sweetspot.audio.engine.DynamicsProcessingEq
 import org.json.JSONObject
 import org.json.JSONArray
 

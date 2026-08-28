@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.transport
 
 object Config {
     const val WEB_PORT = 8080

@@ -1,5 +1,6 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.server
 
+import com.darelisme.sweetspot.transport.Config
 import com.darelisme.sweetspot.pairing.PairingSessionManager
 import java.nio.charset.StandardCharsets
 import org.junit.Assert.assertEquals

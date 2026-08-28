@@ -1,5 +1,6 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.service
 
+import com.darelisme.sweetspot.audio.engine.ProfileStore
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent

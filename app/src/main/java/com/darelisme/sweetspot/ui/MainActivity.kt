@@ -1,5 +1,8 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.ui
 
+import com.darelisme.sweetspot.service.EXTRA_START_REASON
+import com.darelisme.sweetspot.service.SweetSpotService
+import com.darelisme.sweetspot.service.SweetSpotStartReason
 import android.app.Activity
 import android.content.Intent
 import android.os.Bundle

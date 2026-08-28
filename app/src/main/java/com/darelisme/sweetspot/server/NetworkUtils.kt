@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.server
 
 import java.net.Inet4Address
 import java.net.NetworkInterface

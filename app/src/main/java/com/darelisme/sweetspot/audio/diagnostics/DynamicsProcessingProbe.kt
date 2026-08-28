@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.audio.diagnostics
 
 import android.media.audiofx.DynamicsProcessing
 import android.util.Log

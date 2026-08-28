@@ -1,4 +1,6 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.calibration.model
+
+import com.darelisme.sweetspot.ui.calibration.CalibrationPositionAssets
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -163,11 +165,11 @@ class MeasurementContextTest {
 
     @Test
     fun positionIdsUseTheExplicitBundledSvgMapping() {
-        assertEquals("calibration_position/center.svg", context("center").assetPath())
-        assertEquals("calibration_position/left.svg", context("left").assetPath())
-        assertEquals("calibration_position/right.svg", context("right").assetPath())
-        assertEquals("calibration_position/forward.svg", context("forward").assetPath())
-        assertEquals("calibration_position/backward.svg", context("backward").assetPath())
+        assertEquals("calibration_position/center.svg", CalibrationPositionAssets.pathFor("center"))
+        assertEquals("calibration_position/left.svg", CalibrationPositionAssets.pathFor("left"))
+        assertEquals("calibration_position/right.svg", CalibrationPositionAssets.pathFor("right"))
+        assertEquals("calibration_position/forward.svg", CalibrationPositionAssets.pathFor("forward"))
+        assertEquals("calibration_position/backward.svg", CalibrationPositionAssets.pathFor("backward"))
     }
 
     @Test

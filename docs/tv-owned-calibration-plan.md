@@ -47,4 +47,4 @@ Update the shared protocol. Replace production browser planning, analysis, optim
 
 ## Task 7: Whole-product verification and subtraction
 
-Run protocol parity, transport-fixture parity, Android tests, Android build, web tests, typecheck, and generation. Exercise deterministic reload, optional-failure, worse-validation, rollback, cleanup, and incompatible-revision scenarios. Remove old production authority imports, relay runtime, and stale all-or-nothing UI copy. Audit final diffs in both repositories.
+Run protocol parity, transport-fixture parity, Android tests, Android build, web tests, typecheck, and generation. Exercise deterministic reload, optional-failure, worse-validation, rollback, cleanup, and incompatible-revision scenarios. Confirm that production calibration authority remains on Android, the runtime transport remains direct after signaling, and UI copy stays actionable. Audit final diffs in both repositories.

@@ -1,5 +1,6 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.audio.diagnostics
 
+import com.darelisme.sweetspot.audio.engine.DynamicsProcessingEq
 import android.media.AudioFormat
 import android.media.audiofx.AudioEffect
 import android.media.audiofx.BassBoost

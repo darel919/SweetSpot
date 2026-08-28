@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.service
 
 import android.content.BroadcastReceiver
 import android.content.Context

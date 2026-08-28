@@ -1,5 +1,6 @@
-package com.darelisme.sweetspot.calibration
+package com.darelisme.sweetspot.calibration.analysis
 
+import com.darelisme.sweetspot.calibration.model.*
 import kotlin.math.abs
 import kotlin.math.min
 import kotlin.math.roundToInt

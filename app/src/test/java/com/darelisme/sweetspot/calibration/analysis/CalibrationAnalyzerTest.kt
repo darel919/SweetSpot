@@ -1,7 +1,9 @@
-package com.darelisme.sweetspot.calibration
+package com.darelisme.sweetspot.calibration.analysis
 
-import com.darelisme.sweetspot.MeasurementSweep
-import com.darelisme.sweetspot.MeasurementSweepGenerator
+import com.darelisme.sweetspot.calibration.model.*
+import com.darelisme.sweetspot.calibration.playback.MeasurementSweep
+import com.darelisme.sweetspot.calibration.playback.MeasurementSweepGenerator
+import com.darelisme.sweetspot.calibration.playback.SyncMarkerKind
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -56,7 +58,7 @@ class CalibrationAnalyzerTest {
         val marker = MeasurementSweepGenerator.generateSyncMarker(
             sweep,
             sweep.sampleRate,
-            com.darelisme.sweetspot.SyncMarkerKind.END,
+            SyncMarkerKind.END,
         )
         marker.forEachIndexed { index, value -> samples[shiftedTrailingStart + index] = value }
 

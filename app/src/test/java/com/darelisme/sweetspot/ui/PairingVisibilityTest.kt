@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.ui
 
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

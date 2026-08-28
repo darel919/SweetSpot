@@ -62,10 +62,9 @@ metadata, and SHA-256, then passes only the finalized capture to the analyzer.
 7. Add the job protocol and state snapshot.
 8. Replace browser policy with remote microphone capture and job rendering over
    WebRTC DataChannels. Use Cloudflare only for pairing rendezvous and SDP/ICE.
-9. Remove old production authority after parity and end-to-end tests pass. The
-   Auto Room Calibration route already renders only the TV-owned remote-mic
-   component; legacy browser analysis remains diagnostic until parity fixtures
-   are complete.
+9. Keep the Auto Room Calibration route on the TV-owned remote-mic component.
+   Browser analysis remains diagnostic and supports parity fixtures; it is not
+   a production calibration authority.
 
 ## Throughput checkpoint
 

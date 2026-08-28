@@ -1,6 +1,6 @@
 package com.darelisme.sweetspot.transport.signaling
 
-import com.darelisme.sweetspot.Config
+import com.darelisme.sweetspot.transport.Config
 import com.darelisme.sweetspot.pairing.PairingSessionManager
 import okhttp3.OkHttpClient
 import okhttp3.Request

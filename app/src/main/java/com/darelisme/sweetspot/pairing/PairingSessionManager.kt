@@ -1,6 +1,6 @@
 package com.darelisme.sweetspot.pairing
 
-import com.darelisme.sweetspot.Config
+import com.darelisme.sweetspot.transport.Config
 import java.security.SecureRandom
 import java.util.Base64
 

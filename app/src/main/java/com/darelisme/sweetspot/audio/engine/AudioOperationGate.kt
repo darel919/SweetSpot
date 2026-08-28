@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.audio.engine
 
 internal class AudioOperationGate {
     private enum class Owner {

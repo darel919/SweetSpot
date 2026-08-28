@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.calibration.playback
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals

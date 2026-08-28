@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.pairing
 
 import android.content.Context
 import android.content.SharedPreferences

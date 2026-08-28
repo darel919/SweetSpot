@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.calibration.playback
 
 import java.util.Random
 import kotlin.math.pow

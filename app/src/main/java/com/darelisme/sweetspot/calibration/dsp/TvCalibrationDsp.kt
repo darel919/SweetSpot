@@ -1,7 +1,11 @@
-package com.darelisme.sweetspot.calibration
+package com.darelisme.sweetspot.calibration.dsp
 
-import com.darelisme.sweetspot.CalibrationValidationStatus
-import com.darelisme.sweetspot.DynamicsProcessingEq
+import com.darelisme.sweetspot.audio.engine.DynamicsProcessingEq
+import com.darelisme.sweetspot.calibration.analysis.*
+import com.darelisme.sweetspot.calibration.model.*
+import com.darelisme.sweetspot.calibration.model.CalibrationValidationStatus
+import com.darelisme.sweetspot.calibration.playback.CalibrationAudioResult
+import com.darelisme.sweetspot.calibration.playback.CalibrationDspPort
 
 internal class TvCalibrationDsp(
     private val eq: DynamicsProcessingEq,

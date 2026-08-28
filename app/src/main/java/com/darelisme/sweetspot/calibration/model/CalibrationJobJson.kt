@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot.calibration
+package com.darelisme.sweetspot.calibration.model
 
 import org.json.JSONArray
 import org.json.JSONObject

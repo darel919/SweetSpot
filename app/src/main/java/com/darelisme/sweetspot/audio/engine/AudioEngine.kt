@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.audio.engine
 
 /** Service-owned audio abstraction that keeps transport and UI code independent of DSP. */
 interface AudioEngine {

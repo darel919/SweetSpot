@@ -1,12 +1,28 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.calibration.playback
 
+import com.darelisme.sweetspot.audio.engine.AudioEngine
+import com.darelisme.sweetspot.audio.engine.MeasurementAudioOverrideResult
+import com.darelisme.sweetspot.audio.engine.MeasurementAudioState
+import com.darelisme.sweetspot.calibration.model.CalibrationResultText
+import com.darelisme.sweetspot.calibration.model.MeasurementContext
+import com.darelisme.sweetspot.calibration.model.MeasurementResponse
+import com.darelisme.sweetspot.calibration.model.MeasurementResponsePayload
+import com.darelisme.sweetspot.calibration.model.MeasurementSessionFence
+import com.darelisme.sweetspot.calibration.model.ValidationRecoveryResult
+import com.darelisme.sweetspot.calibration.model.calibrationResultText
+import com.darelisme.sweetspot.calibration.model.isCalibrationSessionOutcome
+import com.darelisme.sweetspot.calibration.model.isUserCalibrationCancellation
+import com.darelisme.sweetspot.calibration.model.isValidMeasurementSessionId
+import com.darelisme.sweetspot.calibration.model.shouldForwardMeasurementResponse
+import com.darelisme.sweetspot.calibration.transport.MeasurementSessionPayloadState
+import com.darelisme.sweetspot.calibration.transport.MeasurementSessionPayloads
+import com.darelisme.sweetspot.ui.calibration.CalibrationActivity
+import com.darelisme.sweetspot.ui.calibration.CalibrationGuideState
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
-import android.media.AudioFormat
 import android.media.AudioManager
-import android.media.AudioTrack
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -15,146 +31,7 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import org.json.JSONArray
 import org.json.JSONObject
-
-private const val MAX_MEASUREMENT_SESSION_ID_LENGTH = 64
-
-internal data class MeasurementTrace(
-    val frequenciesHz: DoubleArray,
-    val magnitudesDb: DoubleArray
-) {
-    init {
-        require(frequenciesHz.size == magnitudesDb.size)
-        require(frequenciesHz.size in 2..64)
-        var previousFrequency = 0.0
-        frequenciesHz.forEachIndexed { index, frequency ->
-            require(frequency.isFinite() && frequency > 0.0)
-            if (index > 0) require(frequency > previousFrequency)
-            require(magnitudesDb[index].isFinite())
-            previousFrequency = frequency
-        }
-    }
-
-    override fun equals(other: Any?): Boolean =
-        other is MeasurementTrace &&
-            frequenciesHz.contentEquals(other.frequenciesHz) &&
-            magnitudesDb.contentEquals(other.magnitudesDb)
-
-    override fun hashCode(): Int = 31 * frequenciesHz.contentHashCode() + magnitudesDb.contentHashCode()
-}
-
-internal data class MeasurementResponse(
-    val sessionId: String,
-    val current: Int,
-    val total: Int,
-    val left: MeasurementTrace?,
-    val right: MeasurementTrace?
-) {
-    init {
-        require(isValidMeasurementSessionId(sessionId))
-        require(total in 1..256 && current in 0..total)
-        require(left != null || right != null)
-    }
-}
-
-internal object MeasurementResponsePayload {
-    fun fromValues(
-        sessionId: String,
-        current: Int,
-        total: Int,
-        leftFrequenciesHz: DoubleArray?,
-        leftMagnitudesDb: DoubleArray?,
-        rightFrequenciesHz: DoubleArray?,
-        rightMagnitudesDb: DoubleArray?
-    ): MeasurementResponse? = try {
-        MeasurementResponse(
-            sessionId = sessionId,
-            current = current,
-            total = total,
-            left = traceFromValues(leftFrequenciesHz, leftMagnitudesDb),
-            right = traceFromValues(rightFrequenciesHz, rightMagnitudesDb)
-        )
-    } catch (_: IllegalArgumentException) {
-        null
-    }
-
-    fun parse(value: JSONObject): MeasurementResponse? = try {
-        if (!value.has("sessionId") || !value.has("current") || !value.has("total") ||
-            !value.has("left") || !value.has("right")
-        ) return null
-
-        val sessionId = value.get("sessionId") as? String ?: return null
-        if (!isValidMeasurementSessionId(sessionId)) return null
-        val current = jsonInt(value.get("current")) ?: return null
-        val total = jsonInt(value.get("total")) ?: return null
-        if (total < 1 || current !in 0..total) return null
-
-        val left = if (value.isNull("left")) null else optionalTrace(value, "left")
-        val right = if (value.isNull("right")) null else optionalTrace(value, "right")
-        fromValues(
-            sessionId = sessionId,
-            current = current,
-            total = total,
-            leftFrequenciesHz = left?.frequenciesHz,
-            leftMagnitudesDb = left?.magnitudesDb,
-            rightFrequenciesHz = right?.frequenciesHz,
-            rightMagnitudesDb = right?.magnitudesDb
-        )
-    } catch (_: Exception) {
-        null
-    }
-
-    private fun optionalTrace(value: JSONObject, key: String): MeasurementTrace? {
-        if (value.isNull(key)) return null
-        val channel = value.get(key) as? JSONObject ?: throw IllegalArgumentException("$key is not an object")
-        return parseTrace(channel) ?: throw IllegalArgumentException("$key is invalid")
-    }
-
-    private fun parseTrace(value: JSONObject): MeasurementTrace? {
-        val frequencies = value.get("frequenciesHz") as? JSONArray ?: return null
-        val magnitudes = value.get("magnitudesDb") as? JSONArray ?: return null
-        if (frequencies.length() !in 2..64 || magnitudes.length() != frequencies.length()) return null
-
-        val frequencyValues = DoubleArray(frequencies.length())
-        val magnitudeValues = DoubleArray(magnitudes.length())
-        for (index in frequencyValues.indices) {
-            frequencyValues[index] = jsonNumber(frequencies.get(index)) ?: return null
-            magnitudeValues[index] = jsonNumber(magnitudes.get(index)) ?: return null
-        }
-        return try {
-            MeasurementTrace(frequencyValues, magnitudeValues)
-        } catch (_: IllegalArgumentException) {
-            null
-        }
-    }
-
-    private fun traceFromValues(
-        frequenciesHz: DoubleArray?,
-        magnitudesDb: DoubleArray?
-    ): MeasurementTrace? {
-        if (frequenciesHz == null && magnitudesDb == null) return null
-        if (frequenciesHz == null || magnitudesDb == null) throw IllegalArgumentException("incomplete trace")
-        return MeasurementTrace(frequenciesHz, magnitudesDb)
-    }
-
-    private fun jsonNumber(value: Any): Double? =
-        (value as? Number)?.toDouble()?.takeIf { it.isFinite() }
-
-    private fun jsonInt(value: Any): Int? {
-        val number = jsonNumber(value) ?: return null
-        if (number < Int.MIN_VALUE || number > Int.MAX_VALUE || number != number.toLong().toDouble()) return null
-        return number.toInt()
-    }
-}
-
-internal fun isValidMeasurementSessionId(value: String): Boolean =
-    value.isNotBlank() &&
-        value.length <= MAX_MEASUREMENT_SESSION_ID_LENGTH &&
-        value.none { it.isWhitespace() }
-
-internal fun shouldForwardMeasurementResponse(activeSessionId: String?, response: MeasurementResponse): Boolean =
-    activeSessionId != null && activeSessionId == response.sessionId
 
 class MeasurementController(
     private val context: Context,
@@ -170,64 +47,7 @@ class MeasurementController(
     companion object {
         private const val TAG = "SweetSpotMeasurement"
         private const val WATCHDOG_MS = 60_000L
-        private const val PCM_CHUNK_FRAMES = 4_096
-        private const val PCM_CHUNK_SAMPLES = PCM_CHUNK_FRAMES * 2
-        private const val PCM_WRITE_RETRY_MS = 2L
     }
-
-    private sealed interface SessionState {
-        data object Idle : SessionState
-        data class AwaitingUi(val session: Session) : SessionState
-        data class Ready(
-            val session: Session,
-            val sweep: MeasurementSweep,
-            val channel: String,
-            val context: MeasurementContext?
-        ) : SessionState
-        data class Playing(
-            val session: Session,
-            val sweep: MeasurementSweep,
-            val channel: String,
-            val context: MeasurementContext?
-        ) : SessionState
-        data class Loudness(val session: Session) : SessionState
-        data class AwaitingValidationFinalization(val session: Session) : SessionState
-        data class ValidationFinalized(val session: Session) : SessionState
-        data class Finishing(val session: Session) : SessionState
-    }
-
-    private data class Session(
-        val id: String,
-        val channel: String,
-        val phase: String,
-        val candidateId: String?,
-        var emit: (String, org.json.JSONObject, String?) -> Unit,
-        var replyTo: String?,
-        val rollbackTargetActive: Boolean? = null,
-        var continuedPositionContext: MeasurementContext? = null,
-        var validationFinalizationBlocked: Boolean = false,
-        var validationFatal: Boolean = false,
-        var validationOverrideApplied: Boolean = false,
-        var validationOverrideRestored: Boolean = false,
-        val validationRecoveryGate: ValidationRecoveryGate = ValidationRecoveryGate(),
-        var validationRecoveryResult: ValidationRecoveryResult? = null,
-        var validationRecoveryEventsPublished: Boolean = false,
-        var endedEventPublished: Boolean = false,
-        var validationAbortError: Pair<String, String>? = null,
-        var cancellationRequested: Boolean = false,
-        var audioOperationHeld: Boolean = false,
-        var finalOutcome: String? = null,
-    )
-
-    private class PlaybackResources(val track: AudioTrack) {
-        @Volatile
-        var stopped = false
-    }
-
-    private data class PreparedLoudness(
-        val resources: PlaybackResources,
-        val stream: PinkNoiseGenerator.StereoStream
-    )
 
     private val audioManager = context.getSystemService(AudioManager::class.java)
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -240,10 +60,6 @@ class MeasurementController(
     private val sessionFence = MeasurementSessionFence()
     private var state: SessionState = SessionState.Idle
     private var focusRequest: AudioFocusRequest? = null
-    @Volatile
-    private var playbackResources: PlaybackResources? = null
-    private val playbackLock = Any()
-    private var preparedSweep: MeasurementSweep? = null
     private var bypassState: MeasurementAudioState? = null
     private var watchdog: ScheduledFuture<*>? = null
     @Volatile
@@ -253,6 +69,8 @@ class MeasurementController(
         .setUsage(AudioAttributes.USAGE_MEDIA)
         .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
         .build()
+    private val audioPlayback = MeasurementAudioPlayback(audioAttributes) { !closed }
+    private val audioRunner = MeasurementAudioRunner(audioPlayback) { session -> activeSession === session }
 
     fun begin(
         sessionId: String,
@@ -355,10 +173,10 @@ class MeasurementController(
                         return@submit
                     }
                 }
-                val sweep = prepareSweep(session.channel)
+                val sweep = audioPlayback.prepareSweep(session.channel)
                 state = SessionState.Ready(session, sweep, session.channel, null)
-                session.emit("calibrationSession.started", JSONObjectPayload.session(session), session.replyTo)
-                session.emit("measurement.ready", JSONObjectPayload.ready(session, sweep), session.replyTo)
+                session.emit("calibrationSession.started", sessionPayload(session), session.replyTo)
+                session.emit("measurement.ready", MeasurementSessionPayloads.ready(sessionPayloadState(session), sweep), session.replyTo)
                 CalibrationActivity.updateStatus(
                     sessionId,
                     if (session.phase == "validation") {
@@ -454,7 +272,7 @@ class MeasurementController(
                     CalibrationActivity.updatePrimaryAction(session.id, null)
                     session.emit(
                         "calibrationSession.position.continued",
-                        JSONObjectPayload.positionContinued(session, context),
+                        MeasurementSessionPayloads.positionContinued(session.id, context),
                         session.replyTo,
                     )
                     touchWatchdog()
@@ -553,13 +371,13 @@ class MeasurementController(
                 return@submit
             }
             try {
-                stopAudioTrack()
-                val prepared = prepareLoudness()
+                audioPlayback.stop()
+                val prepared = audioPlayback.prepareLoudness()
                 state = SessionState.Loudness(session)
-                playTrack(prepared.resources)
+                audioPlayback.play(prepared.resources)
                 session.emit(
                     "calibrationSession.loudness.started",
-                    JSONObjectPayload.loudnessStarted(session, prepared.resources.track.sampleRate),
+                    MeasurementSessionPayloads.loudnessStarted(sessionPayloadState(session), prepared.resources.track.sampleRate),
                     replyTo
                 )
                 CalibrationActivity.updateStatus(
@@ -569,7 +387,13 @@ class MeasurementController(
                 CalibrationActivity.updatePrimaryAction(sessionId, "Continue")
                 touchWatchdog()
                 Thread {
-                    playLoudness(session, prepared)
+                    audioRunner.playLoudness(session, prepared) { error ->
+                        submit {
+                            if (activeSession === session && audioPlayback.resources === prepared.resources) {
+                                finishWithError(session, "sweep_playback_failed", error.message ?: "Loudness playback failed")
+                            }
+                        }
+                    }
                 }.apply {
                     name = "sweetspot-loudness-playback"
                     isDaemon = true
@@ -601,10 +425,10 @@ class MeasurementController(
     private fun stopLoudnessInternal(session: Session) {
         state = SessionState.Finishing(session)
         try {
-            stopAudioTrack()
-            val sweep = prepareSweep(session.channel)
+            audioPlayback.stop()
+            val sweep = audioPlayback.prepareSweep(session.channel)
             state = SessionState.Ready(session, sweep, session.channel, null)
-            session.emit("calibrationSession.loudness.stopped", JSONObjectPayload.session(session), session.replyTo)
+            session.emit("calibrationSession.loudness.stopped", sessionPayload(session), session.replyTo)
             CalibrationActivity.updateStatus(session.id, "Volume locked.\nThe TV will guide the next measurement.")
             CalibrationActivity.updatePrimaryAction(session.id, null)
             touchWatchdog()
@@ -722,12 +546,12 @@ class MeasurementController(
                         return@submit
                     }
                     try {
-                        val sweep = prepareSweep(route, context?.captureKind ?: "position-composite")
+                        val sweep = audioPlayback.prepareSweep(route, context?.captureKind ?: "position-composite")
                         if (context == null || !context.sameCapture(session.continuedPositionContext)) {
                             session.continuedPositionContext = null
                         }
                         state = SessionState.Ready(session, sweep, route, context)
-                        emit("measurement.ready", JSONObjectPayload.ready(session, sweep, context), replyTo)
+                        emit("measurement.ready", MeasurementSessionPayloads.ready(sessionPayloadState(session), sweep, context), replyTo)
                         CalibrationActivity.updatePositionGuide(sessionId, context, CalibrationGuideState.READY)
                         CalibrationActivity.updateStatus(sessionId, context?.readyStatus() ?: "TV ready. Follow the instructions shown here.")
                         CalibrationActivity.updatePrimaryAction(
@@ -772,13 +596,13 @@ class MeasurementController(
             }
             session.emit = emit
             session.replyTo = replyTo
-            val playback = playbackResources
+            val playback = audioPlayback.resources
             if (playback == null) {
                 finishWithError(session, "sweep_playback_failed", "Sweep AudioTrack is unavailable")
                 return@submit
             }
             try {
-                playTrack(playback)
+                audioPlayback.play(playback)
                 val playbackContext = context ?: current.context
                 val playbackChannel = playbackContext?.repairChannel
                     ?.takeUnless { it == "both" }
@@ -788,11 +612,38 @@ class MeasurementController(
                     CalibrationActivity.updatePositionGuide(sessionId, it, CalibrationGuideState.MEASURING)
                 }
                 CalibrationActivity.updatePrimaryAction(sessionId, null)
-                emit("measurement.started", JSONObjectPayload.started(session, current.sweep, playbackContext), replyTo)
+                emit("measurement.started", MeasurementSessionPayloads.started(sessionPayloadState(session), current.sweep, playbackContext), replyTo)
                 CalibrationActivity.updateStatus(sessionId, playbackContext?.let { "${it.label()}\nPlaying measurement sweep…" } ?: "Playing measurement sweep…")
                 touchWatchdog()
                 Thread {
-                    playSweep(session, current.sweep, playbackChannel, playbackContext, playback)
+                    audioRunner.playSweep(
+                        session,
+                        current.sweep,
+                        playbackChannel,
+                        playbackContext,
+                        playback,
+                        onFinished = {
+                            submit {
+                                if (activeSession !== session ||
+                                    state !is SessionState.Playing ||
+                                    audioPlayback.resources !== playback ||
+                                    playback.stopped
+                                ) return@submit
+                                audioPlayback.pause()
+                                state = SessionState.Ready(session, current.sweep, playbackChannel, playbackContext)
+                                touchWatchdog()
+                                session.emit("measurement.finished", MeasurementSessionPayloads.finished(session.id, playbackContext), session.replyTo)
+                                CalibrationActivity.updateStatus(session.id, playbackContext?.let { "${it.label()}\nSweep finished. Keep the phone still." } ?: "Sweep finished. Keep the phone still or cancel.")
+                            }
+                        },
+                        onFailure = { error ->
+                            submit {
+                                if (activeSession === session && audioPlayback.resources === playback) {
+                                    finishWithError(session, "sweep_playback_failed", error.message ?: "Sweep playback failed")
+                                }
+                            }
+                        },
+                    )
                 }.apply {
                     name = "sweetspot-sweep-playback"
                     isDaemon = true
@@ -809,232 +660,25 @@ class MeasurementController(
     fun shutdown() {
         if (closed) return
         closed = true
-        stopAudioTrack()
+        audioPlayback.stop()
         val done = CountDownLatch(1)
         try {
             executor.execute {
                 try {
                     activeSession?.let { finishCancelled(it, "calibration_aborted", "Service stopped") }
                 } finally {
-                    stopAudioTrack()
+                    audioPlayback.stop()
                     done.countDown()
                 }
             }
             done.await(2, TimeUnit.SECONDS)
         } catch (_: Throwable) {
-            stopAudioTrack()
+            audioPlayback.stop()
         } finally {
-            stopAudioTrack()
+            audioPlayback.stop()
             activeSession?.let(::releaseSessionAudioOperation)
             executor.shutdownNow()
         }
-    }
-
-    private fun playSweep(
-        session: Session,
-        sweep: MeasurementSweep,
-        channel: String,
-        context: MeasurementContext?,
-        playback: PlaybackResources
-    ) {
-        try {
-            val buffer = ShortArray(PCM_CHUNK_SAMPLES)
-            var firstFrame = 0
-            while (firstFrame < sweep.totalFrames && activeSession === session && !playback.stopped) {
-                val frameCount = minOf(PCM_CHUNK_FRAMES, sweep.totalFrames - firstFrame)
-                MeasurementSweepGenerator.writeStereoPcm(
-                    sweep,
-                    channel,
-                    firstFrame,
-                    frameCount,
-                    buffer
-                )
-                if (!writePcm(playback, buffer, frameCount * 2)) return
-                firstFrame += frameCount
-            }
-            if (firstFrame != sweep.totalFrames || activeSession !== session || playback.stopped) return
-            while (activeSession === session && !playback.stopped) {
-                val playbackHeadPosition = playbackHeadPosition(playback) ?: return
-                if (playbackHeadPosition >= sweep.totalFrames) break
-                Thread.sleep(20)
-            }
-            if (playback.stopped) return
-            submit {
-                if (activeSession !== session ||
-                    state !is SessionState.Playing ||
-                    playbackResources !== playback ||
-                    playback.stopped
-                ) return@submit
-                pauseAudioTrack()
-                state = SessionState.Ready(session, sweep, channel, context)
-                touchWatchdog()
-                session.emit("measurement.finished", JSONObjectPayload.finished(session, context), session.replyTo)
-                CalibrationActivity.updateStatus(session.id, context?.let { "${it.label()}\nSweep finished. Keep the phone still." } ?: "Sweep finished. Keep the phone still or cancel.")
-            }
-        } catch (error: Throwable) {
-            submit {
-                if (activeSession === session && playbackResources === playback) {
-                    finishWithError(session, "sweep_playback_failed", error.message ?: "Sweep playback failed")
-                }
-            }
-        }
-    }
-
-    private fun playLoudness(session: Session, prepared: PreparedLoudness) {
-        try {
-            val buffer = ShortArray(PCM_CHUNK_SAMPLES)
-            while (activeSession === session && !prepared.resources.stopped) {
-                val frameCount = minOf(PCM_CHUNK_FRAMES, prepared.stream.remainingFrames)
-                if (frameCount == 0) {
-                    prepared.stream.reset()
-                    continue
-                }
-                prepared.stream.write(buffer, frameCount)
-                if (!writePcm(prepared.resources, buffer, frameCount * 2)) return
-                if (prepared.stream.remainingFrames == 0) prepared.stream.reset()
-            }
-        } catch (error: Throwable) {
-            submit {
-                if (activeSession === session && playbackResources === prepared.resources) {
-                    finishWithError(session, "sweep_playback_failed", error.message ?: "Loudness playback failed")
-                }
-            }
-        }
-    }
-
-    private fun writePcm(playback: PlaybackResources, buffer: ShortArray, sampleCount: Int): Boolean {
-        var offset = 0
-        while (offset < sampleCount) {
-            val written = synchronized(playback) {
-                if (playback.stopped) null else playback.track.write(
-                    buffer,
-                    offset,
-                    sampleCount - offset,
-                    AudioTrack.WRITE_NON_BLOCKING
-                )
-            } ?: return false
-            when {
-                written > 0 -> offset += written
-                written == 0 -> Thread.sleep(PCM_WRITE_RETRY_MS)
-                else -> throw IllegalStateException("AudioTrack wrote $written samples")
-            }
-        }
-        return true
-    }
-
-    private fun playTrack(playback: PlaybackResources) {
-        synchronized(playback) {
-            if (playback.stopped) throw IllegalStateException("AudioTrack is unavailable")
-            playback.track.play()
-        }
-    }
-
-    private fun playbackHeadPosition(playback: PlaybackResources): Int? = synchronized(playback) {
-        if (playback.stopped) null else playback.track.playbackHeadPosition
-    }
-
-    private fun installPlaybackResources(track: AudioTrack): PlaybackResources {
-        val resources = PlaybackResources(track)
-        synchronized(playbackLock) {
-            if (closed || playbackResources != null) {
-                throw IllegalStateException("AudioTrack is unavailable")
-            }
-            playbackResources = resources
-        }
-        return resources
-    }
-
-    private fun prepareSweep(channel: String, captureKind: String = "position-composite"): MeasurementSweep {
-        preparedSweep?.let { sweep ->
-            if (playbackResources != null && sweep.captureKind == captureKind) return sweep
-            if (playbackResources != null && sweep.captureKind != captureKind) stopAudioTrack()
-        }
-        val nativeRate = AudioTrack.getNativeOutputSampleRate(AudioManager.STREAM_MUSIC)
-        val candidateRates = listOf(48_000, nativeRate).filter { it > 0 }.distinct()
-        var lastError: Throwable? = null
-        for (sampleRate in candidateRates) {
-            var track: AudioTrack? = null
-            try {
-                val minBuffer = AudioTrack.getMinBufferSize(
-                    sampleRate,
-                    AudioFormat.CHANNEL_OUT_STEREO,
-                    AudioFormat.ENCODING_PCM_16BIT
-                )
-                if (minBuffer == AudioTrack.ERROR_BAD_VALUE || minBuffer == AudioTrack.ERROR) continue
-                val sweep = MeasurementSweep(sampleRate, captureKind = captureKind)
-                val format = AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                    .build()
-                track = AudioTrack.Builder()
-                    .setAudioAttributes(audioAttributes)
-                    .setAudioFormat(format)
-                    .setBufferSizeInBytes(minBuffer)
-                    .setTransferMode(AudioTrack.MODE_STREAM)
-                    .build()
-                val candidate = requireNotNull(track)
-                if (candidate.state != AudioTrack.STATE_INITIALIZED) {
-                    throw IllegalStateException("AudioTrack failed to initialize at $sampleRate Hz")
-                }
-                if (candidate.sampleRate != sampleRate) {
-                    throw IllegalStateException("AudioTrack selected ${candidate.sampleRate} Hz for a $sampleRate Hz sweep")
-                }
-                installPlaybackResources(candidate)
-                track = null
-                preparedSweep = sweep
-                Log.i(TAG, "AudioTrack prepared: rate=${candidate.sampleRate}, buffer=$minBuffer, frames=${sweep.totalFrames}")
-                return sweep
-            } catch (error: Throwable) {
-                try { track?.release() } catch (_: Throwable) {}
-                lastError = error
-            }
-        }
-        throw lastError ?: IllegalStateException("No usable stereo PCM output rate")
-    }
-
-    private fun prepareLoudness(): PreparedLoudness {
-        val nativeRate = AudioTrack.getNativeOutputSampleRate(AudioManager.STREAM_MUSIC)
-        val candidateRates = listOf(48_000, nativeRate).filter { it > 0 }.distinct()
-        var lastError: Throwable? = null
-        for (sampleRate in candidateRates) {
-            var track: AudioTrack? = null
-            try {
-                val minBuffer = AudioTrack.getMinBufferSize(
-                    sampleRate,
-                    AudioFormat.CHANNEL_OUT_STEREO,
-                    AudioFormat.ENCODING_PCM_16BIT
-                )
-                if (minBuffer == AudioTrack.ERROR_BAD_VALUE || minBuffer == AudioTrack.ERROR) continue
-                val stream = PinkNoiseGenerator.createStereoStream(sampleRate)
-                val format = AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                    .build()
-                track = AudioTrack.Builder()
-                    .setAudioAttributes(audioAttributes)
-                    .setAudioFormat(format)
-                    .setBufferSizeInBytes(minBuffer)
-                    .setTransferMode(AudioTrack.MODE_STREAM)
-                    .build()
-                val candidate = requireNotNull(track)
-                if (candidate.state != AudioTrack.STATE_INITIALIZED) {
-                    throw IllegalStateException("AudioTrack failed to initialize at $sampleRate Hz")
-                }
-                if (candidate.sampleRate != sampleRate) {
-                    throw IllegalStateException("AudioTrack selected ${candidate.sampleRate} Hz for pink noise")
-                }
-                val resources = installPlaybackResources(candidate)
-                track = null
-                Log.i(TAG, "Pink-noise AudioTrack prepared: rate=${candidate.sampleRate}, buffer=$minBuffer, frames=${stream.frameCount}")
-                return PreparedLoudness(resources, stream)
-            } catch (error: Throwable) {
-                try { track?.release() } catch (_: Throwable) {}
-                lastError = error
-            }
-        }
-        throw lastError ?: IllegalStateException("No usable stereo PCM output rate for pink noise")
     }
 
     private fun requestExclusiveFocus(): Boolean {
@@ -1067,7 +711,7 @@ class MeasurementController(
         submit {
             activeSession?.let {
                 finishWithError(it, "audio_focus_lost", "Audio focus was lost")
-            } ?: stopAudioTrack()
+            } ?: audioPlayback.stop()
         }
     }
 
@@ -1108,7 +752,7 @@ class MeasurementController(
         else if (error != null) session.finalOutcome = "error"
         watchdog?.cancel(false)
         watchdog = null
-        stopAudioTrack()
+        audioPlayback.stop()
 
         focusRequest?.let { request ->
             try {
@@ -1245,7 +889,7 @@ class MeasurementController(
         if (!session.validationRecoveryEventsPublished) {
             publishStateSnapshot(session)
             finalError?.let { (code, message) ->
-                session.emit("measurement.error", JSONObjectPayload.error(session.id, code, message), session.replyTo)
+                session.emit("measurement.error", MeasurementSessionPayloads.error(session.id, code, message), session.replyTo)
             }
             publishSessionEnded(session)
             session.validationRecoveryEventsPublished = true
@@ -1280,14 +924,14 @@ class MeasurementController(
 
     private fun publishSessionEvents(session: Session, error: Pair<String, String>?) {
         error?.let { (code, message) ->
-            session.emit("measurement.error", JSONObjectPayload.error(session.id, code, message), session.replyTo)
+            session.emit("measurement.error", MeasurementSessionPayloads.error(session.id, code, message), session.replyTo)
         }
         publishSessionEnded(session)
     }
 
     private fun publishSessionEnded(session: Session) {
         if (session.endedEventPublished) return
-        session.emit("calibrationSession.ended", JSONObjectPayload.session(session), session.replyTo)
+        session.emit("calibrationSession.ended", sessionPayload(session), session.replyTo)
         session.endedEventPublished = true
     }
 
@@ -1335,31 +979,6 @@ class MeasurementController(
         releaseAudioOperation()
     }
 
-    private fun stopAudioTrack() {
-        val resources = synchronized(playbackLock) {
-            val current = playbackResources
-            playbackResources = null
-            preparedSweep = null
-            current?.stopped = true
-            current
-        } ?: return
-        synchronized(resources) {
-            try { resources.track.stop() } catch (_: Throwable) {}
-            try { resources.track.flush() } catch (_: Throwable) {}
-            try { resources.track.release() } catch (_: Throwable) {}
-        }
-    }
-
-    private fun pauseAudioTrack() {
-        val resources = playbackResources ?: return
-        synchronized(resources) {
-            resources.stopped = true
-            try { resources.track.stop() } catch (_: Throwable) {}
-            try { resources.track.flush() } catch (_: Throwable) {}
-            resources.stopped = false
-        }
-    }
-
     private fun touchWatchdog() {
         watchdog?.cancel(false)
         watchdog = executor.schedule({
@@ -1386,7 +1005,7 @@ class MeasurementController(
         code: String,
         message: String
     ) {
-        emit("measurement.error", JSONObjectPayload.error(sessionId, code, message), replyTo)
+        emit("measurement.error", MeasurementSessionPayloads.error(sessionId, code, message), replyTo)
     }
 
     private fun submit(block: () -> Unit) {
@@ -1398,75 +1017,15 @@ class MeasurementController(
         }
     }
 
-    private object JSONObjectPayload {
-        fun session(session: Session): org.json.JSONObject =
-            org.json.JSONObject()
-                .put("sessionId", session.id)
-                .put("channel", session.channel)
-                .put("phase", session.phase)
-                .put("outcome", session.finalOutcome ?: if (session.cancellationRequested) "cancelled" else "error")
-                .put("completedSessionId", session.id)
+    private fun sessionPayload(session: Session): JSONObject =
+        MeasurementSessionPayloads.session(sessionPayloadState(session))
 
-        fun ready(
-            session: Session,
-            sweep: MeasurementSweep,
-            context: MeasurementContext? = null
-        ): org.json.JSONObject =
-            session(session).put("sweep", sweep(sweep)).also { payload ->
-                context?.let { payload.put("context", it.toJson()) }
-            }
-
-        fun started(
-            session: Session,
-            sweep: MeasurementSweep,
-            context: MeasurementContext? = null
-        ): org.json.JSONObject =
-            session(session).put("sweep", sweep(sweep)).also { payload ->
-                context?.let { payload.put("context", it.toJson()) }
-            }
-
-        fun finished(session: Session, context: MeasurementContext? = null): org.json.JSONObject =
-            org.json.JSONObject().put("sessionId", session.id).also { payload ->
-                context?.let { payload.put("context", it.toJson()) }
-            }
-
-        fun error(sessionId: String, code: String, message: String): org.json.JSONObject =
-            org.json.JSONObject().put("sessionId", sessionId).put("code", code).put("message", message)
-
-        fun loudnessStarted(session: Session, sampleRate: Int): org.json.JSONObject =
-            session(session)
-                .put("sampleRate", sampleRate)
-                .put("levelDbfs", PinkNoiseGenerator.DEFAULT_LEVEL_DBFS)
-                .put("loopDurationMs", PinkNoiseGenerator.DEFAULT_LOOP_DURATION_MS)
-
-        fun positionContinued(session: Session, context: MeasurementContext): org.json.JSONObject =
-            org.json.JSONObject()
-                .put("sessionId", session.id)
-                .put("context", context.toJson())
-
-        private fun sweep(sweep: MeasurementSweep): org.json.JSONObject =
-            org.json.JSONObject()
-                .put("algorithm", sweep.algorithm)
-                .put("sweepRevision", sweep.sweepRevision)
-                .put("sampleRate", sweep.sampleRate)
-                .put("startHz", sweep.startHz)
-                .put("endHz", sweep.endHz)
-                .put("durationMs", sweep.durationMs)
-                .put("preRollMs", sweep.preRollMs)
-                .put("postRollMs", sweep.postRollMs)
-                .put("syncMarkerStartHz", sweep.syncMarkerStartHz)
-                .put("syncMarkerEndHz", sweep.syncMarkerEndHz)
-                .put("syncMarkerDurationMs", sweep.syncMarkerDurationMs)
-                .put("syncMarkerGapMs", sweep.syncMarkerGapMs)
-                .put("endMarkerStartHz", sweep.endMarkerStartHz)
-                .put("endMarkerEndHz", sweep.endMarkerEndHz)
-                .put("endMarkerDurationMs", sweep.endMarkerDurationMs)
-                .put("interSweepGapMs", sweep.interSweepGapMs)
-                .put("sweepLevelDbfs", sweep.sweepLevelDbfs)
-                .put("markerLevelDbfs", sweep.markerLevelDbfs)
-                .put("fadeInMs", sweep.fadeInMs)
-                .put("fadeOutMs", sweep.fadeOutMs)
-                .put("captureKind", sweep.captureKind)
-                .put("markerChannel", sweep.markerChannel)
-    }
+    private fun sessionPayloadState(session: Session): MeasurementSessionPayloadState =
+        MeasurementSessionPayloadState(
+            sessionId = session.id,
+            channel = session.channel,
+            phase = session.phase,
+            finalOutcome = session.finalOutcome,
+            cancellationRequested = session.cancellationRequested,
+        )
 }

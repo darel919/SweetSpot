@@ -62,7 +62,7 @@ For device testing:
 ```bash
 adb connect <TV-IP>:5555
 adb install -r app/build/outputs/apk/debug/app-debug.apk
-adb shell am start -n com.darelisme.sweetspot/.MainActivity
+adb shell am start -n com.darelisme.sweetspot/.ui.MainActivity
 ```
 
 Source tests and a successful build do not prove TV audio behavior, iPhone Safari microphone behavior, direct connectivity, or the cloud-independence acceptance test. Report those separately and only after running them on the target devices.
@@ -71,13 +71,21 @@ Source tests and a successful build do not prove TV audio behavior, iPhone Safar
 
 ```text
 app/src/main/java/com/darelisme/sweetspot/
-├── audio/                 DSP and audio diagnostics
-├── calibration/           analysis, capture, persistence, playback, transport adapters
+├── audio/                 engine and diagnostics
+├── calibration/           TV-owned calibration authority
+│   ├── analysis/          acoustic analysis and validation
+│   ├── capture/           verified capture storage and readers
+│   ├── dsp/               calibration DSP adapter
+│   ├── model/             jobs, protocol models, ledger, and recovery
+│   ├── persistence/       atomic job snapshots
+│   ├── playback/          sweeps, session state, audio running, and AudioTrack ownership
+│   └── transport/         capture and calibration event adapters
+├── diagnostics/            bounded device and audio diagnostics orchestration
 ├── pairing/               rendezvous credentials and lifetime
 ├── transport/             protocol, signaling, and WebRTC implementation
 ├── server/                local authenticated HTTP API
-├── ui/                    native overlay and TV controls
-└── SweetSpotService.kt    lifecycle orchestration
+├── service/               foreground-service lifecycle and command orchestration
+└── ui/                    native overlay and TV controls
 ```
 
 Calibration policy and analysis stay under `calibration/`. Generic peer and signaling code stays under `transport/`. The service coordinates ownership and lifecycle without implementing WebRTC or acoustic analysis.

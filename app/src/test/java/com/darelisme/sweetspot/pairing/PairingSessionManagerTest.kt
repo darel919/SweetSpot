@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.pairing
 
 import com.darelisme.sweetspot.pairing.PairingSessionManager
 import org.junit.Assert.assertEquals

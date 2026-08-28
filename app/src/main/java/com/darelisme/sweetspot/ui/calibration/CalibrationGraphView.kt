@@ -1,5 +1,7 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.ui.calibration
 
+import com.darelisme.sweetspot.calibration.model.MeasurementResponse
+import com.darelisme.sweetspot.calibration.model.MeasurementTrace
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint

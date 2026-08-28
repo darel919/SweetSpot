@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.service
 
 internal enum class SweetSpotStartReason {
     USER_LAUNCH,

@@ -1,4 +1,6 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.calibration.model
+
+import com.darelisme.sweetspot.audio.engine.DynamicsProcessingEq
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull

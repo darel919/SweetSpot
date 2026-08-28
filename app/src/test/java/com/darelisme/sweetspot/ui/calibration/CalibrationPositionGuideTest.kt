@@ -1,4 +1,6 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.ui.calibration
+
+import com.darelisme.sweetspot.calibration.model.MeasurementContext
 
 import org.junit.Assert.assertEquals
 import org.junit.Test

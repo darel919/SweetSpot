@@ -1,82 +1,62 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.service
 
+import com.darelisme.sweetspot.BuildConfig
+import com.darelisme.sweetspot.R
+import com.darelisme.sweetspot.audio.diagnostics.AudioEffectDiagnostics
+import com.darelisme.sweetspot.audio.diagnostics.DynamicsProcessingProbe
+import com.darelisme.sweetspot.audio.engine.AudioEngine
+import com.darelisme.sweetspot.audio.engine.AudioOperationGate
+import com.darelisme.sweetspot.audio.engine.DynamicsProcessingEq
+import com.darelisme.sweetspot.audio.engine.ProfileStore
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.media.audiofx.Virtualizer
 import android.os.IBinder
-import android.os.Debug
 import android.os.Handler
 import android.os.Looper
-import android.system.Os
-import android.system.OsConstants
 import android.util.Log
 import android.widget.Toast
-import com.darelisme.sweetspot.calibration.AndroidResponseV1Analyzer
-import com.darelisme.sweetspot.calibration.CalibrationCaptureStore
-import com.darelisme.sweetspot.calibration.transport.CalibrationCaptureStreamFrame
+import com.darelisme.sweetspot.calibration.analysis.AndroidResponseV1Analyzer
+import com.darelisme.sweetspot.calibration.capture.CalibrationCaptureStore
 import com.darelisme.sweetspot.calibration.transport.CalibrationCaptureStreamReceiver
 import com.darelisme.sweetspot.calibration.CalibrationEngine
 import com.darelisme.sweetspot.calibration.CalibrationEngineListener
 import com.darelisme.sweetspot.calibration.CalibrationEngineResult
-import com.darelisme.sweetspot.calibration.CalibrationJob
-import com.darelisme.sweetspot.calibration.CalibrationJobId
-import com.darelisme.sweetspot.calibration.CalibrationJobJson
-import com.darelisme.sweetspot.calibration.CalibrationPhase
-import com.darelisme.sweetspot.calibration.CaptureAttempt
-import com.darelisme.sweetspot.calibration.CalibrationPosition
-import com.darelisme.sweetspot.calibration.CaptureId
-import com.darelisme.sweetspot.calibration.CaptureChannel
-import com.darelisme.sweetspot.calibration.TvCalibrationDsp
-import com.darelisme.sweetspot.calibration.TvCalibrationPlayback
+import com.darelisme.sweetspot.calibration.model.CalibrationJob
+import com.darelisme.sweetspot.calibration.model.CalibrationJobId
+import com.darelisme.sweetspot.calibration.model.CalibrationJobJson
+import com.darelisme.sweetspot.calibration.model.CalibrationPhase
+import com.darelisme.sweetspot.calibration.model.CaptureAttempt
+import com.darelisme.sweetspot.calibration.model.CaptureId
+import com.darelisme.sweetspot.calibration.dsp.TvCalibrationDsp
+import com.darelisme.sweetspot.calibration.persistence.CalibrationJobStore
+import com.darelisme.sweetspot.calibration.playback.TvCalibrationPlayback
+import com.darelisme.sweetspot.calibration.model.CalibrationCandidateTransaction
+import com.darelisme.sweetspot.calibration.model.CalibrationValidationStatus
+import com.darelisme.sweetspot.calibration.playback.MeasurementController
+import com.darelisme.sweetspot.diagnostics.SweetSpotDiagnostics
+import com.darelisme.sweetspot.diagnostics.SweetSpotDiagnosticsAudioPort
+import com.darelisme.sweetspot.diagnostics.SweetSpotDiagnosticsCoordinator
+import com.darelisme.sweetspot.calibration.playback.MeasurementSweep
+import com.darelisme.sweetspot.pairing.DeviceIdentity
 import com.darelisme.sweetspot.pairing.PairingSessionManager
+import com.darelisme.sweetspot.server.WebServer
+import com.darelisme.sweetspot.server.ServiceActions
 import com.darelisme.sweetspot.transport.PeerTransport
 import com.darelisme.sweetspot.transport.PeerTransportDiagnostics
 import com.darelisme.sweetspot.transport.PeerTransportState
 import com.darelisme.sweetspot.transport.webrtc.WebRtcPeerTransport
+import com.darelisme.sweetspot.ui.OverlayController
+import com.darelisme.sweetspot.ui.OverlayActions
+import com.darelisme.sweetspot.ui.OverlayPresetOption
+import com.darelisme.sweetspot.ui.OverlayState
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.io.FileInputStream
-import java.util.concurrent.Executors
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import kotlin.math.roundToInt
-import kotlin.math.pow
-
-internal fun parseStrictCalibrationArray(value: JSONArray?): FloatArray? {
-    if (value == null || value.length() != DynamicsProcessingEq.INTERNAL_BANDS) return null
-    return try {
-        FloatArray(DynamicsProcessingEq.INTERNAL_BANDS) { index ->
-            val parsed = value.getDouble(index)
-            require(parsed.isFinite())
-            parsed.toFloat().also { require(it.isFinite()) }
-        }
-    } catch (_: Throwable) {
-        null
-    }
-}
-
-internal fun parseStrictProbeArray(value: JSONArray?, expectedBands: Int): FloatArray? {
-    if (value == null || expectedBands <= 0 || value.length() != expectedBands) return null
-    return try {
-        FloatArray(expectedBands) { index ->
-            val parsed = value.getDouble(index)
-            require(parsed.isFinite())
-            parsed.toFloat().also {
-                require(it.isFinite())
-                require(it >= DynamicsProcessingProbe.MIN_PROBE_GAIN_DB)
-                require(it <= DynamicsProcessingProbe.MAX_PROBE_GAIN_DB)
-            }
-        }
-    } catch (_: Throwable) {
-        null
-    }
-}
 
 /**
  * Long-lived owner of the audio DSP objects and the control web server.
@@ -90,7 +70,7 @@ internal fun parseStrictProbeArray(value: JSONArray?, expectedBands: Int): Float
  * The service itself is not exported; external callers (e.g. ADB during
  * development) go through [SweetSpotCommandReceiver].
  */
-class SweetSpotService : Service(), ServiceActions {
+class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
 
     companion object {
         private const val TAG = "SweetSpot"
@@ -148,19 +128,19 @@ class SweetSpotService : Service(), ServiceActions {
     }
     private lateinit var profileStore: ProfileStore
 
-    /** Serializes probe runs so a burst of broadcasts cannot overlap probes. */
-    private val probeExecutor = Executors.newSingleThreadExecutor()
     private val audioOperationGate = AudioOperationGate()
+    private val diagnostics = SweetSpotDiagnosticsCoordinator(
+        operationGate = audioOperationGate,
+        audioPort = object : SweetSpotDiagnosticsAudioPort {
+            override fun currentEq(): DynamicsProcessingEq? = engine as? DynamicsProcessingEq
 
-    /** Last capacity-probe results surfaced to the web UI. */
-    private var lastProbeResults: List<DynamicsProcessingProbe.ProbeResult>? = null
-    private val probeRunning = AtomicBoolean(false)
-    private var persistentBands: Int = 0
-    private var persistentCurveName: String? = null
-    @Volatile
-    private var persistentProbeLeaseHeld = false
-    @Volatile
-    private var persistentProbeError: String? = null
+            override fun isMeasurementActive(): Boolean = measurementController?.isActive() == true
+
+            override fun suspendProduction() = this@SweetSpotService.suspendProduction()
+
+            override fun resumeProduction() = this@SweetSpotService.resumeProduction()
+        },
+    )
     @Volatile
     private var measurementRestorationState: String = "none"
     @Volatile
@@ -168,8 +148,12 @@ class SweetSpotService : Service(), ServiceActions {
     @Volatile
     private var measurementRestorationError: String? = null
 
-    /** Persistent global-mix Virtualizer for spatial-widening A/B tests. */
-    private var persistentVirtualizer: Virtualizer? = null
+    override val commandContext: Context get() = this
+    override val commandAudioEngine: AudioEngine? get() = engine
+    override val commandCalibrationEngine: CalibrationEngine? get() = calibrationEngine
+    override val commandCaptureStreamReceiver: CalibrationCaptureStreamReceiver? get() = captureStreamReceiver
+    override val commandMeasurementController: MeasurementController? get() = measurementController
+    override val commandDiagnostics: SweetSpotDiagnostics get() = diagnostics
 
     /**
      * Enters the foreground before slow runtime initialization. Android allows
@@ -202,10 +186,10 @@ class SweetSpotService : Service(), ServiceActions {
             createdEngine = DynamicsProcessingEq(profileStore).also { it.initialize() }
             val calibrationSweep = MeasurementSweep(sampleRate = 48_000)
             val calibrationAnalyzer = AndroidResponseV1Analyzer()
-            val calibrationJobStore = com.darelisme.sweetspot.calibration.CalibrationJobStore(
+            val calibrationJobStore = CalibrationJobStore(
                 File(filesDir, "calibration/jobs"),
                 expectedAnalyzerRevision = calibrationAnalyzer.revision,
-                expectedSweepRevision = com.darelisme.sweetspot.calibration.SweepRevision(calibrationSweep.sweepRevision),
+                expectedSweepRevision = com.darelisme.sweetspot.calibration.model.SweepRevision(calibrationSweep.sweepRevision),
             )
             val calibrationCaptureStore = CalibrationCaptureStore(File(filesDir, "calibration/captures"))
             createdCaptureStreamReceiver = CalibrationCaptureStreamReceiver(
@@ -431,12 +415,12 @@ class SweetSpotService : Service(), ServiceActions {
                 applyPresetWithFeedback(preset)
             }
             ACTION_BYPASS -> engine?.setEnabled(false)
-            ACTION_PROBE -> runProbe()
+            ACTION_PROBE -> diagnostics.runProbe()
             ACTION_PROBE_PERSIST -> {
                 val bands = intent.getIntExtra(EXTRA_PROBE_BANDS, DynamicsProcessingEq.INTERNAL_BANDS)
-                runPersistentProbe(bands)
+                diagnostics.runPersistentProbe(bands)
             }
-            ACTION_PROBE_RELEASE -> releasePersistentProbe()
+            ACTION_PROBE_RELEASE -> diagnostics.releasePersistentProbe()
             ACTION_CALIBRATION_UI_READY ->
                 measurementController?.activityReady(intent.getStringExtra(EXTRA_SESSION_ID).orEmpty())
             ACTION_CALIBRATION_UI_CLOSED ->
@@ -456,27 +440,28 @@ class SweetSpotService : Service(), ServiceActions {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    /** Runs the temporary DynamicsProcessing band-capacity probe off the main thread. */
     override fun runProbe() {
-        Log.i(TAG, "DynamicsProcessing probe requested")
-        if (!tryAcquireDiagnosticOperation()) {
-            Log.w(TAG, "Rejecting overlapping or calibration-active DynamicsProcessing probe")
-            return
-        }
-        probeExecutor.submit {
-            try {
-                suspendProduction()
-                probeRunning.set(true)
-                lastProbeResults = DynamicsProcessingProbe().run()
-            } catch (e: Throwable) {
-                Log.e(TAG, "Probe execution error", e)
-            } finally {
-                probeRunning.set(false)
-                resumeProduction()
-                releaseDiagnosticOperation()
-            }
-        }
+        diagnostics.runProbe()
     }
+
+    override fun runPersistentProbe(bands: Int) {
+        diagnostics.runPersistentProbe(bands)
+    }
+
+    override fun releasePersistentProbe() {
+        diagnostics.releasePersistentProbe()
+    }
+
+    override fun getLastProbeResults(): List<DynamicsProcessingProbe.ProbeResult>? = diagnostics.lastProbeResults
+
+    override fun isProbeRunning(): Boolean = diagnostics.probeRunning
+
+    override fun isPersistentProbeActive(): Boolean = diagnostics.isPersistentProbeActive()
+
+    override fun getPersistentProbeBands(): Int =
+        if (diagnostics.isPersistentProbeActive()) diagnostics.persistentProbeBands else 0
+
+    override fun getPersistentProbeError(): String? = diagnostics.persistentProbeError
 
     override fun onDestroy() {
         Log.i(TAG, "Service onDestroy — hiding overlay, stopping web server, releasing engine, closing direct transport")
@@ -499,7 +484,7 @@ class SweetSpotService : Service(), ServiceActions {
         calibrationEngine = null
         calibrationPlayback?.close()
         calibrationPlayback = null
-        releasePersistentProbeBlocking()
+        diagnostics.shutdown()
         stopForeground(STOP_FOREGROUND_REMOVE)
         webServer?.stop()
         webServer = null
@@ -509,667 +494,15 @@ class SweetSpotService : Service(), ServiceActions {
             engine?.release()
             engine = null
         }
-        persistentProbeLeaseHeld = false
-        persistentBands = 0
-        persistentCurveName = null
-        persistentProbeError = null
         audioOperationGate.forceRelease()
-        try { persistentVirtualizer?.release() } catch (_: Throwable) {}
-        persistentVirtualizer = null
-        probeExecutor.shutdownNow()
         super.onDestroy()
     }
 
-    /**
-     * Enables the temporary diagnostic overlay on the production 64-band
-     * DynamicsProcessing instance. A second effect on global session 0 loses
-     * control on the TCL, so transfer/routing probes must use this owner.
-     */
-    override fun runPersistentProbe(bands: Int) {
-        Log.i(TAG, "Persistent DynamicsProcessing probe requested: $bands bands")
-        if (!tryAcquireDiagnosticOperation()) {
-            Log.w(TAG, "Rejecting persistent probe while another audio operation is active")
-            return
-        }
-        probeExecutor.submit {
-            var keepLease = false
-            try {
-                persistentProbeError = null
-                persistentCurveName = null
-                val eq = dpEq() ?: throw IllegalStateException("Production DynamicsProcessing is not initialized")
-                if (!eq.clearDiagnosticProbe()) throw IllegalStateException("Could not restore production EQ before starting the diagnostic overlay")
-                if (bands != DynamicsProcessingEq.INTERNAL_BANDS) {
-                    Log.w(TAG, "Diagnostic transfer probe requires ${DynamicsProcessingEq.INTERNAL_BANDS} bands; requested $bands")
-                    persistentBands = 0
-                    persistentProbeError = "Diagnostic transfer probe requires exactly ${DynamicsProcessingEq.INTERNAL_BANDS} bands"
-                    return@submit
-                }
-                if (eq.getChannelCount() < 1) throw IllegalStateException("Production DynamicsProcessing has no channels")
-                persistentBands = DynamicsProcessingEq.INTERNAL_BANDS
-                if (!eq.applyDiagnosticProbe(FloatArray(DynamicsProcessingEq.INTERNAL_BANDS))) {
-                    throw IllegalStateException("Production DynamicsProcessing rejected the flat diagnostic overlay")
-                }
-                persistentCurveName = "flat"
-                if (!audioOperationGate.promoteToPersistent()) {
-                    throw IllegalStateException("Persistent diagnostic probe could not retain the audio-operation lease")
-                }
-                persistentProbeLeaseHeld = true
-                keepLease = true
-                Log.i(TAG, "=== Persistent DynamicsProcessing ACTIVE ===")
-                Log.i(TAG, "Bands: $persistentBands | Channels: ${eq.getChannelCount()} | Session: 0 (production owner)")
-                Log.i(TAG, "Diagnostic overlay is ready; it is not persisted and must be released after the experiment.")
-            } catch (e: Throwable) {
-                Log.e(TAG, "Persistent probe failed for $bands bands", e)
-                persistentBands = 0
-                persistentCurveName = null
-                persistentProbeError = e.message ?: "Persistent diagnostic probe failed"
-            } finally {
-                if (!keepLease) {
-                    persistentProbeLeaseHeld = false
-                    releaseDiagnosticOperation()
-                }
-            }
-        }
-    }
-
-    /** Removes the temporary diagnostic overlay and restores production EQ. */
-    override fun releasePersistentProbe() {
-        probeExecutor.submit { releasePersistentProbeInternal() }
-    }
-
-    private fun releasePersistentProbeInternal() {
-        if (!persistentProbeLeaseHeld && dpEq()?.isDiagnosticProbeActive() != true) return
-        try {
-            val eq = dpEq() ?: throw IllegalStateException("Production DynamicsProcessing is not initialized")
-            if (!eq.clearDiagnosticProbe() || eq.isDiagnosticProbeActive() || !eq.isLiveDspVerified()) {
-                throw IllegalStateException("Production DynamicsProcessing restoration could not be verified")
-            }
-            persistentProbeLeaseHeld = false
-            persistentBands = 0
-            persistentCurveName = null
-            persistentProbeError = null
-            audioOperationGate.releasePersistent()
-            Log.i(TAG, "Diagnostic DynamicsProcessing probe released")
-        } catch (e: Throwable) {
-            persistentProbeError = e.message ?: "Persistent diagnostic probe release failed"
-            Log.e(TAG, "Failed to release persistent instance", e)
-        }
-    }
-
-    private fun releasePersistentProbeBlocking() {
-        if (!audioOperationGate.isHeld() && dpEq()?.isDiagnosticProbeActive() != true) return
-        val done = CountDownLatch(1)
-        try {
-            probeExecutor.submit {
-                try {
-                    releasePersistentProbeInternal()
-                } finally {
-                    done.countDown()
-                }
-            }
-            done.await(2, java.util.concurrent.TimeUnit.SECONDS)
-        } catch (e: Throwable) {
-            Log.e(TAG, "Failed to schedule persistent probe release during shutdown", e)
-        }
-    }
-
-    override fun getLastProbeResults(): List<DynamicsProcessingProbe.ProbeResult>? = lastProbeResults
-    override fun isProbeRunning(): Boolean = probeRunning.get()
-    override fun isPersistentProbeActive(): Boolean =
-        persistentProbeLeaseHeld || dpEq()?.isDiagnosticProbeActive() == true
-    override fun getPersistentProbeBands(): Int = if (isPersistentProbeActive()) persistentBands else 0
-    override fun getPersistentProbeError(): String? = persistentProbeError
-
-    /**
-     * Dispatches dashboard control commands arriving via the control channel.
-     * Runs on the transport control thread, so probe work is submitted to [probeExecutor]
-     * and answered with a follow-up probe.status message.
-     */
-    private fun peerCommandHandler() = object : PeerTransport.CommandHandler {
-        override fun onCommand(type: String, payload: JSONObject, replyTo: (String, JSONObject) -> Unit) {
-            val engine = this@SweetSpotService.engine
-            var commandOk = true
-            var commandError: String? = null
-            when (type) {
-                "state.get",
-                "profile.list",
-                "calibration.get" -> {
-                    replyTo("state.snapshot", stateSnapshotJson())
-                    return
-                }
-                "calibration.job.start" -> {
-                    replyCalibrationJobResult(calibrationEngine?.startNewJob(), replyTo)
-                    return
-                }
-                "calibration.job.get" -> {
-                    val requestedId = payload.optString("jobId").takeIf { it.isNotBlank() }
-                    val current = calibrationEngine?.currentJob()
-                    if (requestedId == null || current?.id?.value == requestedId) {
-                        replyCalibrationJobResult(calibrationEngine?.resumeJob(), replyTo)
-                    } else {
-                        replyTo("state.snapshot", stateSnapshotJson().put("ok", false).put("error", "No matching calibration job"))
-                    }
-                    return
-                }
-                "calibration.job.finish" -> {
-                    val jobId = payload.optString("jobId").takeIf { it.isNotBlank() }?.let(::CalibrationJobId)
-                    replyCalibrationJobResult(
-                        jobId?.let { calibrationEngine?.finishWithBest(it) }
-                            ?: CalibrationEngineResult.Rejected(null, "invalid_job", "A calibration job ID is required"),
-                        replyTo,
-                    )
-                    return
-                }
-                "calibration.job.cancel" -> {
-                    val jobId = payload.optString("jobId").takeIf { it.isNotBlank() }?.let(::CalibrationJobId)
-                    val result = when (payload.optString("scope")) {
-                        "capture" -> {
-                            val captureId = payload.optString("captureId").takeIf { it.isNotBlank() }?.let(::CaptureId)
-                            val currentJob = calibrationEngine?.currentJob()
-                            val currentCaptureId = when (val action = currentJob?.nextAction) {
-                                is com.darelisme.sweetspot.calibration.CalibrationAction.Capture -> action.request.captureId.value
-                                is com.darelisme.sweetspot.calibration.CalibrationAction.Validate -> action.captureId.value
-                                else -> null
-                            }
-                            if (jobId != null && captureId != null
-                                && currentJob?.id?.value == jobId.value
-                                && currentCaptureId == captureId.value
-                            ) captureStreamReceiver?.cancel()
-                            if (jobId != null && captureId != null) calibrationEngine?.cancelCapture(jobId, captureId) else null
-                        }
-                        "optional_refinement" -> jobId?.let {
-                            if (calibrationEngine?.currentJob()?.id?.value == it.value) captureStreamReceiver?.cancel()
-                            calibrationEngine?.cancelOptionalRefinement(it)
-                        }
-                        else -> null
-                    }
-                    replyCalibrationJobResult(result ?: CalibrationEngineResult.Rejected(null, "invalid_cancel", "Invalid calibration cancel scope"), replyTo)
-                    return
-                }
-                "calibration.job.discard" -> {
-                    val jobId = payload.optString("jobId").takeIf { it.isNotBlank() }?.let(::CalibrationJobId)
-                    if (jobId != null && calibrationEngine?.currentJob()?.id == jobId) captureStreamReceiver?.cancel()
-                    replyCalibrationJobResult(
-                        jobId?.let { calibrationEngine?.discardJob(it) }
-                            ?: CalibrationEngineResult.Rejected(null, "invalid_job", "A calibration job ID is required"),
-                        replyTo,
-                    )
-                    return
-                }
-                "calibration.capture.ready",
-                "calibration.validation.capture.ready" -> {
-                    val jobId = payload.optString("jobId").takeIf { it.isNotBlank() }?.let(::CalibrationJobId)
-                    val captureId = payload.optString("captureId").takeIf { it.isNotBlank() }?.let(::CaptureId)
-                    replyCalibrationJobResult(
-                        if (jobId != null && captureId != null) calibrationEngine?.captureReady(jobId, captureId)
-                        else CalibrationEngineResult.Rejected(null, "invalid_capture", "A calibration job and capture ID are required"),
-                        replyTo,
-                    )
-                    return
-                }
-                "engine.enable" -> {
-                    commandOk = engine?.setEnabled(true) == true
-                    if (!commandOk) commandError = "Live DSP rejected enable"
-                }
-                "engine.bypass" -> {
-                    commandOk = engine?.setEnabled(false) == true
-                    if (!commandOk) commandError = "Live DSP rejected bypass"
-                }
-                "engine.setBands" -> {
-                    val arr = payload.optJSONArray("bandsDb")
-                    val bandCount = engine?.getCapabilities()?.bandCount ?: 0
-                    val previous = engine?.getBandLevels()
-                    val previousPreset = engine?.getActivePreset() ?: 0
-                    if (arr == null || arr.length() != bandCount) {
-                        commandOk = false
-                        commandError = "Expected $bandCount user EQ bands"
-                    } else {
-                        for (i in 0 until bandCount) {
-                            val value = arr.optDouble(i, Double.NaN)
-                            if (!value.isFinite()
-                                || value < DynamicsProcessingEq.MIN_USER_LEVEL_MILLIBELS / 100f
-                                || value > DynamicsProcessingEq.MAX_USER_LEVEL_MILLIBELS / 100f
-                                || engine?.setBandLevel(i, (value * 100).roundToInt()) != true
-                            ) {
-                                commandOk = false
-                                commandError = "Live DSP rejected user EQ band $i"
-                                break
-                            }
-                        }
-                    }
-                    if (!commandOk && previous != null && previous.size == bandCount) {
-                        for (i in previous.indices) {
-                            if (engine.setBandLevel(i, previous[i]) != true) {
-                                commandError = "$commandError; previous user EQ could not be fully restored"
-                                break
-                            }
-                        }
-                        if (previousPreset > 0 && engine.applyPreset(previousPreset) != true) {
-                            commandError = "$commandError; previous EQ preset could not be fully restored"
-                        }
-                    }
-                }
-                "engine.applyPreset" -> {
-                    commandOk = applyPresetWithFeedback(payload.optInt("preset", -1))
-                    if (!commandOk) commandError = "Live DSP rejected preset"
-                }
-                "profile.save" -> payload.optString("name").takeIf { it.isNotBlank() }?.let { engine?.saveCurrentProfile(it) }
-                "profile.load" -> {
-                    commandOk = payload.optString("name").takeIf { it.isNotBlank() }?.let { loadProfileWithFeedback(it) } ?: false
-                    if (!commandOk) commandError = "Live DSP rejected profile load"
-                }
-                "profile.delete" -> payload.optString("name").takeIf { it.isNotBlank() }?.let { engine?.deleteProfile(it) }
-                "calibration.applyCandidate" -> {
-                    val arr = payload.optJSONArray("bandsDb")
-                    val leftArr = payload.optJSONArray("leftBandsDb")
-                    val rightArr = payload.optJSONArray("rightBandsDb")
-                    val left = parseStrictCalibrationArray(leftArr)
-                    val right = parseStrictCalibrationArray(rightArr)
-                    val common = parseStrictCalibrationArray(arr)
-                    commandOk = if (leftArr != null || rightArr != null) {
-                        val target = dpEq()
-                        common != null && left != null && right != null && target?.applyCalibrationCandidate(common, left, right) == true
-                    } else {
-                        common != null && dpEq()?.applyCalibrationCandidate(common) == true
-                    }
-                    if (!commandOk) commandError = dpEq()?.getLastCalibrationApplyError() ?: "Calibration candidate was rejected"
-                    if (!commandOk) showCalibrationErrorToast(commandError ?: "Calibration candidate was rejected")
-                    replyTo("state.snapshot", stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
-                    return
-                }
-                "calibration.export" -> {
-                    val target = dpEq()
-                    val packageValue = target?.exportCalibrationPackage(
-                        CalibrationPackageSourceDevice(
-                            id = DeviceIdentity.get(this@SweetSpotService),
-                            name = DeviceIdentity.getName(this@SweetSpotService),
-                            appVersion = "0.1.0",
-                            buildId = BuildConfig.SWEETSPOT_BUILD_ID,
-                        ),
-                    )
-                    commandOk = packageValue != null
-                    if (packageValue != null) {
-                        replyTo("calibration.exported", CalibrationPackageCodec.serialize(packageValue))
-                        return
-                    }
-                    commandError = target?.getLastCalibrationApplyError()
-                        ?: target?.getLiveDspVerificationError()
-                        ?: "No verified active calibration is available"
-                    replyTo("state.snapshot", stateSnapshotJson().put("ok", false).put("error", commandError))
-                    return
-                }
-                "calibration.import" -> {
-                    val target = dpEq()
-                    val expectedFrequencies = target?.getCalibrationFrequenciesHz() ?: IntArray(0)
-                    val parsed = if (target == null) {
-                        CalibrationPackageParseResult.Rejected("The TV audio engine is unavailable")
-                    } else {
-                        CalibrationPackageCodec.parseForImport(
-                            payload = payload,
-                            expectedFrequenciesHz = expectedFrequencies,
-                            independentRoutingVerified = target.supportsIndependentCalibration(),
-                        )
-                    }
-                    when (parsed) {
-                        is CalibrationPackageParseResult.Accepted -> {
-                            commandOk = target?.applyImportedCalibrationCandidate(parsed.value) == true
-                            if (!commandOk) {
-                                commandError = target?.getLastCalibrationApplyError()
-                                    ?: "Imported calibration was rejected"
-                            }
-                        }
-                        is CalibrationPackageParseResult.Rejected -> {
-                            commandOk = false
-                            commandError = parsed.error
-                        }
-                    }
-                    if (!commandOk) showCalibrationErrorToast(commandError ?: "Imported calibration was rejected")
-                    replyTo("state.snapshot", stateSnapshotJson().put("ok", commandOk).apply {
-                        commandError?.let { put("error", it) }
-                    })
-                    return
-                }
-                "calibration.acceptCandidate" -> {
-                    val candidateId = payload.optString("candidateId")
-                    val transaction = dpEq()?.getCalibrationTransaction()
-                    commandOk = candidateId.isNotBlank() && (dpEq()?.acceptCalibrationCandidate(candidateId) == true)
-                    if (!commandOk) commandError = "Calibration candidate is not available for acceptance"
-                    if (commandOk) {
-                        measurementController?.validationFinalized(candidateId, "improved", transaction?.reason)
-                    } else if (candidateId.isNotBlank()) {
-                        measurementController?.validationFinalizationFailed(candidateId, commandError ?: "Calibration candidate acceptance failed")
-                    }
-                    replyTo("state.snapshot", stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
-                    return
-                }
-                "calibration.rollbackCandidate" -> {
-                    val candidateId = payload.optString("candidateId")
-                    val transaction = dpEq()?.getCalibrationTransaction()
-                    val result = transaction?.validationStatus?.rollbackOutcome() ?: "inconclusive"
-                    commandOk = candidateId.isNotBlank() && rollbackCalibrationCandidate(candidateId)
-                    if (!commandOk) commandError = dpEq()?.getLastCalibrationApplyError() ?: "Calibration candidate rollback failed"
-                    if (commandOk) {
-                        measurementController?.validationFinalized(candidateId, result, transaction?.reason)
-                    } else if (candidateId.isNotBlank()) {
-                        measurementController?.validationFinalizationFailed(candidateId, commandError ?: "Calibration candidate rollback failed")
-                    }
-                    replyTo("state.snapshot", stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
-                    return
-                }
-                "calibration.validation.result" -> {
-                    val candidateId = payload.optString("candidateId")
-                    val status = when (payload.optString("status")) {
-                        "passed" -> CalibrationValidationStatus.PASSED
-                        "worse" -> CalibrationValidationStatus.WORSE
-                        "inconclusive" -> CalibrationValidationStatus.INCONCLUSIVE
-                        "failed" -> CalibrationValidationStatus.FAILED
-                        else -> null
-                    }
-                    val before = if (payload.has("beforeDb")) payload.optDouble("beforeDb", Double.NaN).toFloat().takeIf { it.isFinite() } else null
-                    val after = if (payload.has("afterDb")) payload.optDouble("afterDb", Double.NaN).toFloat().takeIf { it.isFinite() } else null
-                    val reason = payload.optString("reason").takeIf { it.isNotBlank() }
-                    commandOk = candidateId.isNotBlank() && status != null && dpEq()?.recordCalibrationValidation(
-                        candidateId,
-                        status,
-                        before,
-                        after,
-                        reason,
-                    ) == true
-                    if (!commandOk) commandError = "Calibration validation result was rejected"
-                    if (!commandOk && candidateId.isNotBlank()) {
-                        measurementController?.validationFinalizationFailed(candidateId, commandError ?: "Calibration validation result was rejected")
-                    }
-                    replyTo("state.snapshot", stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
-                    return
-                }
-                "calibration.reset" -> {
-                    commandOk = resetCalibration()
-                }
-                "calibrationSession.begin" -> {
-                    measurementController?.begin(
-                        payload.optString("sessionId"),
-                        payload.optString("channel", "both"),
-                        payload.optString("phase", "measurement"),
-                        payload.optString("candidateId").takeIf { it.isNotBlank() },
-                        null,
-                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
-                    )
-                    return
-                }
-                "calibrationSession.end" -> {
-                    measurementController?.end(
-                        payload.optString("sessionId"),
-                        payload.optString("outcome").takeIf { it.isNotBlank() },
-                        null,
-                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
-                    )
-                    return
-                }
-                "calibrationSession.abort" -> {
-                    val abort = parseCalibrationSessionAbortPayload(payload)
-                    if (abort == null) {
-                        replyTo(
-                            "measurement.error",
-                            JSONObject()
-                                .put("sessionId", payload.optString("sessionId"))
-                                .put("code", "invalid_session")
-                                .put("message", "calibrationSession.abort requires a valid error code"),
-                        )
-                    } else {
-                        measurementController?.cancel(
-                            sessionId = abort.sessionId,
-                            code = abort.code,
-                            message = abort.message,
-                            replyTo = null,
-                            emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) },
-                        )
-                    }
-                    return
-                }
-                "calibrationSession.loudness.start" -> {
-                    measurementController?.startLoudness(
-                        payload.optString("sessionId"),
-                        null,
-                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
-                    )
-                    return
-                }
-                "calibrationSession.loudness.stop" -> {
-                    measurementController?.stopLoudness(
-                        payload.optString("sessionId"),
-                        null,
-                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
-                    )
-                    return
-                }
-                "calibrationSession.progress" -> {
-                    measurementController?.updateProgress(
-                        payload.optString("sessionId"),
-                        payload.optString("stage"),
-                        payload.optInt("current", -1),
-                        payload.optInt("total", -1),
-                        payload.optInt("estimatedRemainingSeconds", -1).takeIf { payload.has("estimatedRemainingSeconds") },
-                        payload.optString("message").takeIf { payload.has("message") }
-                    )
-                    return
-                }
-                "measurement.response" -> {
-                    val response = MeasurementResponsePayload.parse(payload)
-                    if (response == null) {
-                        Log.w(TAG, "Rejected invalid measurement.response payload")
-                        return
-                    }
-                    measurementController?.updateResponse(response)
-                    return
-                }
-                "measurement.prepare" -> {
-                    val context = MeasurementContext.fromJson(payload.optJSONObject("context"))
-                    if (payload.has("context") && context == null) {
-                        replyTo("measurement.error", JSONObject()
-                            .put("sessionId", payload.optString("sessionId"))
-                            .put("code", "invalid_session")
-                            .put("message", "Invalid measurement context"))
-                        return
-                    }
-                    measurementController?.prepare(
-                        payload.optString("sessionId"),
-                        payload.optString("channel", "both"),
-                        context,
-                        null,
-                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
-                    )
-                    return
-                }
-                "measurement.playSweep" -> {
-                    val context = MeasurementContext.fromJson(payload.optJSONObject("context"))
-                    if (payload.has("context") && context == null) {
-                        replyTo("measurement.error", JSONObject()
-                            .put("sessionId", payload.optString("sessionId"))
-                            .put("code", "invalid_session")
-                            .put("message", "Invalid measurement context"))
-                        return
-                    }
-                    measurementController?.playSweep(
-                        payload.optString("sessionId"),
-                        context,
-                        null,
-                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) }
-                    )
-                    return
-                }
-                "measurement.abort" -> {
-                    measurementController?.cancel(
-                        sessionId = payload.optString("sessionId"),
-                        code = "calibration_aborted",
-                        message = "Calibration cancelled",
-                        replyTo = null,
-                        emit = { eventType, eventPayload, _ -> replyTo(eventType, eventPayload) },
-                    )
-                    return
-                }
-                "measurement.diagnostics" -> {
-                    val context = MeasurementContext.fromJson(payload.optJSONObject("context"))
-                    if (context == null) return
-                    measurementController?.updateDiagnostics(
-                        payload.optString("sessionId"),
-                        context,
-                        payload.optInt("current", -1),
-                        payload.optInt("total", -1),
-                        payload.optJSONObject("diagnostics") ?: return
-                    )
-                    return
-                }
-                "probe.run" -> {
-                    val bands = payload.optInt("bands", 128)
-                    if (!tryAcquireDiagnosticOperation()) {
-                        replyTo("state.snapshot", stateSnapshotJson().put("ok", false).put("error", "Probe is unavailable while calibration is active"))
-                        return
-                    }
-                    probeExecutor.submit {
-                        try {
-                            suspendProduction()
-                            probeRunning.set(true)
-                            lastProbeResults = DynamicsProcessingProbe().runFor(bands)
-                        } catch (e: Throwable) {
-                            Log.e(TAG, "Control probe failed", e)
-                        } finally {
-                            probeRunning.set(false)
-                            resumeProduction()
-                            releaseDiagnosticOperation()
-                        }
-                        postProbeStatus(replyTo)
-                    }
-                    return
-                }
-                "probe.status" -> {
-                    postProbeStatus(replyTo)
-                    return
-                }
-                "probe.persistent.start" -> runPersistentProbe(payload.optInt("bands", 64))
-                "probe.persistent.release" -> releasePersistentProbe()
-                "virtualizer.on" -> setVirtualizer(true)
-                "virtualizer.off" -> setVirtualizer(false)
-                "probe.curve.apply" -> {
-                    val commonArray = payload.optJSONArray("bandsDb")
-                    val leftArray = payload.optJSONArray("leftBandsDb")
-                    val rightArray = payload.optJSONArray("rightBandsDb")
-                    commandOk = if (commonArray != null || leftArray != null || rightArray != null) {
-                        val expectedBands = persistentBands
-                        val common = parseStrictProbeArray(commonArray, expectedBands)
-                        val left = parseStrictProbeArray(leftArray, expectedBands)
-                        val right = parseStrictProbeArray(rightArray, expectedBands)
-                        common != null
-                            && ((leftArray == null && rightArray == null && applyPersistentBands(common))
-                                || (leftArray != null && rightArray != null && left != null && right != null && applyPersistentBands(common, left, right)))
-                    } else {
-                        val curve = payload.optString("curve", "hollow")
-                        applyPersistentCurve(curve)
-                    }
-                    if (!commandOk) commandError = "Persistent probe curve was rejected"
-                }
-                "diagnostics.deviceInfo" -> {
-                    replyTo("diagnostics.deviceInfo", deviceInfoJson())
-                    return
-                }
-                "diagnostics.transport" -> {
-                    replyTo("diagnostics.transport", transportDiagnosticsJson())
-                    return
-                }
-                "diagnostics.effects" -> {
-                    val diagnostics = runEffectDiagnosticsBlocking()
-                    if (diagnostics.has("error")) {
-                        commandOk = false
-                        commandError = diagnostics.optString("error")
-                    } else {
-                        replyTo("diagnostics.effects", diagnostics)
-                        return
-                    }
-                }
-                else -> {
-                    Log.d(TAG, "control: unknown command $type")
-                    return
-                }
-            }
-            replyTo("state.snapshot", stateSnapshotJson().put("ok", commandOk).apply { commandError?.let { put("error", it) } })
-        }
-
-        override fun onCaptureFrame(frame: CalibrationCaptureStreamFrame) {
-            val receiver = captureStreamReceiver ?: return
-            var completed: CalibrationCaptureStreamReceiver.Completed? = null
-            try {
-                val finished = receiver.accept(frame) ?: return
-                completed = finished
-                val result = FileInputStream(finished.pcmFile).use { input ->
-                    calibrationEngine?.submitCaptureStream(
-                        metadataJson = finished.metadataJson,
-                        pcm = input,
-                        pcmBytes = finished.byteCount,
-                    )
-                }
-                if (result != null) publishCalibrationCaptureResult(result, finished)
-                receiver.delete(finished)
-            } catch (error: Throwable) {
-                Log.e(TAG, "Direct calibration capture failed", error)
-                completed?.let { finished ->
-                    try { receiver.delete(finished) } catch (_: Throwable) {}
-                }
-                receiver.cancel()
-                publishCalibrationCaptureRejection(frame.captureId, error.message ?: "The TV rejected this calibration recording")
-            }
-        }
+    /** Dispatches dashboard commands to the service-owned command boundary. */
+    private fun peerCommandHandler(): PeerTransport.CommandHandler = SweetSpotPeerCommandHandler(this)
 
 
-        private fun postProbeStatus(replyTo: (String, JSONObject) -> Unit) {
-            val results = lastProbeResults.orEmpty()
-            var highest = -1
-            val arr = JSONArray()
-            for (r in results) {
-                val pass = r.constructed && r.hasControl && r.enabled && r.actualBands == r.requested
-                if (pass) highest = maxOf(highest, r.requested)
-                arr.put(JSONObject().apply {
-                    put("requested", r.requested)
-                    put("constructed", r.constructed)
-                    put("hasControl", r.hasControl)
-                    put("enabled", r.enabled)
-                    put("actualBands", r.actualBands)
-                    put("pass", pass)
-                    put("exception", r.exception ?: JSONObject.NULL)
-                })
-            }
-            val persistent = if (isPersistentProbeActive()) JSONObject().apply {
-                put("active", true)
-                put("bands", persistentBands)
-                put("curve", persistentCurveName ?: JSONObject.NULL)
-                val sum = getPersistentProbeCurveSummary(0)
-                if (sum != null) {
-                    put("curveSummary", JSONObject().apply {
-                        put("bandsTotal", sum.bandsTotal)
-                        put("bandsCut", sum.bandsCut)
-                        put("bandsFlat", sum.bandsFlat)
-                    })
-                }
-                val right = getPersistentProbeCurveSummary(1)
-                if (right != null) {
-                    put("rightCurveSummary", JSONObject().apply {
-                        put("bandsTotal", right.bandsTotal)
-                        put("bandsCut", right.bandsCut)
-                        put("bandsFlat", right.bandsFlat)
-                    })
-                }
-            } else JSONObject().put("active", false).put("bands", 0)
-            persistent.put("error", persistentProbeError ?: JSONObject.NULL)
-            replyTo("probe.status", JSONObject().apply {
-                put("running", probeRunning.get())
-                put("available", lastProbeResults != null)
-                put("results", arr)
-                put("highest", highest)
-                put("recommended", highest)
-                put("persistent", persistent)
-            })
-        }
-    }
-
-    private fun replyCalibrationJobResult(
+    override fun replyCalibrationJobResult(
         result: CalibrationEngineResult?,
         replyTo: (String, JSONObject) -> Unit,
     ) {
@@ -1187,7 +520,7 @@ class SweetSpotService : Service(), ServiceActions {
         }
     }
 
-    private fun publishCalibrationCaptureResult(
+    override fun publishCalibrationCaptureResult(
         result: CalibrationEngineResult,
         capture: CalibrationCaptureStreamReceiver.Completed,
     ) {
@@ -1201,7 +534,7 @@ class SweetSpotService : Service(), ServiceActions {
                 val channel = metadata.optString("channel")
                 if (channel == "both") {
                     lastValidationOutcome != null &&
-                        lastValidationOutcome != com.darelisme.sweetspot.calibration.ValidationOutcome.INCONCLUSIVE_CAPTURE
+                        lastValidationOutcome != com.darelisme.sweetspot.calibration.model.ValidationOutcome.INCONCLUSIVE_CAPTURE
                 } else {
                     job?.ledger?.attempts?.any {
                         it.request.captureId.value == captureId && it is CaptureAttempt.Accepted
@@ -1230,11 +563,11 @@ class SweetSpotService : Service(), ServiceActions {
         job?.let { peerTransport?.publish("calibration.job.state", CalibrationJobJson.view(it)) }
     }
 
-    private fun publishCalibrationCaptureRejection(captureId: String, reason: String) {
+    override fun publishCalibrationCaptureRejection(captureId: String, reason: String) {
         val job = calibrationEngine?.currentJob() ?: return
         val actionCaptureId = when (val action = job.nextAction) {
-            is com.darelisme.sweetspot.calibration.CalibrationAction.Capture -> action.request.captureId.value
-            is com.darelisme.sweetspot.calibration.CalibrationAction.Validate -> action.captureId.value
+            is com.darelisme.sweetspot.calibration.model.CalibrationAction.Capture -> action.request.captureId.value
+            is com.darelisme.sweetspot.calibration.model.CalibrationAction.Validate -> action.captureId.value
             else -> null
         }
         if (actionCaptureId != captureId) return
@@ -1248,41 +581,9 @@ class SweetSpotService : Service(), ServiceActions {
         )
     }
 
-    /** Mirrors WebServer.deviceInfoJson; runs on the control thread (~400ms sample window). */
-    private fun deviceInfoJson(): JSONObject {
-        val rt = Runtime.getRuntime()
-        val memInfo = Debug.MemoryInfo()
-        Debug.getMemoryInfo(memInfo)
-        val asPid = findProcessPid("audioserver") ?: findProcessPid("audioserver64")
-        val appPid = android.os.Process.myPid()
-        val appStartTicks = cpuTicks(appPid)
-        val audioStartTicks = asPid?.let(::cpuTicks)
-        val start = System.nanoTime()
-        try { Thread.sleep(400) } catch (_: InterruptedException) {}
-        val wallSecs = (System.nanoTime() - start) / 1e9
-        val appCpu = cpuPercent(appStartTicks, cpuTicks(appPid), wallSecs)
-        val asCpu = if (asPid != null && audioStartTicks != null) {
-            cpuPercent(audioStartTicks, cpuTicks(asPid), wallSecs)
-        } else {
-            0.0
-        }
-        return JSONObject().apply {
-            put("javaHeapMax", rt.maxMemory())
-            put("javaHeapTotal", rt.totalMemory())
-            put("javaHeapFree", rt.freeMemory())
-            put("nativeHeapAllocated", Debug.getNativeHeapAllocatedSize())
-            put("nativeHeapSize", Debug.getNativeHeapSize())
-            put("pssTotalKb", memInfo.totalPss)
-            put("privateDirtyKb", memInfo.totalPrivateDirty)
-            put("cpuPercent", appCpu)
-            put("audioserverCpuPercent", asCpu)
-            put("audioserverPid", asPid ?: JSONObject.NULL)
-            put("persistentProbeActive", isPersistentProbeActive())
-            put("persistentProbeBands", getPersistentProbeBands())
-        }
-    }
+    override fun deviceInfoJson(): JSONObject = diagnostics.deviceInfoJson()
 
-    private fun transportDiagnosticsJson(): JSONObject {
+    override fun transportDiagnosticsJson(): JSONObject {
         val diagnostics = latestPeerDiagnostics
         return JSONObject().apply {
             put("state", diagnostics.state.name.lowercase(java.util.Locale.ROOT))
@@ -1304,134 +605,17 @@ class SweetSpotService : Service(), ServiceActions {
         }
     }
 
-    private fun cpuTicks(pid: Int): Long = try {
-            val stat = File("/proc/$pid/stat").readText()
-            val parts = stat.substring(stat.lastIndexOf(')') + 1).trim().split("\\s+".toRegex())
-            (parts.getOrNull(12)?.toLongOrNull() ?: 0L) + (parts.getOrNull(13)?.toLongOrNull() ?: 0L)
-    } catch (_: Throwable) { 0L }
+    override fun applyPersistentCurve(curve: String): Boolean = diagnostics.applyPersistentCurve(curve)
 
-    private fun cpuPercent(startTicks: Long, endTicks: Long, wallSecs: Double): Double {
-        val clk = try {
-            Os.sysconf(OsConstants._SC_CLK_TCK).toDouble()
-        } catch (_: Throwable) { 100.0 }
-        return if (wallSecs > 0) ((endTicks - startTicks) / clk / wallSecs) * 100.0 else 0.0
-    }
+    override fun applyPersistentBands(common: FloatArray, left: FloatArray?, right: FloatArray?): Boolean =
+        diagnostics.applyPersistentBands(common, left, right)
 
-    /** Finds a process PID by its comm name via /proc; null when SELinux hides it. */
-    private fun findProcessPid(name: String): Int? = try {
-        File("/proc").list()?.firstOrNull { entry ->
-            val pid = entry.toIntOrNull() ?: return@firstOrNull false
-            try {
-                File("/proc/$pid/stat").readText().let { stat ->
-                    val s = stat.indexOf('(')
-                    val e = stat.lastIndexOf(')')
-                    s in 0 until e && stat.substring(s + 1, e) == name
-                }
-            } catch (_: Throwable) { false }
-        }?.toIntOrNull()
-    } catch (_: Throwable) { null }
+    override fun getPersistentProbeCurve(): String? = diagnostics.getPersistentProbeCurve()
 
-    override fun applyPersistentCurve(curve: String): Boolean {
-        val eq = dpEq() ?: return false
-        if (!eq.isDiagnosticProbeActive() || persistentBands != DynamicsProcessingEq.INTERNAL_BANDS) return false
-        val n = DynamicsProcessingEq.INTERNAL_BANDS
-        return try {
-            val common = FloatArray(n) { index ->
-                val freq = DynamicsProcessingEq.F_MIN.toFloat() *
-                    (DynamicsProcessingEq.F_MAX.toFloat() / DynamicsProcessingEq.F_MIN.toFloat()).pow((index + 1).toFloat() / n)
-                when (curve) {
-                    "hollow" -> if (freq >= 300f && freq < 3000f) -15f else 0f
-                    "flat" -> 0f
-                    else -> return false
-                }
-            }
-            val applied = eq.applyDiagnosticProbe(common)
-            if (!applied) return false
-            persistentCurveName = curve
-            true
-        } catch (e: Throwable) {
-            Log.e(TAG, "applyPersistentCurve($curve) failed", e)
-            false
-        }
-    }
+    override fun getPersistentProbeCurveSummary(channel: Int): DynamicsProcessingProbe.CurveSummary? =
+        diagnostics.getPersistentProbeCurveSummary(channel)
 
-    override fun applyPersistentBands(common: FloatArray, left: FloatArray?, right: FloatArray?): Boolean {
-        val eq = dpEq() ?: return false
-        val n = DynamicsProcessingEq.INTERNAL_BANDS
-        if (!eq.isDiagnosticProbeActive() || persistentBands != n) return false
-        if (common.size != n || (left == null) != (right == null)) return false
-        if (common.any { !it.isFinite() || it < DynamicsProcessingProbe.MIN_PROBE_GAIN_DB || it > DynamicsProcessingProbe.MAX_PROBE_GAIN_DB }) return false
-        if (left != null) {
-            val rightCurve = right ?: return false
-            if (left.size != n || rightCurve.size != n) return false
-            if (left.any { !it.isFinite() || it < DynamicsProcessingProbe.MIN_PROBE_GAIN_DB || it > DynamicsProcessingProbe.MAX_PROBE_GAIN_DB } ||
-                rightCurve.any { !it.isFinite() || it < DynamicsProcessingProbe.MIN_PROBE_GAIN_DB || it > DynamicsProcessingProbe.MAX_PROBE_GAIN_DB }) return false
-        }
-        return try {
-            val applied = eq.applyDiagnosticProbe(common, left, right)
-            if (applied) persistentCurveName = "custom"
-            applied
-        } catch (e: Throwable) {
-            Log.e(TAG, "applyPersistentBands failed", e)
-            false
-        }
-    }
-
-    override fun getPersistentProbeCurve(): String? = if (isPersistentProbeActive()) persistentCurveName else null
-
-    @Volatile private var effectInventory: List<AudioEffectDiagnostics.EffectInventoryEntry>? = null
-    @Volatile private var sessionProbes: List<AudioEffectDiagnostics.SessionProbe>? = null
-
-    /** Runs diagnostics synchronously; called from the control thread. */
-    fun runEffectDiagnosticsBlocking(): JSONObject {
-        if (!tryAcquireDiagnosticOperation()) {
-            return JSONObject().put("error", "Diagnostics are unavailable while calibration is active")
-        }
-        try {
-            suspendProduction()
-            val (inv, probes) = AudioEffectDiagnostics().runAll()
-            effectInventory = inv
-            sessionProbes = probes
-            return AudioEffectDiagnostics.payloadJson(inv, probes)
-        } finally {
-            resumeProduction()
-            releaseDiagnosticOperation()
-        }
-    }
-
-    override fun runEffectDiagnostics() {
-        Log.i(TAG, "Audio effect diagnostics requested")
-        if (!tryAcquireDiagnosticOperation()) {
-            Log.w(TAG, "Rejecting diagnostics while another audio operation is active")
-            return
-        }
-        probeExecutor.submit {
-            try {
-                suspendProduction()
-                val (inv, probes) = AudioEffectDiagnostics().runAll()
-                effectInventory = inv
-                sessionProbes = probes
-            } catch (e: Throwable) {
-                Log.e(TAG, "Effect diagnostics error", e)
-            } finally {
-                resumeProduction()
-                releaseDiagnosticOperation()
-            }
-        }
-    }
-
-    override fun getEffectInventory(): List<AudioEffectDiagnostics.EffectInventoryEntry> =
-        effectInventory ?: emptyList()
-
-    override fun getSessionProbes(): List<AudioEffectDiagnostics.SessionProbe> =
-        sessionProbes ?: emptyList()
-
-    override fun getPersistentProbeCurveSummary(channel: Int): DynamicsProcessingProbe.CurveSummary? {
-        if (!isPersistentProbeActive() || persistentBands != DynamicsProcessingEq.INTERNAL_BANDS) return null
-        return dpEq()?.getDiagnosticProbeCurveSummary(channel)
-    }
-
-    private fun dpEq() = engine as? DynamicsProcessingEq
+    override fun dpEq() = engine as? DynamicsProcessingEq
 
     private fun overlayState(): OverlayState {
         val currentEngine = engine
@@ -1505,7 +689,7 @@ class SweetSpotService : Service(), ServiceActions {
         }
     }
 
-    private fun rollbackCalibrationCandidate(candidateId: String): Boolean {
+    override fun rollbackCalibrationCandidate(candidateId: String): Boolean {
         val eq = dpEq() ?: return false
         if (!eq.rollbackCalibrationCandidate(candidateId)) return false
         return eq.getCalibrationTransaction() == null && eq.isLiveDspVerified()
@@ -1537,19 +721,6 @@ class SweetSpotService : Service(), ServiceActions {
         dpEq()?.setCalibrationBandsByChannel(left, right) ?: false
     override fun resetCalibration(): Boolean = dpEq()?.resetCalibration() ?: false
 
-    private fun tryAcquireDiagnosticOperation(): Boolean {
-        if (!audioOperationGate.tryAcquireTransient()) return false
-        if (measurementController?.isActive() == true || dpEq()?.isDiagnosticProbeActive() == true) {
-            audioOperationGate.releaseTransient()
-            return false
-        }
-        return true
-    }
-
-    private fun releaseDiagnosticOperation() {
-        audioOperationGate.releaseTransient()
-    }
-
     /** Release the production engine so a diagnostic DynamicsProcessing can own session 0. */
     private fun suspendProduction() {
         synchronized(runtimeLock) {
@@ -1564,7 +735,7 @@ class SweetSpotService : Service(), ServiceActions {
         }
     }
 
-    private fun applyPresetWithFeedback(preset: Int): Boolean {
+    override fun applyPresetWithFeedback(preset: Int): Boolean {
         val engine = engine ?: return false
         val eqName = engine.getCapabilities().presets[preset] ?: return false
         if (!engine.applyPreset(preset)) return false
@@ -1572,7 +743,7 @@ class SweetSpotService : Service(), ServiceActions {
         return true
     }
 
-    private fun loadProfileWithFeedback(name: String): Boolean {
+    override fun loadProfileWithFeedback(name: String): Boolean {
         val engine = engine ?: return false
         if (name !in engine.listProfiles()) return false
         if (!engine.loadProfile(name)) return false
@@ -1586,31 +757,21 @@ class SweetSpotService : Service(), ServiceActions {
         }
     }
 
-    private fun showCalibrationErrorToast(message: String) {
+    override fun showCalibrationErrorToast(message: String) {
         mainHandler.post {
             Toast.makeText(this, "Calibration could not continue: $message", Toast.LENGTH_LONG).show()
         }
     }
 
-    /**
-     * Creates (once) and enables or disables the persistent session-0
-     * Virtualizer at max strength. Called from the control thread.
-     */
-    private fun setVirtualizer(on: Boolean) {
-        try {
-            val existing = persistentVirtualizer
-            val v = if (existing != null) existing else {
-                val created = Virtualizer(1000, 0)
-                if (created.strengthSupported) created.setStrength(1000)
-                persistentVirtualizer = created
-                created
-            }
-            v.enabled = on
-            Log.i(TAG, "Persistent Virtualizer $on (control=${v.hasControl()}, enabled=${v.enabled}, strength=${v.roundedStrength})")
-        } catch (e: Throwable) {
-            Log.e(TAG, "Virtualizer set($on) failed", e)
-        }
+    override fun runEffectDiagnostics() {
+        diagnostics.runEffectDiagnostics()
     }
+
+    override fun getEffectInventory(): List<AudioEffectDiagnostics.EffectInventoryEntry> =
+        diagnostics.getEffectInventory()
+
+    override fun getSessionProbes(): List<AudioEffectDiagnostics.SessionProbe> =
+        diagnostics.getSessionProbes()
 
     /**
      * Canonical state snapshot for the hosted dashboard (protocol v1).
@@ -1625,7 +786,7 @@ class SweetSpotService : Service(), ServiceActions {
         next
     }
 
-    private fun stateSnapshotJson(): JSONObject {
+    override fun stateSnapshotJson(): JSONObject {
         val engine = engine ?: DynamicsProcessingEq(profileStore)
         val caps = engine.getCapabilities()
         val calBands = dpEq()?.getEffectiveCalibrationBands() ?: FloatArray(0)

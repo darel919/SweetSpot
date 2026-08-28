@@ -1,5 +1,7 @@
 package com.darelisme.sweetspot.calibration
 
+import com.darelisme.sweetspot.calibration.model.*
+
 internal object CalibrationTestFixtures {
     fun accepted(
         position: CalibrationPosition,

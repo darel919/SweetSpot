@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot.calibration
+package com.darelisme.sweetspot.calibration.model
 
 sealed interface CaptureAttempt {
     val request: CaptureRequest

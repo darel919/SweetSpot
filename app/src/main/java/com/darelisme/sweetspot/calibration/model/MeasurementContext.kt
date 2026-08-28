@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.calibration.model
 
 import org.json.JSONObject
 import kotlin.math.abs
@@ -67,8 +67,6 @@ data class MeasurementContext(
         "backward" -> "BACK POSITION"
         else -> "POSITION"
     }
-
-    fun assetPath(): String? = CalibrationPositionAssets.pathFor(positionId)
 
     fun instruction(): String {
         val normalInstruction = if (attemptIndex > 0) retryInstruction() else normalPositionInstruction()

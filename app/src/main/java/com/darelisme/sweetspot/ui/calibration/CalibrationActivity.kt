@@ -1,5 +1,9 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.ui.calibration
 
+import com.darelisme.sweetspot.calibration.model.MeasurementContext
+import com.darelisme.sweetspot.calibration.model.MeasurementResponse
+import com.darelisme.sweetspot.calibration.model.MeasurementResponseSummary
+import com.darelisme.sweetspot.service.SweetSpotService
 import android.app.Activity
 import android.content.Intent
 import android.os.Build

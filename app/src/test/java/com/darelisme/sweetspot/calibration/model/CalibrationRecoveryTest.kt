@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.calibration.model
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue

@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.calibration.model
 
 /**
  * Requested calibration curve state. The active flag describes the state itself,

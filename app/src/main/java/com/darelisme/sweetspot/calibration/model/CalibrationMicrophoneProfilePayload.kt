@@ -1,5 +1,6 @@
-package com.darelisme.sweetspot.calibration
+package com.darelisme.sweetspot.calibration.model
 
+import com.darelisme.sweetspot.calibration.analysis.MicrophoneCalibrationProfile
 import kotlin.math.abs
 
 /**

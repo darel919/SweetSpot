@@ -1,4 +1,6 @@
-package com.darelisme.sweetspot.calibration
+package com.darelisme.sweetspot.calibration.playback
+
+import com.darelisme.sweetspot.calibration.model.*
 
 sealed interface CalibrationAudioResult {
     data class Success(val candidateId: CandidateId? = null) : CalibrationAudioResult

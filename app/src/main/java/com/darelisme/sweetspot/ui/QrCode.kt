@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.ui
 
 import android.graphics.Bitmap
 import android.graphics.Color

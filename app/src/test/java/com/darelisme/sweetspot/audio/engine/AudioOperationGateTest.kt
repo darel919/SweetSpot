@@ -1,4 +1,4 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.audio.engine
 
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

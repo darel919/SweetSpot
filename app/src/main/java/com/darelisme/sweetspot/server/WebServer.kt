@@ -1,6 +1,11 @@
-package com.darelisme.sweetspot
+package com.darelisme.sweetspot.server
 
+import com.darelisme.sweetspot.audio.diagnostics.AudioEffectDiagnostics
+import com.darelisme.sweetspot.audio.engine.AudioEngine
+import com.darelisme.sweetspot.audio.engine.DynamicsProcessingEq
 import com.darelisme.sweetspot.pairing.PairingSessionManager
+import com.darelisme.sweetspot.transport.Config
+import com.darelisme.sweetspot.ui.OverlayController
 import android.os.Debug
 import android.system.Os
 import android.system.OsConstants
@@ -41,46 +46,6 @@ import org.json.JSONObject
  *
  * One request per connection, `Connection: close` (no keep-alive parsing needed).
  */
-
-/**
- * Hooks the web server uses to trigger service-level diagnostics
- * (DynamicsProcessing capacity probe + persistent instance). Implemented by
- * [SweetSpotService]; keeps [WebServer] decoupled from the concrete service.
- */
-interface ServiceActions {
-    fun runProbe()
-    fun runPersistentProbe(bands: Int)
-    fun releasePersistentProbe()
-    fun getLastProbeResults(): List<DynamicsProcessingProbe.ProbeResult>?
-    fun isProbeRunning(): Boolean
-    fun isPersistentProbeActive(): Boolean
-    fun getPersistentProbeBands(): Int
-    fun applyPersistentCurve(curve: String): Boolean
-    fun applyPersistentBands(common: FloatArray, left: FloatArray? = null, right: FloatArray? = null): Boolean
-    fun getPersistentProbeCurve(): String?
-    fun getPersistentProbeCurveSummary(channel: Int = 0): DynamicsProcessingProbe.CurveSummary?
-    fun getPersistentProbeError(): String?
-
-    /** Audio effect chain diagnostics (effect inventory + session-0 probes). */
-    fun runEffectDiagnostics()
-    fun getEffectInventory(): List<AudioEffectDiagnostics.EffectInventoryEntry>
-    fun getSessionProbes(): List<AudioEffectDiagnostics.SessionProbe>
-
-    /** Calibration is a 64-band read-only base curve managed by the TV engine. */
-    fun getCalibrationBands(): FloatArray?
-    fun getRequestedCalibrationBands(): FloatArray?
-    fun getEffectiveCalibrationBands(): FloatArray?
-    fun getRequestedCalibrationBandsForChannel(channel: Int): FloatArray?
-    fun getEffectiveCalibrationBandsForChannel(channel: Int): FloatArray?
-    fun getCalibrationFrequenciesHz(): IntArray?
-    fun isCalibrationActive(): Boolean
-    fun wasLastCalibrationApplySuccessful(): Boolean
-    fun getLastCalibrationApplyError(): String?
-    fun isCalibrationLiveDspVerified(): Boolean
-    fun getCalibrationLiveDspVerificationError(): String?
-    fun setCalibrationBands(gains: FloatArray): Boolean
-    fun resetCalibration(): Boolean
-}
 
 class WebServer(
     private val engine: AudioEngine,

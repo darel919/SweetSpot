@@ -664,6 +664,7 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
                 add(OverlayPresetOption(name = name, profileName = name))
             }
         }
+        val activePreset = currentEngine?.let { resolveActiveOverlayPreset(it, presetOptions) }
         val job = calibrationEngine?.currentJob()
         val calibrationMessage = when (job?.phase) {
             CalibrationPhase.CenterPreflight -> "Center setup is being checked before you move the phone."
@@ -685,8 +686,25 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
             calibrationEnabled = dpEq()?.isCalibrationActive() == true,
             startOnBoot = profileStore.isStartOnBootEnabled(),
             presets = presetOptions,
+            activePreset = activePreset,
             calibrationMessage = calibrationMessage,
         )
+    }
+
+    private fun resolveActiveOverlayPreset(
+        currentEngine: AudioEngine,
+        options: List<OverlayPresetOption>,
+    ): OverlayPresetOption? {
+        val activePresetId = currentEngine.getActivePreset()
+        if (activePresetId != 0) {
+            return options.firstOrNull { it.presetId == activePresetId }
+        }
+
+        val activeLevels = currentEngine.getBandLevels()
+        return options.firstOrNull { option ->
+            val profileName = option.profileName ?: return@firstOrNull false
+            profileStore.loadNamed(profileName)?.levels?.contentEquals(activeLevels) == true
+        }
     }
 
     private fun overlayActions(): OverlayActions = object : OverlayActions {

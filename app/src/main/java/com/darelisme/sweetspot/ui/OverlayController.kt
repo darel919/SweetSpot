@@ -2,6 +2,7 @@ package com.darelisme.sweetspot.ui
 
 import android.content.Context
 import android.content.res.ColorStateList
+import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.drawable.BitmapDrawable
 import android.os.Handler
@@ -21,6 +22,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import kotlin.math.roundToInt
+import java.util.Locale
 
 data class OverlayPresetOption(
     val name: String,
@@ -36,6 +38,7 @@ data class OverlayState(
     val calibrationEnabled: Boolean = false,
     val startOnBoot: Boolean = true,
     val presets: List<OverlayPresetOption> = emptyList(),
+    val activePreset: OverlayPresetOption? = null,
     val calibrationMessage: String? = null,
 )
 
@@ -88,6 +91,12 @@ class OverlayController(
     }
 
     private enum class Page { HOME, PAIRING, CALIBRATION, EQ_PROFILE }
+
+    private data class EqRowFocus(
+        val eq: TextView,
+        val presets: List<TextView>,
+        val activePreset: TextView?,
+    )
 
     private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -283,15 +292,20 @@ class OverlayController(
             actions::setCalibrationEnabled,
             enabled = state.calibrationAvailable,
         )
-        val eqButton = addEqRow(container, state.presets)
-        dsp.nextFocusDownId = if (calibration.isEnabled) calibration.id else eqButton.id
-        if (calibration.isEnabled) calibration.nextFocusDownId = eqButton.id
-        eqButton.nextFocusUpId = if (calibration.isEnabled) calibration.id else dsp.id
+        val eqRow = addEqRow(container, state.presets, state.activePreset)
+        val eqEntryId = eqRow.activePreset?.id ?: eqRow.eq.id
+        dsp.nextFocusDownId = if (calibration.isEnabled) calibration.id else eqEntryId
+        if (calibration.isEnabled) calibration.nextFocusDownId = eqEntryId
+        eqRow.eq.nextFocusUpId = if (calibration.isEnabled) calibration.id else dsp.id
+        eqRow.presets.forEach { preset ->
+            preset.nextFocusUpId = if (calibration.isEnabled) calibration.id else dsp.id
+        }
 
         addSpacer(container, 12)
         val calibrationMenu = addButton(container, "Calibration menu") { page = Page.CALIBRATION; refreshContent() }
-        eqButton.nextFocusDownId = calibrationMenu.id
-        calibrationMenu.nextFocusUpId = eqButton.id
+        eqRow.eq.nextFocusDownId = calibrationMenu.id
+        eqRow.presets.forEach { preset -> preset.nextFocusDownId = calibrationMenu.id }
+        calibrationMenu.nextFocusUpId = eqEntryId
         addButton(container, "Show QR Link") { page = Page.PAIRING; forcePairingQr = true; refreshContent() }
 
         addSpacer(container, 12)
@@ -430,17 +444,51 @@ class OverlayController(
         return checkbox
     }
 
-    private fun addEqRow(parent: LinearLayout, options: List<OverlayPresetOption>): Button {
+    private fun addEqRow(
+        parent: LinearLayout,
+        options: List<OverlayPresetOption>,
+        activePreset: OverlayPresetOption?,
+    ): EqRowFocus {
         val row = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        val eqButton = createButton("EQ") {
+        val eq = createFocusText("EQ") {
             page = Page.EQ_PROFILE
             refreshContent()
         }.apply {
             id = View.generateViewId()
         }
+        val initialIndex = options.indexOfFirst { it == activePreset }.coerceAtLeast(0)
+        var selectedIndex = initialIndex
+        var quickFocusActive = false
+        var quickTexts: List<TextView> = emptyList()
+
+        fun updatePresetIndicator() {
+            quickTexts.forEachIndexed { index, text ->
+                val selected = index == selectedIndex
+                text.paintFlags = if (selected) {
+                    text.paintFlags or Paint.UNDERLINE_TEXT_FLAG
+                } else {
+                    text.paintFlags and Paint.UNDERLINE_TEXT_FLAG.inv()
+                }
+                text.setTextColor(if (selected) 0xFFFFFFFF.toInt() else 0xFFE8E8EA.toInt())
+            }
+        }
+
+        fun selectPreset(index: Int) {
+            if (quickTexts.isEmpty()) return
+            selectedIndex = index.coerceIn(0, quickTexts.lastIndex)
+            updatePresetIndicator()
+        }
+
+        fun focusPreset(index: Int) {
+            val preset = quickTexts.getOrNull(index) ?: return
+            quickFocusActive = true
+            selectPreset(index)
+            preset.requestFocus()
+        }
+
         val scroll = HorizontalScrollView(context).apply {
             isHorizontalScrollBarEnabled = false
             isFocusable = false
@@ -448,24 +496,20 @@ class OverlayController(
             isFillViewport = true
             descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
         }
-
         val quickRow = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
-        val quickButtons = options.mapIndexed { index, option ->
-            createButton(option.name) {
+        quickTexts = options.mapIndexed { index, option ->
+            createFocusText(option.name.uppercase(Locale.ROOT)) {
                 actions.applyPreset(option)
                 refreshContent()
             }.apply {
                 id = View.generateViewId()
-                if (index == 0) nextFocusLeftId = eqButton.id
-                setOnKeyListener { _, keyCode, event ->
-                    if (index == 0 && keyCode == KeyEvent.KEYCODE_DPAD_LEFT && event.action == KeyEvent.ACTION_DOWN) {
-                        eqButton.requestFocus()
-                    } else {
-                        false
-                    }
-                }
+                if (index == 0) nextFocusLeftId = eq.id
                 setOnFocusChangeListener { view, hasFocus ->
                     if (hasFocus) {
+                        if (!quickFocusActive) {
+                            quickFocusActive = true
+                            selectPreset(initialIndex)
+                        }
                         view.post {
                             val viewportStart = scroll.scrollX
                             val viewportEnd = viewportStart + scroll.width
@@ -477,37 +521,78 @@ class OverlayController(
                             }
                             target?.let { scroll.smoothScrollTo(it.coerceAtLeast(0), 0) }
                         }
+                    } else {
+                        view.post {
+                            if (quickTexts.none { it.hasFocus() }) quickFocusActive = false
+                        }
+                    }
+                }
+                setOnKeyListener { _, keyCode, event ->
+                    when {
+                        keyCode == KeyEvent.KEYCODE_DPAD_LEFT -> {
+                            if (event.action == KeyEvent.ACTION_DOWN) {
+                                if (index == 0) {
+                                    quickFocusActive = false
+                                    eq.requestFocus()
+                                } else {
+                                    focusPreset(index - 1)
+                                }
+                            }
+                            true
+                        }
+                        keyCode == KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                            if (event.action == KeyEvent.ACTION_DOWN && index < quickTexts.lastIndex) {
+                                focusPreset(index + 1)
+                            }
+                            true
+                        }
+                        keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER -> {
+                            if (event.action == KeyEvent.ACTION_UP) performClick()
+                            true
+                        }
+                        else -> false
                     }
                 }
             }
         }
-        quickButtons.forEach { button ->
-            quickRow.addView(button, LinearLayout.LayoutParams(
+        quickTexts.forEach { text ->
+            quickRow.addView(text, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply { marginEnd = dp(6) })
+            ).apply { marginEnd = dp(8) })
         }
-        eqButton.nextFocusRightId = quickButtons.firstOrNull()?.id ?: View.NO_ID
-        eqButton.setOnKeyListener { _, keyCode, event ->
-            if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT && event.action == KeyEvent.ACTION_DOWN) {
-                quickButtons.firstOrNull()?.requestFocus() == true
-            } else {
-                false
+        updatePresetIndicator()
+        eq.nextFocusRightId = quickTexts.firstOrNull()?.id ?: View.NO_ID
+        eq.setOnKeyListener { _, keyCode, event ->
+            when {
+                keyCode == KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                    if (event.action == KeyEvent.ACTION_DOWN) focusPreset(0)
+                    true
+                }
+                keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER -> {
+                    if (event.action == KeyEvent.ACTION_UP) eq.performClick()
+                    true
+                }
+                else -> false
             }
         }
-        scroll.addView(quickRow, ViewGroup.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ))
-        row.addView(eqButton, LinearLayout.LayoutParams(dp(84), LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+        row.addView(eq, LinearLayout.LayoutParams(dp(64), LinearLayout.LayoutParams.WRAP_CONTENT).apply {
             marginEnd = dp(6)
         })
-        row.addView(scroll, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        if (quickTexts.isNotEmpty()) {
+            row.addView(createEqArrow("<"))
+            scroll.addView(quickRow, ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ))
+            row.addView(scroll, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            row.addView(createEqArrow(">"))
+        }
         parent.addView(row, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT,
         ).apply { bottomMargin = dp(6) })
-        return eqButton
+        return EqRowFocus(eq, quickTexts, quickTexts.getOrNull(initialIndex))
     }
 
     private fun addButton(parent: LinearLayout, label: String, action: () -> Unit): Button {
@@ -530,6 +615,29 @@ class OverlayController(
         isFocusable = true
         isClickable = true
         setOnClickListener { action() }
+    }
+
+    private fun createFocusText(label: String, action: () -> Unit): TextView = TextView(context).apply {
+        text = label
+        textSize = 16f
+        gravity = Gravity.CENTER
+        setTextColor(0xFFE8E8EA.toInt())
+        setPadding(dp(8), dp(10), dp(8), dp(10))
+        minHeight = dp(48)
+        isFocusable = true
+        isClickable = true
+        setOnClickListener { action() }
+    }
+
+    private fun createEqArrow(symbol: String): TextView = TextView(context).apply {
+        text = symbol
+        textSize = 18f
+        gravity = Gravity.CENTER
+        setTextColor(0xFFB8B8BC.toInt())
+        minWidth = dp(20)
+        minHeight = dp(48)
+        isFocusable = false
+        isClickable = false
     }
 
     private fun addSpacer(parent: LinearLayout, height: Int) {

@@ -498,8 +498,15 @@ class DynamicsProcessingEq(private val profileStore: ProfileStore) : AudioEngine
     fun isCalibrationActive(): Boolean = calibrationActive
 
     @Synchronized
-    fun hasCalibrationProfile(): Boolean =
-        calibrationActive || profileStore.loadCalibration() != null || profileStore.loadCalibrationChannels() != null
+    fun hasCalibrationProfile(): Boolean {
+        if (profileStore.loadCalibrationTransaction()?.previous?.active == false) return false
+        val common = profileStore.loadCalibration()
+        if (common != null && isValidCalibrationArray(common)) return true
+        val channels = profileStore.loadCalibrationChannels()
+        return channels != null &&
+            isValidCalibrationArray(channels.first) &&
+            isValidCalibrationArray(channels.second)
+    }
 
     /** Toggles the saved room correction without deleting its measured curve. */
     @Synchronized

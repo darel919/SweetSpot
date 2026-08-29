@@ -22,6 +22,7 @@ The direct peer has two ordered, reliable DataChannels:
 Cloudflare is not in the active calibration or EQ data path after the channels open. It hosts the secure dashboard and brokers short-lived signaling only. The local Android HTTP server remains available for authenticated diagnostics, local API testing, and ADB workflows; it is not the browser control path.
 
 The native WebRTC peer factory is initialized lazily when a remote dashboard session needs it. The app creates no WebRTC media tracks, keeps capture data in bounded temporary files, and releases peer, factory, and native session resources when the session ends.
+The foreground service keeps DSP active without keeping a signaling socket open. Pairing opens signaling only while the QR/pairing surface is visible or a direct peer needs recovery.
 
 The dashboard's collapsed developer details can request a redacted TV transport snapshot covering peer state, ICE state, traffic, capture buffering, reconnects, and the latest transport error.
 
@@ -35,7 +36,7 @@ Center, left, and right form the minimum viable dataset. Optional position failu
 
 The dashboard offers two TV-owned job modes. Auto stops optional refinement when the mandatory solution is sufficiently trustworthy. Advanced continues the forward and backward room positions when possible, then stages the best verified solution. Neither mode changes correction during the deterministic sweep being measured.
 
-See [`docs/tv-owned-calibration-architecture.md`](docs/tv-owned-calibration-architecture.md) and [`AGENTS.md`](AGENTS.md) for the authoritative boundaries and invariants.
+See [`docs/tv-owned-calibration-architecture.md`](docs/tv-owned-calibration-architecture.md) for the public architecture boundaries and invariants.
 
 ## Resource constraints
 

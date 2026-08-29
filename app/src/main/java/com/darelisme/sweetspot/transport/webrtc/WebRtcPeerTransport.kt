@@ -6,6 +6,7 @@ import com.darelisme.sweetspot.pairing.PairingSessionManager
 import com.darelisme.sweetspot.transport.PeerTransport
 import com.darelisme.sweetspot.transport.PeerTransportDiagnostics
 import com.darelisme.sweetspot.transport.PeerTransportState
+import com.darelisme.sweetspot.transport.shouldKeepSignaling
 import com.darelisme.sweetspot.transport.protocol.PeerEnvelopeValidator
 import com.darelisme.sweetspot.transport.signaling.SignalingClient
 import livekit.org.webrtc.DataChannel
@@ -71,6 +72,8 @@ class WebRtcPeerTransport(
             "peer_in_use",
             "stale_session",
             "protocol_mismatch",
+            "rate_limited",
+            "too_many_ice_candidates",
         )
     }
 
@@ -103,6 +106,10 @@ class WebRtcPeerTransport(
         sessionProvider = pairingSessionProvider,
         listener = object : SignalingClient.Listener {
             override fun onConnected(roundTripMs: Long?) = postControl {
+                if (!signalingShouldRun()) {
+                    if (currentState != PeerTransportState.DIRECT) setState(PeerTransportState.IDLE)
+                    return@postControl
+                }
                 signalingRoundTripMs = roundTripMs
                 if (currentState != PeerTransportState.DIRECT) setState(PeerTransportState.SIGNALING)
             }
@@ -110,6 +117,7 @@ class WebRtcPeerTransport(
             override fun onMessage(message: JSONObject) = postControl { handleSignal(message) }
 
             override fun onClosed(reason: String) = postControl {
+                if (!signalingShouldRun()) return@postControl
                 if (currentState != PeerTransportState.DIRECT && currentState != PeerTransportState.RECONNECTING) {
                     setError("Signaling unavailable: $reason")
                     setState(PeerTransportState.SIGNALING)
@@ -122,6 +130,7 @@ class WebRtcPeerTransport(
 
     private val running = AtomicBoolean(false)
     private var currentState = PeerTransportState.IDLE
+    private var pairingVisible = false
     @Volatile
     private var currentGeneration: String? = null
     private var authenticatedGeneration: String? = null
@@ -159,11 +168,47 @@ class WebRtcPeerTransport(
         maxPriorityBytes = MAX_PENDING_PRIORITY_CONTROL_BYTES,
     )
 
+    private fun signalingShouldRun(): Boolean = shouldKeepSignaling(
+        serviceRunning = running.get(),
+        pairingVisible = pairingVisible,
+        directPeer = directPresenceSent,
+        recoveryPending = currentState == PeerTransportState.RECONNECTING && authenticatedGeneration != null,
+    )
+
     override fun start() {
         if (!running.compareAndSet(false, true)) return
         postControl {
+            pairingVisible = false
+            setState(PeerTransportState.IDLE)
+        }
+    }
+
+    override fun openPairing() {
+        if (!running.get()) return
+        postControl {
+            pairingVisible = true
+            if (directPresenceSent) return@postControl
             setState(PeerTransportState.PAIRING)
             signaling.start()
+        }
+    }
+
+    override fun closePairing() {
+        if (!running.get()) return
+        postControl {
+            pairingVisible = false
+            val recoveryPending = currentState == PeerTransportState.RECONNECTING
+                && authenticatedGeneration != null
+            if (directPresenceSent) return@postControl
+            if (recoveryPending) {
+                signaling.start()
+                return@postControl
+            }
+            closePeer(notify = false)
+            currentGeneration = null
+            signaling.resetGeneration()
+            signaling.suspend()
+            setState(PeerTransportState.IDLE)
         }
     }
 
@@ -202,8 +247,13 @@ class WebRtcPeerTransport(
             closePeer(notify = false)
             currentGeneration = null
             signaling.resetGeneration()
-            signaling.reconnect()
-            setState(PeerTransportState.PAIRING)
+            if (pairingVisible) {
+                signaling.start()
+                setState(PeerTransportState.PAIRING)
+            } else {
+                signaling.suspend()
+                setState(PeerTransportState.IDLE)
+            }
         }
     }
 
@@ -259,6 +309,7 @@ class WebRtcPeerTransport(
     }
 
     private fun handleSignal(message: JSONObject) {
+        if (!signalingShouldRun()) return
         if (!exactInt(message.opt("v"), 1)) {
             signaling.suspend()
             failPeer("The signaling service sent an unsupported message", retryable = false)
@@ -283,7 +334,13 @@ class WebRtcPeerTransport(
                     closePeer(notify = false)
                     currentGeneration = null
                     signaling.resetGeneration()
-                    setState(PeerTransportState.PAIRING)
+                    if (pairingVisible) {
+                        signaling.start()
+                        setState(PeerTransportState.PAIRING)
+                    } else {
+                        signaling.suspend()
+                        setState(PeerTransportState.IDLE)
+                    }
                 }
             }
             "signal.offer" -> handleOffer(message)
@@ -603,7 +660,7 @@ class WebRtcPeerTransport(
                             commandHandler.onCaptureDataRejected(
                                 generation,
                                 bytes,
-                                "The TV capture queue is full. Retry this capture.",
+                                "The TV capture queue is full. Retry this measurement without moving the phone.",
                             )
                         }
                     }
@@ -620,14 +677,12 @@ class WebRtcPeerTransport(
         if (channel.state() == DataChannel.State.CLOSING || channel.state() == DataChannel.State.CLOSED) {
             if (currentState != PeerTransportState.RECONNECTING) {
                 reconnectCount++
-                signaling.reconnect()
                 if (directPresenceSent) {
-                    setState(PeerTransportState.RECONNECTING)
                     listener?.onPeerPresence(false, currentGeneration)
                     directPresenceSent = false
-                } else {
-                    setState(PeerTransportState.RECONNECTING)
                 }
+                setState(PeerTransportState.RECONNECTING)
+                if (signalingShouldRun()) signaling.reconnect() else signaling.suspend()
             }
             schedulePeerClose()
         } else {
@@ -882,19 +937,27 @@ class WebRtcPeerTransport(
             PeerConnection.PeerConnectionState.FAILED,
             -> {
                 reconnectCount++
-                signaling.reconnect()
                 if (directPresenceSent) {
-                    setState(PeerTransportState.RECONNECTING)
                     listener?.onPeerPresence(false, currentGeneration)
                     directPresenceSent = false
-                } else {
-                    setState(PeerTransportState.RECONNECTING)
                 }
+                setState(PeerTransportState.RECONNECTING)
+                if (signalingShouldRun()) signaling.reconnect() else signaling.suspend()
                 schedulePeerClose()
             }
             PeerConnection.PeerConnectionState.CLOSED -> {
                 closePeer(notify = true)
-                if (running.get()) setState(PeerTransportState.PAIRING)
+                if (running.get()) {
+                    if (pairingVisible) {
+                        signaling.start()
+                        setState(PeerTransportState.PAIRING)
+                    } else {
+                        signaling.suspend()
+                        currentGeneration = null
+                        signaling.resetGeneration()
+                        setState(PeerTransportState.IDLE)
+                    }
+                }
             }
             else -> if (currentState != PeerTransportState.DIRECT) setState(PeerTransportState.CONNECTING)
         }
@@ -964,7 +1027,7 @@ class WebRtcPeerTransport(
         }
         closePeer(notify = false, releaseSession = false)
         setState(PeerTransportState.RECONNECTING)
-        signaling.reconnect()
+        if (signalingShouldRun()) signaling.reconnect() else signaling.suspend()
         if (generation != null) schedulePeerClose()
     }
 
@@ -1051,7 +1114,17 @@ class WebRtcPeerTransport(
             reconnectCloseTask = null
             if (currentGeneration == generation && !directPresenceSent) {
                 closePeer(notify = false)
-                if (running.get()) setState(PeerTransportState.PAIRING)
+                if (running.get()) {
+                    if (pairingVisible) {
+                        signaling.start()
+                        setState(PeerTransportState.PAIRING)
+                    } else {
+                        currentGeneration = null
+                        signaling.resetGeneration()
+                        signaling.suspend()
+                        setState(PeerTransportState.IDLE)
+                    }
+                }
             }
         }, RECONNECT_CLOSE_GRACE_MS, TimeUnit.MILLISECONDS)
     }

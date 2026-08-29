@@ -34,6 +34,7 @@ class SignalingClient(
         private const val MAX_MESSAGE_BYTES = 64 * 1024
         private const val RECONNECT_MIN_MS = 1_000L
         private const val RECONNECT_MAX_MS = 30_000L
+        private const val SIGNALING_SUBPROTOCOL = "sweetspot.v1"
     }
 
     private val client = OkHttpClient.Builder()
@@ -58,8 +59,16 @@ class SignalingClient(
     private var generation: String? = null
 
     fun start() {
-        if (!running.compareAndSet(false, true)) return
-        post(::connect)
+        if (running.compareAndSet(false, true)) {
+            post(::connect)
+            return
+        }
+        post {
+            if (socket == null && !reconnectScheduled) {
+                reconnectDelayMs = RECONNECT_MIN_MS
+                connect()
+            }
+        }
     }
 
     fun stop() {
@@ -145,7 +154,10 @@ class SignalingClient(
         val nextGeneration = generation ?: newGeneration()
         generation = nextGeneration
         connectStartedAtMs = System.currentTimeMillis()
-        val request = Request.Builder().url(socketUrl(session)).build()
+        val request = Request.Builder()
+            .url(socketUrl(session))
+            .header("Sec-WebSocket-Protocol", "$SIGNALING_SUBPROTOCOL, ${session.pairSecret}")
+            .build()
         try {
             val candidate = synchronized(socketLock) {
                 client.newWebSocket(request, object : WebSocketListener() {
@@ -268,7 +280,7 @@ class SignalingClient(
             base.startsWith("http://") -> "ws://${base.removePrefix("http://")}"
             else -> base
         }
-        return "$wsBase/api/signaling/${session.rendezvousId}/ws?role=$role&secret=${session.pairSecret}"
+        return "$wsBase/api/signaling/${session.rendezvousId}/ws?role=$role"
     }
 
     private fun newGeneration(): String = buildString {

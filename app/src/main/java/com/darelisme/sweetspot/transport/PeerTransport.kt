@@ -53,6 +53,12 @@ interface PeerTransport {
 
     fun start()
 
+    /** Opens the short-lived pairing/signaling path without changing service lifetime. */
+    fun openPairing() {}
+
+    /** Closes pairing availability while preserving an authenticated direct peer. */
+    fun closePairing() {}
+
     fun stop()
 
     fun reconnectForPairingRotation()

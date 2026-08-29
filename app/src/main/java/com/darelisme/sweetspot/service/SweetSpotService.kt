@@ -717,6 +717,10 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
             overlay?.refresh()
         }
 
+        override fun setPairingVisible(visible: Boolean) {
+            if (visible) peerTransport?.openPairing() else peerTransport?.closePairing()
+        }
+
         override fun startCalibration() {
             // The paired web client owns microphone capture and starts the TV job.
             overlay?.showPairing()

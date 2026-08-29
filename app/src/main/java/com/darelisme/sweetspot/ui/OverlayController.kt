@@ -42,6 +42,7 @@ interface OverlayActions {
     fun setCalibrationEnabled(enabled: Boolean) {}
     fun applyPreset(option: OverlayPresetOption) {}
     fun setStartOnBoot(enabled: Boolean) {}
+    fun setPairingVisible(visible: Boolean) {}
     fun startCalibration() {}
 }
 
@@ -79,22 +80,28 @@ class OverlayController(
     private var shownAtMs: Long = 0
     private var connectedAtMs: Long = 0
     private var focusAssigned = false
+    private var pairingVisibilityReported = false
 
     fun show() = mainHandler.post {
         page = Page.HOME
         forcePairingQr = false
         if (shown) refreshContent() else showInternal()
+        reportPairingVisibility()
     }
 
     fun showPairing() = mainHandler.post {
         page = Page.PAIRING
         forcePairingQr = true
         if (shown) refreshContent() else showInternal()
+        reportPairingVisibility()
     }
 
     fun hide() = mainHandler.post { hideInternal() }
 
-    fun refresh() = mainHandler.post { if (shown) refreshContent() }
+    fun refresh() = mainHandler.post {
+        if (shown) refreshContent()
+        reportPairingVisibility()
+    }
 
     fun isShown(): Boolean = shown
 
@@ -102,6 +109,7 @@ class OverlayController(
         pairCode = code
         pairingUrl = url
         if (shown) refreshContent()
+        reportPairingVisibility()
     }
 
     fun updateConnectionState(state: String) = mainHandler.post {
@@ -111,6 +119,7 @@ class OverlayController(
             if (page == Page.PAIRING || forcePairingQr) scheduleConnectDismiss()
         }
         if (shown) refreshContent()
+        reportPairingVisibility()
     }
 
     private val dismissRunnable = Runnable { hideInternal() }
@@ -152,12 +161,16 @@ class OverlayController(
         } catch (_: Exception) {
             overlayView = null
             shown = false
+            reportPairingVisibility()
         }
     }
 
     private fun hideInternal() {
         mainHandler.removeCallbacks(dismissRunnable)
-        if (!shown) return
+        if (!shown) {
+            reportPairingVisibility()
+            return
+        }
         overlayView?.let { view ->
             try { windowManager.removeView(view) } catch (_: Exception) {}
         }
@@ -165,6 +178,7 @@ class OverlayController(
         shown = false
         page = Page.HOME
         forcePairingQr = false
+        reportPairingVisibility()
     }
 
     private fun refreshContent() {
@@ -178,10 +192,25 @@ class OverlayController(
             overlayView = view
             shownAtMs = SystemClock.elapsedRealtime()
             scheduleInactivityDismiss()
+            reportPairingVisibility()
         } catch (_: Exception) {
             overlayView = null
             shown = false
+            reportPairingVisibility()
         }
+    }
+
+    private fun pairingUiVisible(): Boolean = shown && (
+        page == Page.PAIRING
+            || forcePairingQr
+            || page == Page.HOME && shouldShowPairingQr(pairCode, connectionState)
+        )
+
+    private fun reportPairingVisibility() {
+        val visible = pairingUiVisible()
+        if (visible == pairingVisibilityReported) return
+        pairingVisibilityReported = visible
+        actions.setPairingVisible(visible)
     }
 
     private fun statusText(): String = when (connectionState) {

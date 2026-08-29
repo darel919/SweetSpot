@@ -1,6 +1,7 @@
 package com.darelisme.sweetspot.ui
 
 import android.content.Context
+import android.content.res.ColorStateList
 import android.graphics.PixelFormat
 import android.graphics.drawable.BitmapDrawable
 import android.os.Handler
@@ -8,6 +9,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -37,6 +39,11 @@ data class OverlayState(
     val calibrationMessage: String? = null,
 )
 
+enum class OverlayPresentation {
+    USER_OPENED,
+    AUTOMATIC,
+}
+
 interface OverlayActions {
     fun setDspEnabled(enabled: Boolean) {}
     fun setCalibrationEnabled(enabled: Boolean) {}
@@ -44,6 +51,7 @@ interface OverlayActions {
     fun setStartOnBoot(enabled: Boolean) {}
     fun setPairingVisible(visible: Boolean) {}
     fun startCalibration() {}
+    fun stopSweetSpot() {}
 }
 
 /** Lightweight system overlay for pairing and the small set of TV controls. */
@@ -57,6 +65,21 @@ class OverlayController(
         private const val QR_SIZE_PX = 260
         private const val DISMISS_AFTER_CONNECT_MS = 5_000L
         private const val INACTIVITY_DISMISS_MS = 30_000L
+        private val CHECKBOX_TEXT_COLORS = ColorStateList(
+            arrayOf(
+                intArrayOf(-android.R.attr.state_enabled),
+                intArrayOf(),
+            ),
+            intArrayOf(0xFF77777C.toInt(), 0xFFFFFFFF.toInt()),
+        )
+        private val CHECKBOX_TINT_COLORS = ColorStateList(
+            arrayOf(
+                intArrayOf(-android.R.attr.state_enabled),
+                intArrayOf(android.R.attr.state_checked),
+                intArrayOf(),
+            ),
+            intArrayOf(0xFF5A5A60.toInt(), 0xFF6BE0D1.toInt(), 0xFFE8E8EA.toInt()),
+        )
 
         const val CONNECTION_DISCONNECTED = "disconnected"
         const val CONNECTION_CONNECTING = "connecting"
@@ -77,12 +100,16 @@ class OverlayController(
     @Volatile private var connectionState: String = CONNECTION_DISCONNECTED
     private var page = Page.HOME
     private var forcePairingQr = false
+    private var presentationMode = OverlayPresentation.AUTOMATIC
     private var shownAtMs: Long = 0
     private var connectedAtMs: Long = 0
     private var focusAssigned = false
     private var pairingVisibilityReported = false
 
-    fun show() = mainHandler.post {
+    fun show(presentation: OverlayPresentation = OverlayPresentation.AUTOMATIC) = mainHandler.post {
+        if (!shown || presentation == OverlayPresentation.USER_OPENED) {
+            presentationMode = presentation
+        }
         page = Page.HOME
         forcePairingQr = false
         if (shown) refreshContent() else showInternal()
@@ -116,7 +143,8 @@ class OverlayController(
         connectionState = state
         if (state == CONNECTION_CONNECTED && shown && connectedAtMs == 0L) {
             connectedAtMs = SystemClock.elapsedRealtime()
-            if (page == Page.PAIRING || forcePairingQr) scheduleConnectDismiss()
+        } else if (state != CONNECTION_CONNECTED) {
+            connectedAtMs = 0L
         }
         if (shown) refreshContent()
         reportPairingVisibility()
@@ -124,15 +152,14 @@ class OverlayController(
 
     private val dismissRunnable = Runnable { hideInternal() }
 
-    private fun scheduleInactivityDismiss() {
+    private fun scheduleDismiss() {
         mainHandler.removeCallbacks(dismissRunnable)
-        val remaining = INACTIVITY_DISMISS_MS - (SystemClock.elapsedRealtime() - shownAtMs)
-        if (remaining <= 0) hideInternal() else mainHandler.postDelayed(dismissRunnable, remaining)
-    }
-
-    private fun scheduleConnectDismiss() {
-        mainHandler.removeCallbacks(dismissRunnable)
-        val remaining = DISMISS_AFTER_CONNECT_MS - (SystemClock.elapsedRealtime() - connectedAtMs)
+        if (!shown || presentationMode == OverlayPresentation.USER_OPENED) return
+        val connectedPairingPage = connectionState == CONNECTION_CONNECTED &&
+            connectedAtMs > 0L && (page == Page.PAIRING || forcePairingQr)
+        val timeout = if (connectedPairingPage) DISMISS_AFTER_CONNECT_MS else INACTIVITY_DISMISS_MS
+        val startedAt = if (connectedPairingPage) connectedAtMs else shownAtMs
+        val remaining = timeout - (SystemClock.elapsedRealtime() - startedAt)
         if (remaining <= 0) hideInternal() else mainHandler.postDelayed(dismissRunnable, remaining)
     }
 
@@ -156,8 +183,12 @@ class OverlayController(
             overlayView = view
             shown = true
             shownAtMs = SystemClock.elapsedRealtime()
-            connectedAtMs = 0
-            scheduleInactivityDismiss()
+            connectedAtMs = if (connectionState == CONNECTION_CONNECTED && (page == Page.PAIRING || forcePairingQr)) {
+                shownAtMs
+            } else {
+                0L
+            }
+            scheduleDismiss()
         } catch (_: Exception) {
             overlayView = null
             shown = false
@@ -167,6 +198,7 @@ class OverlayController(
 
     private fun hideInternal() {
         mainHandler.removeCallbacks(dismissRunnable)
+        presentationMode = OverlayPresentation.AUTOMATIC
         if (!shown) {
             reportPairingVisibility()
             return
@@ -190,8 +222,7 @@ class OverlayController(
             val view = buildView()
             windowManager.addView(view, params)
             overlayView = view
-            shownAtMs = SystemClock.elapsedRealtime()
-            scheduleInactivityDismiss()
+            scheduleDismiss()
             reportPairingVisibility()
         } catch (_: Exception) {
             overlayView = null
@@ -203,8 +234,7 @@ class OverlayController(
     private fun pairingUiVisible(): Boolean = shown && (
         page == Page.PAIRING
             || forcePairingQr
-            || page == Page.HOME && shouldShowPairingQr(pairCode, connectionState)
-        )
+    )
 
     private fun reportPairingVisibility() {
         val visible = pairingUiVisible()
@@ -244,29 +274,32 @@ class OverlayController(
 
     private fun buildHome(container: LinearLayout) {
         val state = stateProvider()
-        val code = pairCode.orEmpty()
-        if (forcePairingQr || shouldShowPairingQr(code, connectionState)) buildPairingSection(container, compact = true)
 
-        addCheckbox(container, "DSP", state.dspEnabled, actions::setDspEnabled)
-        if (state.calibrationAvailable) {
-            addCheckbox(container, "Calibration profile", state.calibrationEnabled, actions::setCalibrationEnabled)
-        }
+        val dsp = addCheckbox(container, "DSP", state.dspEnabled, actions::setDspEnabled)
+        val calibration = addCheckbox(
+            container,
+            "Calibration",
+            state.calibrationAvailable && state.calibrationEnabled,
+            actions::setCalibrationEnabled,
+            enabled = state.calibrationAvailable,
+        )
+        val eqButton = addEqRow(container, state.presets)
+        dsp.nextFocusDownId = if (calibration.isEnabled) calibration.id else eqButton.id
+        if (calibration.isEnabled) calibration.nextFocusDownId = eqButton.id
+        eqButton.nextFocusUpId = if (calibration.isEnabled) calibration.id else dsp.id
 
-        addButton(container, "EQ profile") {
-            page = Page.EQ_PROFILE
-            refreshContent()
-        }
-        if (state.presets.isNotEmpty()) {
-            addText(container, "Quick EQ", 17f, 0xFFB8B8BC.toInt(), Gravity.START, top = 16, bottom = 4)
-            addQuickProfileSwitcher(container, state.presets)
-        }
-        addButton(container, "Calibration menu") { page = Page.CALIBRATION; refreshContent() }
-        addButton(container, "Show QR link") { page = Page.PAIRING; forcePairingQr = true; refreshContent() }
-        addButton(container, "Start on boot: ${if (state.startOnBoot) "ON" else "OFF"}") {
-            actions.setStartOnBoot(!state.startOnBoot)
-            refreshContent()
-        }
-        addButton(container, "Hide to background") { hideInternal() }
+        addSpacer(container, 12)
+        val calibrationMenu = addButton(container, "Calibration menu") { page = Page.CALIBRATION; refreshContent() }
+        eqButton.nextFocusDownId = calibrationMenu.id
+        calibrationMenu.nextFocusUpId = eqButton.id
+        addButton(container, "Show QR Link") { page = Page.PAIRING; forcePairingQr = true; refreshContent() }
+
+        addSpacer(container, 12)
+        addCheckbox(container, "Start On Boot", state.startOnBoot, actions::setStartOnBoot)
+
+        addSpacer(container, 6)
+        addButton(container, "Exit (Hide to Background)") { hideInternal() }
+        addButton(container, "Exit (Stop SweetSpot)") { actions.stopSweetSpot() }
     }
 
     private fun buildPairing(container: LinearLayout) {
@@ -296,7 +329,7 @@ class OverlayController(
             forcePairingQr = true
             refreshContent()
         }
-        addButton(container, "Show QR link") { page = Page.PAIRING; forcePairingQr = true; refreshContent() }
+        addButton(container, "Show QR Link") { page = Page.PAIRING; forcePairingQr = true; refreshContent() }
         addButton(container, "Back to controls") { page = Page.HOME; refreshContent() }
     }
 
@@ -368,16 +401,22 @@ class OverlayController(
         label: String,
         checked: Boolean,
         action: (Boolean) -> Unit,
-    ) {
+        enabled: Boolean = true,
+    ): CheckBox {
         val checkbox = CheckBox(context).apply {
             text = label
             textSize = 16f
-            isFocusable = true
-            isClickable = true
             isChecked = checked
+            isEnabled = enabled
+            isFocusable = enabled
+            isClickable = enabled
+            setTextColor(CHECKBOX_TEXT_COLORS)
+            setButtonTintList(CHECKBOX_TINT_COLORS)
             setOnCheckedChangeListener { _, next ->
-                action(next)
-                refreshContent()
+                if (enabled) {
+                    action(next)
+                    refreshContent()
+                }
             }
         }
         parent.addView(checkbox, LinearLayout.LayoutParams(
@@ -388,53 +427,91 @@ class OverlayController(
             focusAssigned = true
             checkbox.post { checkbox.requestFocus() }
         }
+        return checkbox
     }
 
-    private fun addQuickProfileSwitcher(parent: LinearLayout, options: List<OverlayPresetOption>) {
+    private fun addEqRow(parent: LinearLayout, options: List<OverlayPresetOption>): Button {
+        val row = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val eqButton = createButton("EQ") {
+            page = Page.EQ_PROFILE
+            refreshContent()
+        }.apply {
+            id = View.generateViewId()
+        }
         val scroll = HorizontalScrollView(context).apply {
             isHorizontalScrollBarEnabled = false
+            isFocusable = false
+            isFocusableInTouchMode = false
+            isFillViewport = true
             descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
         }
-        val row = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
-        options.forEach { option ->
-            val button = Button(context).apply {
-                text = option.name
-                textSize = 14f
-                isFocusable = true
-                isClickable = true
-                setOnClickListener {
-                    actions.applyPreset(option)
-                    refreshContent()
+
+        val quickRow = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+        val quickButtons = options.mapIndexed { index, option ->
+            createButton(option.name) {
+                actions.applyPreset(option)
+                refreshContent()
+            }.apply {
+                id = View.generateViewId()
+                if (index == 0) nextFocusLeftId = eqButton.id
+                setOnKeyListener { _, keyCode, event ->
+                    if (index == 0 && keyCode == KeyEvent.KEYCODE_DPAD_LEFT && event.action == KeyEvent.ACTION_DOWN) {
+                        eqButton.requestFocus()
+                    } else {
+                        false
+                    }
                 }
                 setOnFocusChangeListener { view, hasFocus ->
                     if (hasFocus) {
-                        view.post { scroll.smoothScrollTo((view.left - dp(16)).coerceAtLeast(0), 0) }
+                        view.post {
+                            val viewportStart = scroll.scrollX
+                            val viewportEnd = viewportStart + scroll.width
+                            val target = when {
+                                scroll.width <= 0 -> null
+                                view.left < viewportStart -> view.left - dp(16)
+                                view.right > viewportEnd -> view.right - scroll.width + dp(16)
+                                else -> null
+                            }
+                            target?.let { scroll.smoothScrollTo(it.coerceAtLeast(0), 0) }
+                        }
                     }
                 }
             }
-            row.addView(button, LinearLayout.LayoutParams(
+        }
+        quickButtons.forEach { button ->
+            quickRow.addView(button, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
             ).apply { marginEnd = dp(6) })
         }
-        scroll.addView(row, ViewGroup.LayoutParams(
+        eqButton.nextFocusRightId = quickButtons.firstOrNull()?.id ?: View.NO_ID
+        eqButton.setOnKeyListener { _, keyCode, event ->
+            if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT && event.action == KeyEvent.ACTION_DOWN) {
+                quickButtons.firstOrNull()?.requestFocus() == true
+            } else {
+                false
+            }
+        }
+        scroll.addView(quickRow, ViewGroup.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ))
-        parent.addView(scroll, LinearLayout.LayoutParams(
+        row.addView(eqButton, LinearLayout.LayoutParams(dp(84), LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            marginEnd = dp(6)
+        })
+        row.addView(scroll, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        parent.addView(row, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT,
         ).apply { bottomMargin = dp(6) })
+        return eqButton
     }
 
-    private fun addButton(parent: LinearLayout, label: String, action: () -> Unit) {
-        val button = Button(context).apply {
-            text = label
-            textSize = 16f
-            isFocusable = true
-            isClickable = true
-            setOnClickListener { action() }
-        }
+    private fun addButton(parent: LinearLayout, label: String, action: () -> Unit): Button {
+        val button = createButton(label, action)
         parent.addView(button, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -443,6 +520,23 @@ class OverlayController(
             focusAssigned = true
             button.post { button.requestFocus() }
         }
+        return button
+    }
+
+    private fun createButton(label: String, action: () -> Unit): Button = Button(context).apply {
+        text = label
+        textSize = 16f
+        isAllCaps = false
+        isFocusable = true
+        isClickable = true
+        setOnClickListener { action() }
+    }
+
+    private fun addSpacer(parent: LinearLayout, height: Int) {
+        parent.addView(View(context), LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(height),
+        ))
     }
 
     private fun dp(value: Int): Int = (value * density).roundToInt()

@@ -51,6 +51,7 @@ import com.darelisme.sweetspot.transport.webrtc.WebRtcPeerTransport
 import com.darelisme.sweetspot.ui.OverlayController
 import com.darelisme.sweetspot.ui.OverlayActions
 import com.darelisme.sweetspot.ui.OverlayPresetOption
+import com.darelisme.sweetspot.ui.OverlayPresentation
 import com.darelisme.sweetspot.ui.OverlayState
 import org.json.JSONArray
 import org.json.JSONObject
@@ -405,9 +406,10 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val reason = startReason(intent)
         val decision = SweetSpotStartupPolicy.decide(
             enabled = profileStore.isEnabled(),
-            reason = startReason(intent),
+            reason = reason,
             requestedShowOverlay = intent?.getBooleanExtra(EXTRA_SHOW_UI, false) ?: false,
             startOnBoot = profileStore.isStartOnBootEnabled(),
         )
@@ -439,7 +441,7 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
             ACTION_CALIBRATION_CONTINUE ->
                 measurementController?.continueFromActivity(intent.getStringExtra(EXTRA_SESSION_ID).orEmpty())
             ACTION_START -> {
-                if (decision.showOverlay) overlay?.show() else overlay?.hide()
+                if (decision.showOverlay) overlay?.show(OverlayPresentation.USER_OPENED) else overlay?.hide()
             }
             null -> overlay?.hide()
             else -> Log.d(TAG, "onStartCommand: no/unknown action (intent=$intent)")
@@ -724,6 +726,10 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
         override fun startCalibration() {
             // The paired web client owns microphone capture and starts the TV job.
             overlay?.showPairing()
+        }
+
+        override fun stopSweetSpot() {
+            stopSelf()
         }
     }
 

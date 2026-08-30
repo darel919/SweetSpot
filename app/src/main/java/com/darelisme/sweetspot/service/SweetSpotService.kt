@@ -93,6 +93,7 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
         private const val CHANNEL_ID = "sweetspot"
         private const val NOTIFICATION_ID = 1
         private const val CLIENT_DISCONNECT_GRACE_MS = 10_000L
+        private const val DEFERRED_ROTATION_RECHECK_MS = 30_000L
         private const val STATE_REVISION_PREFS = "state_revision"
         private const val STATE_REVISION_KEY = "revision"
     }
@@ -123,7 +124,6 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
     private val clientDisconnectGrace = Runnable {
         pendingDisconnectedPeerGeneration = null
         measurementController?.clientPresenceChanged(false)
-        rotatePairingSession(force = true)
     }
     private lateinit var profileStore: ProfileStore
 
@@ -386,9 +386,10 @@ class SweetSpotService : Service(), ServiceActions, SweetSpotPeerCommandHost {
 
     private fun schedulePairingRotation() {
         mainHandler.removeCallbacks(pairingRotation)
+        if (pairingRotationPending && pairCodes.hasActivePeer()) return
         val session = pairCodes.currentSession()
         val delay = if (pairingRotationPending) {
-            1_000L
+            DEFERRED_ROTATION_RECHECK_MS
         } else {
             (session.expiresAt - System.currentTimeMillis() - PairingSessionManager.ROTATION_MARGIN_MS)
                 .coerceAtLeast(1_000L)

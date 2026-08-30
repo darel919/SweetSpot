@@ -1,0 +1,5 @@
+ts	phase	decision	why	evidence	result
+2026-08-27T00:00:00Z	frame	Treat Android and web as one release-coupled migration	The wire contract and authority boundary cannot be correct if only one repository changes	AGENTS.md, ../sweetspot-web/AGENTS.md	baseline mapped
+2026-08-27T00:00:01Z	frame	Build the persisted three-position monotonic job before porting optional refinement	Every later analyzer and protocol step needs one authoritative state model	user specification: required hard invariants 1-4	implemented
+2026-08-27T00:00:02Z	baseline	Captured clean Android and web test baselines	Later failures need an unambiguous pre-change reference	./gradlew test; cd ../sweetspot-web && bun run test	Android green; web 280 pass, 0 fail
+2026-08-27T00:00:03Z	design	Selected a serialized reducer-backed engine with atomic job snapshots	The reducer centralizes monotonic evidence and restart behavior while snapshots keep persistence small on low-end flash	docs/tv-owned-calibration-architecture.md	architecture decision recorded for implementation

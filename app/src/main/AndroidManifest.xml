@@ -19,6 +19,7 @@
 
     <application
         android:allowBackup="false"
+        android:banner="@drawable/ic_launcher_background"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
@@ -26,7 +27,7 @@
         android:theme="@android:style/Theme.Material.NoActionBar">
 
         <activity
-            android:name=".MainActivity"
+            android:name=".ui.MainActivity"
             android:exported="true"
             android:screenOrientation="landscape">
 
@@ -40,7 +41,7 @@
         </activity>
 
         <activity
-            android:name=".CalibrationActivity"
+            android:name=".ui.calibration.CalibrationActivity"
             android:exported="false"
             android:launchMode="singleTop"
             android:taskAffinity=""
@@ -48,12 +49,12 @@
             android:theme="@android:style/Theme.Material.NoActionBar" />
 
         <service
-            android:name=".SweetSpotService"
+            android:name=".service.SweetSpotService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
 
         <receiver
-            android:name=".SweetSpotCommandReceiver"
+            android:name=".service.SweetSpotCommandReceiver"
             android:exported="false">
             <intent-filter>
                 <action android:name="com.darelisme.sweetspot.START" />
@@ -66,7 +67,7 @@
         </receiver>
 
         <receiver
-            android:name=".BootCompletedReceiver"
+            android:name=".service.BootCompletedReceiver"
             android:enabled="true"
             android:exported="false">
             <intent-filter>

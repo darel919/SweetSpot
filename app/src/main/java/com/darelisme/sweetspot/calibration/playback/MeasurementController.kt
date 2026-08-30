@@ -1,0 +1,1031 @@
+package com.darelisme.sweetspot.calibration.playback
+
+import com.darelisme.sweetspot.audio.engine.AudioEngine
+import com.darelisme.sweetspot.audio.engine.MeasurementAudioOverrideResult
+import com.darelisme.sweetspot.audio.engine.MeasurementAudioState
+import com.darelisme.sweetspot.calibration.model.CalibrationResultText
+import com.darelisme.sweetspot.calibration.model.MeasurementContext
+import com.darelisme.sweetspot.calibration.model.MeasurementResponse
+import com.darelisme.sweetspot.calibration.model.MeasurementResponsePayload
+import com.darelisme.sweetspot.calibration.model.MeasurementSessionFence
+import com.darelisme.sweetspot.calibration.model.ValidationRecoveryResult
+import com.darelisme.sweetspot.calibration.model.calibrationResultText
+import com.darelisme.sweetspot.calibration.model.isCalibrationSessionOutcome
+import com.darelisme.sweetspot.calibration.model.isUserCalibrationCancellation
+import com.darelisme.sweetspot.calibration.model.isValidMeasurementSessionId
+import com.darelisme.sweetspot.calibration.model.shouldForwardMeasurementResponse
+import com.darelisme.sweetspot.calibration.transport.MeasurementSessionPayloadState
+import com.darelisme.sweetspot.calibration.transport.MeasurementSessionPayloads
+import com.darelisme.sweetspot.ui.calibration.CalibrationActivity
+import com.darelisme.sweetspot.ui.calibration.CalibrationGuideState
+import android.content.Context
+import android.content.Intent
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import org.json.JSONObject
+
+class MeasurementController(
+    private val context: Context,
+    private val engine: AudioEngine,
+    private val rollbackCandidate: (String) -> Boolean = { false },
+    private val stateSnapshotProvider: () -> JSONObject = { JSONObject() },
+    private val finalStateVerifier: () -> Boolean = { true },
+    private val rollbackTargetActiveProvider: (String) -> Boolean? = { null },
+    private val acquireAudioOperation: () -> Boolean = { true },
+    private val releaseAudioOperation: () -> Unit = {},
+    private val onMeasurementRestorationState: (String, String?, String?) -> Unit = { _, _, _ -> },
+) {
+    companion object {
+        private const val TAG = "SweetSpotMeasurement"
+        private const val WATCHDOG_MS = 60_000L
+    }
+
+    private val audioManager = context.getSystemService(AudioManager::class.java)
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val executor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "sweetspot-measurement").apply { isDaemon = true }
+    }
+
+    @Volatile
+    private var activeSession: Session? = null
+    private val sessionFence = MeasurementSessionFence()
+    private var state: SessionState = SessionState.Idle
+    private var focusRequest: AudioFocusRequest? = null
+    private var bypassState: MeasurementAudioState? = null
+    private var watchdog: ScheduledFuture<*>? = null
+    @Volatile
+    private var closed = false
+
+    private val audioAttributes = AudioAttributes.Builder()
+        .setUsage(AudioAttributes.USAGE_MEDIA)
+        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+        .build()
+    private val audioPlayback = MeasurementAudioPlayback(audioAttributes) { !closed }
+    private val audioRunner = MeasurementAudioRunner(audioPlayback) { session -> activeSession === session }
+
+    fun begin(
+        sessionId: String,
+        channel: String,
+        phase: String,
+        candidateId: String?,
+        replyTo: String?,
+        emit: (String, org.json.JSONObject, String?) -> Unit
+    ) {
+        submit {
+            if (!validSessionId(sessionId) || !validChannel(channel) || !validPhase(phase)
+                || (phase == "validation" && candidateId.isNullOrBlank())
+                || (phase == "measurement" && candidateId != null)
+            ) {
+                emitError(emit, replyTo, sessionId, "invalid_session", "Invalid session, channel, or phase")
+                return@submit
+            }
+            if (activeSession != null || state !is SessionState.Idle || !sessionFence.begin(sessionId)) {
+                emitError(emit, replyTo, sessionId, "already_measuring", "Another calibration session is active")
+                return@submit
+            }
+            if (!acquireAudioOperation()) {
+                sessionFence.terminate(sessionId)
+                emitError(emit, replyTo, sessionId, "already_measuring", "Another audio operation is active")
+                return@submit
+            }
+
+            val rollbackTargetActive = if (phase == "validation" && candidateId != null) {
+                try {
+                    rollbackTargetActiveProvider(candidateId)
+                } catch (_: Throwable) {
+                    null
+                }
+            } else {
+                null
+            }
+            val session = Session(
+                sessionId,
+                channel,
+                phase,
+                candidateId,
+                emit,
+                replyTo,
+                rollbackTargetActive,
+            )
+            session.audioOperationHeld = true
+            activeSession = session
+            state = SessionState.AwaitingUi(session)
+            touchWatchdog()
+            CalibrationActivity.updateStatus(sessionId, "Opening calibration mode…")
+            CalibrationActivity.updatePrimaryAction(sessionId, null)
+            try {
+                mainHandler.post {
+                    if (closed || activeSession !== session) return@post
+                    try {
+                        context.startActivity(Intent(context, CalibrationActivity::class.java).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            putExtra(CalibrationActivity.EXTRA_SESSION_ID, sessionId)
+                        })
+                    } catch (error: Throwable) {
+                        submit {
+                            if (activeSession === session) {
+                                finishWithError(session, "calibration_ui_failed", error.message ?: "Unable to open calibration UI")
+                            }
+                        }
+                    }
+                }
+            } catch (error: Throwable) {
+                finishWithError(session, "calibration_ui_failed", error.message ?: "Unable to open calibration UI")
+            }
+        }
+    }
+
+    fun activityReady(sessionId: String) {
+        submit {
+            val session = activeSession ?: return@submit
+            if (session.id != sessionId || state !is SessionState.AwaitingUi) return@submit
+            touchWatchdog()
+            CalibrationActivity.updateStatus(sessionId, "Requesting exclusive audio…")
+            if (!requestExclusiveFocus()) {
+                finishWithError(session, "audio_focus_denied", "Exclusive audio focus was denied")
+                return@submit
+            }
+            try {
+                val overrideResult = if (session.phase == "validation") {
+                    engine.beginCalibrationValidation(session.candidateId)
+                } else {
+                    engine.beginMeasurementBypass()
+                }
+                bypassState = when (overrideResult) {
+                    is MeasurementAudioOverrideResult.Applied -> overrideResult.previousState.also {
+                        session.validationOverrideApplied = session.phase == "validation"
+                    }
+                    is MeasurementAudioOverrideResult.Failed -> {
+                        finishWithError(
+                            session,
+                            if (overrideResult.restored) "dsp_state_unverified" else "dsp_restore_failed",
+                            overrideResult.error,
+                        )
+                        return@submit
+                    }
+                }
+                val sweep = audioPlayback.prepareSweep(session.channel)
+                state = SessionState.Ready(session, sweep, session.channel, null)
+                session.emit("calibrationSession.started", sessionPayload(session), session.replyTo)
+                session.emit("measurement.ready", MeasurementSessionPayloads.ready(sessionPayloadState(session), sweep), session.replyTo)
+                CalibrationActivity.updateStatus(
+                    sessionId,
+                    if (session.phase == "validation") {
+                        "Validating the applied correction.\nKeep the iPhone still."
+                    } else {
+                        "Calibration is ready.\nKeep the iPhone still."
+                    }
+                )
+                touchWatchdog()
+            } catch (error: Throwable) {
+                finishWithError(session, "sweep_playback_failed", error.message ?: "Unable to prepare sweep")
+            }
+        }
+    }
+
+    fun activityClosed(sessionId: String) {
+        submit {
+            val session = activeSession ?: return@submit
+            if (session.id == sessionId) {
+                when (state) {
+                    is SessionState.ValidationFinalized -> closeValidationUi(session)
+                    is SessionState.AwaitingValidationFinalization ->
+                        finishCancelled(session, "calibration_ui_closed", "Calibration UI closed unexpectedly")
+                    else -> finishCancelled(session, "calibration_ui_closed", "Calibration UI closed unexpectedly")
+                }
+            }
+        }
+    }
+
+    fun cancel(
+        sessionId: String,
+        code: String,
+        message: String?,
+        replyTo: String?,
+        emit: (String, org.json.JSONObject, String?) -> Unit,
+    ) {
+        markMeasurementRestorationIfActive(sessionId)
+        submit {
+            val session = activeSession
+            if (sessionFence.shouldIgnore(sessionId)) return@submit
+            if (session == null || session.id != sessionId) {
+                emitError(emit, replyTo, sessionId, "invalid_session", "No matching calibration session")
+                return@submit
+            }
+            session.emit = emit
+            session.replyTo = replyTo
+            when (state) {
+                is SessionState.ValidationFinalized -> closeValidationUi(session)
+                else -> if (isUserCalibrationCancellation(code)) {
+                    finishCancelled(session, code, message ?: defaultCalibrationAbortMessage(code))
+                } else {
+                    finishWithError(session, code, message ?: defaultCalibrationAbortMessage(code))
+                }
+            }
+        }
+    }
+
+    fun cancelFromActivity(sessionId: String) {
+        markMeasurementRestorationIfActive(sessionId)
+        submit {
+            activeSession?.let { session ->
+                if (session.id != sessionId) return@let
+                when (state) {
+                    is SessionState.ValidationFinalized -> closeValidationUi(session)
+                    else -> finishCancelled(session, "calibration_aborted", "Calibration cancelled")
+                }
+            }
+        }
+    }
+
+    fun clientPresenceChanged(present: Boolean) {
+        if (present) return
+        submit {
+            activeSession?.let { session ->
+                when (state) {
+                    is SessionState.ValidationFinalized -> closeValidationUi(session)
+                    else -> finishCancelled(session, "calibration_aborted", "Calibration dashboard disconnected")
+                }
+            }
+        }
+    }
+
+    fun continueFromActivity(sessionId: String) {
+        submit {
+            val session = activeSession ?: return@submit
+            if (session.id != sessionId) return@submit
+            when (val current = state) {
+                is SessionState.Loudness -> stopLoudnessInternal(session)
+                is SessionState.Ready -> {
+                    val context = current.context ?: return@submit
+                    if (!context.requiresRemoteContinue() || context.sameCapture(session.continuedPositionContext)) return@submit
+                    session.continuedPositionContext = context
+                    CalibrationActivity.updatePrimaryAction(session.id, null)
+                    session.emit(
+                        "calibrationSession.position.continued",
+                        MeasurementSessionPayloads.positionContinued(session.id, context),
+                        session.replyTo,
+                    )
+                    touchWatchdog()
+                }
+                is SessionState.ValidationFinalized -> closeValidationUi(session)
+                is SessionState.AwaitingValidationFinalization -> {
+                    if (session.validationFatal) closeValidationUi(session)
+                }
+                else -> Unit
+            }
+        }
+    }
+
+    fun validationFinalized(candidateId: String, outcome: String, reason: String? = null) {
+        submit {
+            val session = activeSession ?: return@submit
+            if (session.phase != "validation" || session.candidateId != candidateId ||
+                state !is SessionState.AwaitingValidationFinalization
+            ) return@submit
+            val abortOutcome = session.validationAbortError?.let { error ->
+                if (isUserCalibrationCancellation(error.first)) "cancelled" else "error"
+            }
+            val finalOutcome = abortOutcome ?: outcome
+            if (finalOutcome == "improved" && session.validationFinalizationBlocked) {
+                showValidationFailure(session, "The TV could not verify restoration before accepting the candidate")
+                return@submit
+            }
+            state = SessionState.ValidationFinalized(session)
+            watchdog?.cancel(false)
+            watchdog = null
+            val result = calibrationResultText(
+                finalOutcome,
+                if (finalOutcome == "error") session.validationAbortError?.second ?: reason else reason,
+                session.rollbackTargetActive,
+            )
+            CalibrationActivity.updateStatus(session.id, "${result.title}\n${result.body}")
+            CalibrationActivity.updatePrimaryAction(session.id, "Done")
+        }
+    }
+
+    fun validationFinalizationFailed(candidateId: String, message: String) {
+        submit {
+            val session = activeSession ?: return@submit
+            if (session.phase != "validation" || session.candidateId != candidateId ||
+                state !is SessionState.AwaitingValidationFinalization
+            ) return@submit
+            showValidationFailure(session, message)
+        }
+    }
+
+    fun end(
+        sessionId: String,
+        outcome: String?,
+        replyTo: String?,
+        emit: (String, org.json.JSONObject, String?) -> Unit,
+    ) {
+        if (outcome == null || !isCalibrationSessionOutcome(outcome)) {
+            submit {
+                emitError(emit, replyTo, sessionId, "invalid_session", "Calibration session end requires a valid final outcome")
+            }
+            return
+        }
+        markMeasurementRestorationIfActive(sessionId)
+        submit {
+            val session = activeSession
+            if (session == null || session.id != sessionId) {
+                emitError(emit, replyTo, sessionId, "invalid_session", "No matching calibration session")
+                return@submit
+            }
+            session.emit = emit
+            session.replyTo = replyTo
+            session.finalOutcome = outcome
+            finishSession(session, null)
+        }
+    }
+
+    fun startLoudness(
+        sessionId: String,
+        replyTo: String?,
+        emit: (String, org.json.JSONObject, String?) -> Unit
+    ) {
+        submit {
+            val session = activeSession
+            if (session == null || session.id != sessionId || session.phase != "measurement") {
+                emitError(emit, replyTo, sessionId, "invalid_session", "Loudness preflight is not available")
+                return@submit
+            }
+            session.emit = emit
+            session.replyTo = replyTo
+            if (state is SessionState.Loudness) {
+                touchWatchdog()
+                return@submit
+            }
+            if (state !is SessionState.Ready) {
+                emitError(emit, replyTo, sessionId, "invalid_session", "Session is not ready for loudness preflight")
+                return@submit
+            }
+            try {
+                audioPlayback.stop()
+                val prepared = audioPlayback.prepareLoudness()
+                state = SessionState.Loudness(session)
+                audioPlayback.play(prepared.resources)
+                session.emit(
+                    "calibrationSession.loudness.started",
+                    MeasurementSessionPayloads.loudnessStarted(sessionPayloadState(session), prepared.resources.track.sampleRate),
+                    replyTo
+                )
+                CalibrationActivity.updateStatus(
+                    sessionId,
+                    "Set your normal listening volume.\nPink noise is playing at ${PinkNoiseGenerator.DEFAULT_LEVEL_DBFS} dBFS.\nLeave the volume unchanged, then press Continue on the TV."
+                )
+                CalibrationActivity.updatePrimaryAction(sessionId, "Continue")
+                touchWatchdog()
+                Thread {
+                    audioRunner.playLoudness(session, prepared) { error ->
+                        submit {
+                            if (activeSession === session && audioPlayback.resources === prepared.resources) {
+                                finishWithError(session, "sweep_playback_failed", error.message ?: "Loudness playback failed")
+                            }
+                        }
+                    }
+                }.apply {
+                    name = "sweetspot-loudness-playback"
+                    isDaemon = true
+                    start()
+                }
+            } catch (error: Throwable) {
+                finishWithError(session, "sweep_playback_failed", error.message ?: "Unable to play loudness reference")
+            }
+        }
+    }
+
+    fun stopLoudness(
+        sessionId: String,
+        replyTo: String?,
+        emit: (String, org.json.JSONObject, String?) -> Unit
+    ) {
+        submit {
+            val session = activeSession
+            if (session == null || session.id != sessionId || state !is SessionState.Loudness) {
+                emitError(emit, replyTo, sessionId, "invalid_session", "Loudness preflight is not active")
+                return@submit
+            }
+            session.emit = emit
+            session.replyTo = replyTo
+            stopLoudnessInternal(session)
+        }
+    }
+
+    private fun stopLoudnessInternal(session: Session) {
+        state = SessionState.Finishing(session)
+        try {
+            audioPlayback.stop()
+            val sweep = audioPlayback.prepareSweep(session.channel)
+            state = SessionState.Ready(session, sweep, session.channel, null)
+            session.emit("calibrationSession.loudness.stopped", sessionPayload(session), session.replyTo)
+            CalibrationActivity.updateStatus(session.id, "Volume locked.\nThe TV will guide the next measurement.")
+            CalibrationActivity.updatePrimaryAction(session.id, null)
+            touchWatchdog()
+        } catch (error: Throwable) {
+            finishWithError(session, "sweep_playback_failed", error.message ?: "Unable to prepare measurement sweep")
+        }
+    }
+
+    fun updateProgress(
+        sessionId: String,
+        stage: String,
+        current: Int,
+        total: Int,
+        estimatedRemainingSeconds: Int?,
+        message: String?
+    ) {
+        submit {
+            val session = activeSession ?: return@submit
+            if (session.id != sessionId || current < 0 || total < 1 || current > total) return@submit
+            val stageLabel = when (stage) {
+                "loudness" -> "Set listening volume"
+                "preparing" -> "Preparing next sweep"
+                "recording" -> "Recording measurement"
+                "analyzing" -> "Analyzing measurement"
+                "position-pause" -> "Move to the next position, then press Continue on the TV"
+                "validation" -> "Validating correction"
+                "ending" -> "Finishing calibration"
+                else -> "Calibration"
+            }
+            val progress = "Calibration progress: $current of $total"
+            val estimate = estimatedRemainingSeconds?.takeIf { it >= 0 }?.let { seconds ->
+                val minutes = seconds / 60
+                val remainder = seconds % 60
+                if (minutes > 0) "Approx. ${minutes}m ${remainder}s remaining" else "Approx. ${remainder}s remaining"
+            }
+            val contextLabel = when (val current = state) {
+                is SessionState.Ready -> current.context?.label()
+                is SessionState.Playing -> current.context?.label()
+                else -> null
+            }
+            val activeContext = when (val current = state) {
+                is SessionState.Ready -> current.context
+                is SessionState.Playing -> current.context
+                else -> null
+            }
+            val instruction = message?.takeIf { stage != "position-pause" && it.isNotBlank() }
+            val text = listOfNotNull(progress, stageLabel, contextLabel, estimate, instruction).joinToString("\n")
+            CalibrationActivity.updateStatus(sessionId, text)
+            when (stage) {
+                "position-pause" -> {
+                    activeContext?.let {
+                        CalibrationActivity.updatePositionGuide(sessionId, it, CalibrationGuideState.READY)
+                    }
+                    CalibrationActivity.updatePrimaryAction(sessionId, "Continue")
+                }
+                "recording" -> activeContext?.let {
+                    CalibrationActivity.updatePositionGuide(sessionId, it, CalibrationGuideState.MEASURING)
+                }
+            }
+            touchWatchdog()
+        }
+    }
+
+    fun updateDiagnostics(
+        sessionId: String,
+        context: MeasurementContext?,
+        current: Int,
+        total: Int,
+        _diagnostics: org.json.JSONObject
+    ) {
+        submit {
+            val session = activeSession ?: return@submit
+            if (session.id != sessionId || context == null || !context.isValid()) return@submit
+            val readyContext = (state as? SessionState.Ready)?.context
+            if (readyContext != null && readyContext != context) return@submit
+            val stage = if (session.phase == "validation") "Validating correction" else "Analyzing measurement"
+            CalibrationActivity.updateStatus(
+                sessionId,
+                "Calibration progress: $current of $total\n$stage\n${context.label()}\nKeep the iPhone still.",
+            )
+            touchWatchdog()
+        }
+    }
+
+    internal fun updateResponse(response: MeasurementResponse) {
+        submit {
+            val session = activeSession ?: return@submit
+            if (!shouldForwardMeasurementResponse(session.id, response) || state is SessionState.Finishing) return@submit
+            CalibrationActivity.updateGraph(session.id, response)
+            touchWatchdog()
+        }
+    }
+
+    fun prepare(
+        sessionId: String,
+        channel: String?,
+        context: MeasurementContext?,
+        replyTo: String?,
+        emit: (String, org.json.JSONObject, String?) -> Unit
+    ) {
+        submit {
+            val session = activeSession
+            if (sessionFence.shouldIgnore(sessionId)) return@submit
+            if (session == null || session.id != sessionId) {
+                emitError(emit, replyTo, sessionId, "invalid_session", "No matching calibration session")
+                return@submit
+            }
+            session.emit = emit
+            session.replyTo = replyTo
+            when (val current = state) {
+                is SessionState.Ready -> {
+                    val route = context?.channel ?: channel ?: session.channel
+                    if (!validChannel(route) || (context != null && !context.isValid())) {
+                        emitError(emit, replyTo, sessionId, "invalid_session", "Invalid measurement channel or context")
+                        return@submit
+                    }
+                    try {
+                        val sweep = audioPlayback.prepareSweep(route, context?.captureKind ?: "position-composite")
+                        if (context == null || !context.sameCapture(session.continuedPositionContext)) {
+                            session.continuedPositionContext = null
+                        }
+                        state = SessionState.Ready(session, sweep, route, context)
+                        emit("measurement.ready", MeasurementSessionPayloads.ready(sessionPayloadState(session), sweep, context), replyTo)
+                        CalibrationActivity.updatePositionGuide(sessionId, context, CalibrationGuideState.READY)
+                        CalibrationActivity.updateStatus(sessionId, context?.readyStatus() ?: "TV ready. Follow the instructions shown here.")
+                        CalibrationActivity.updatePrimaryAction(
+                            sessionId,
+                            context?.takeIf { it.requiresRemoteContinue() && !it.sameCapture(session.continuedPositionContext) }
+                                ?.let { "Continue" },
+                        )
+                        touchWatchdog()
+                    } catch (error: Throwable) {
+                        finishWithError(session, "sweep_playback_failed", error.message ?: "Unable to prepare routed sweep")
+                    }
+                }
+                is SessionState.AwaitingUi -> touchWatchdog()
+                is SessionState.Finishing -> Unit
+                else -> emitError(emit, replyTo, sessionId, "invalid_session", "Session is not ready to prepare")
+            }
+        }
+    }
+
+    fun playSweep(
+        sessionId: String,
+        context: MeasurementContext?,
+        replyTo: String?,
+        emit: (String, org.json.JSONObject, String?) -> Unit
+    ) {
+        submit {
+            val current = state
+            val session = activeSession
+            if (sessionFence.shouldIgnore(sessionId) || current is SessionState.Finishing) return@submit
+            if (session == null || session.id != sessionId || current !is SessionState.Ready) {
+                emitError(emit, replyTo, sessionId, "invalid_session", "Session is not ready for playback")
+                return@submit
+            }
+            if (context != null && !context.isValid()) {
+                emitError(emit, replyTo, sessionId, "invalid_session", "Invalid measurement context")
+                return@submit
+            }
+            if ((current.context == null) != (context == null) ||
+                (current.context != null && current.context != context)) {
+                emitError(emit, replyTo, sessionId, "invalid_session", "Playback context does not match prepared sweep")
+                return@submit
+            }
+            session.emit = emit
+            session.replyTo = replyTo
+            val playback = audioPlayback.resources
+            if (playback == null) {
+                finishWithError(session, "sweep_playback_failed", "Sweep AudioTrack is unavailable")
+                return@submit
+            }
+            try {
+                audioPlayback.play(playback)
+                val playbackContext = context ?: current.context
+                val playbackChannel = playbackContext?.repairChannel
+                    ?.takeUnless { it == "both" }
+                    ?: current.channel
+                state = SessionState.Playing(session, current.sweep, current.channel, playbackContext)
+                playbackContext?.let {
+                    CalibrationActivity.updatePositionGuide(sessionId, it, CalibrationGuideState.MEASURING)
+                }
+                CalibrationActivity.updatePrimaryAction(sessionId, null)
+                emit("measurement.started", MeasurementSessionPayloads.started(sessionPayloadState(session), current.sweep, playbackContext), replyTo)
+                CalibrationActivity.updateStatus(sessionId, playbackContext?.let { "${it.label()}\nPlaying measurement sweep…" } ?: "Playing measurement sweep…")
+                touchWatchdog()
+                Thread {
+                    audioRunner.playSweep(
+                        session,
+                        current.sweep,
+                        playbackChannel,
+                        playbackContext,
+                        playback,
+                        onFinished = {
+                            submit {
+                                if (activeSession !== session ||
+                                    state !is SessionState.Playing ||
+                                    audioPlayback.resources !== playback ||
+                                    playback.stopped
+                                ) return@submit
+                                audioPlayback.pause()
+                                state = SessionState.Ready(session, current.sweep, playbackChannel, playbackContext)
+                                touchWatchdog()
+                                session.emit("measurement.finished", MeasurementSessionPayloads.finished(session.id, playbackContext), session.replyTo)
+                                CalibrationActivity.updateStatus(session.id, playbackContext?.let { "${it.label()}\nSweep finished. Keep the phone still." } ?: "Sweep finished. Keep the phone still or cancel.")
+                            }
+                        },
+                        onFailure = { error ->
+                            submit {
+                                if (activeSession === session && audioPlayback.resources === playback) {
+                                    finishWithError(session, "sweep_playback_failed", error.message ?: "Sweep playback failed")
+                                }
+                            }
+                        },
+                    )
+                }.apply {
+                    name = "sweetspot-sweep-playback"
+                    isDaemon = true
+                    start()
+                }
+            } catch (error: Throwable) {
+                finishWithError(session, "sweep_playback_failed", error.message ?: "Unable to play sweep")
+            }
+        }
+    }
+
+    fun isActive(): Boolean = activeSession != null
+
+    fun shutdown() {
+        if (closed) return
+        closed = true
+        audioPlayback.stop()
+        val done = CountDownLatch(1)
+        try {
+            executor.execute {
+                try {
+                    activeSession?.let { finishCancelled(it, "calibration_aborted", "Service stopped") }
+                } finally {
+                    audioPlayback.stop()
+                    done.countDown()
+                }
+            }
+            done.await(2, TimeUnit.SECONDS)
+        } catch (_: Throwable) {
+            audioPlayback.stop()
+        } finally {
+            audioPlayback.stop()
+            activeSession?.let(::releaseSessionAudioOperation)
+            executor.shutdownNow()
+        }
+    }
+
+    private fun requestExclusiveFocus(): Boolean {
+        return try {
+            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+                .setAudioAttributes(audioAttributes)
+                .setOnAudioFocusChangeListener({ change -> onFocusChange(change) }, mainHandler)
+                .build()
+            focusRequest = request
+            val result = audioManager.requestAudioFocus(request)
+            if (result != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                focusRequest = null
+                false
+            } else {
+                Log.i(TAG, "Exclusive audio focus granted")
+                true
+            }
+        } catch (error: Throwable) {
+            Log.w(TAG, "Exclusive audio focus request failed", error)
+            focusRequest = null
+            false
+        }
+    }
+
+    private fun onFocusChange(change: Int) {
+        if (change != AudioManager.AUDIOFOCUS_LOSS &&
+            change != AudioManager.AUDIOFOCUS_LOSS_TRANSIENT &&
+            change != AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
+        ) return
+        submit {
+            activeSession?.let {
+                finishWithError(it, "audio_focus_lost", "Audio focus was lost")
+            } ?: audioPlayback.stop()
+        }
+    }
+
+    private fun finishWithError(session: Session, code: String, message: String) {
+        finishSession(session, code to message)
+    }
+
+    private fun markMeasurementRestorationIfActive(sessionId: String) {
+        val session = activeSession
+        if (session?.id == sessionId && session.phase == "measurement") {
+            onMeasurementRestorationState("restoring", session.id, null)
+        }
+    }
+
+    private fun finishCancelled(session: Session, code: String, message: String) {
+        session.cancellationRequested = true
+        finishSession(session, code to message)
+    }
+
+    private fun finishSession(session: Session, error: Pair<String, String>?) {
+        if (activeSession !== session) return
+        if (state is SessionState.ValidationFinalized) return
+        if (state is SessionState.Finishing) return
+
+        if (session.phase == "validation" && session.validationRecoveryResult != null) {
+            presentValidationRecovery(session, session.validationAbortError ?: error)
+            return
+        }
+
+        if (state is SessionState.AwaitingValidationFinalization && error == null) {
+            showValidationFailure(session, "Validation finalization timed out")
+            return
+        }
+
+        state = SessionState.Finishing(session)
+        var finalError = error
+        if (session.cancellationRequested) session.finalOutcome = "cancelled"
+        else if (error != null) session.finalOutcome = "error"
+        watchdog?.cancel(false)
+        watchdog = null
+        audioPlayback.stop()
+
+        focusRequest?.let { request ->
+            try {
+                audioManager.abandonAudioFocusRequest(request)
+            } catch (_: Throwable) {
+            }
+        }
+        focusRequest = null
+
+        if (session.phase == "validation") {
+            if (error != null) session.validationAbortError = error
+            val originalError = session.validationAbortError
+            if (error != null) {
+                session.validationRecoveryResult = session.validationRecoveryGate.recover(
+                    candidateId = session.candidateId,
+                    restoreValidationState = { restoreValidationState(session) },
+                    rollbackCandidate = rollbackCandidate,
+                    verifyFinalState = finalStateVerifier,
+                )
+                finalError = validationRecoveryError(originalError, session.validationRecoveryResult!!)
+                presentValidationRecovery(session, finalError)
+                return
+            }
+
+            val restored = restoreValidationState(session)
+            if (!restored) {
+                val restoreError = "dsp_restore_failed" to
+                    "The TV could not verify restoration of its previous audio state"
+                session.validationAbortError = restoreError
+                session.validationRecoveryResult = session.validationRecoveryGate.recover(
+                    candidateId = session.candidateId,
+                    restoreValidationState = { false },
+                    rollbackCandidate = rollbackCandidate,
+                    verifyFinalState = finalStateVerifier,
+                )
+                finalError = validationRecoveryError(restoreError, session.validationRecoveryResult!!)
+                presentValidationRecovery(session, finalError)
+                return
+            }
+
+            publishSessionEvents(session, null)
+            state = SessionState.AwaitingValidationFinalization(session)
+            CalibrationActivity.updateStatus(
+                session.id,
+                "Validation measurements complete.\nWaiting for the TV to confirm the final result.",
+            )
+            CalibrationActivity.updatePrimaryAction(session.id, null)
+            touchWatchdog()
+            Log.i(TAG, "Validation measurements ended: ${session.id}")
+            return
+        }
+
+        onMeasurementRestorationState("restoring", session.id, null)
+        val restored = restoreMeasurementState()
+        if (restored) {
+            onMeasurementRestorationState("none", null, null)
+        } else {
+            val restoreMessage = "The TV could not verify restoration of its previous audio state"
+            onMeasurementRestorationState("failed", session.id, restoreMessage)
+            finalError = if (finalError == null) {
+                "dsp_restore_failed" to restoreMessage
+            } else {
+                finalError.first to "${finalError.second}. $restoreMessage"
+            }
+            session.finalOutcome = "error"
+        }
+        publishSessionEvents(session, finalError)
+        CalibrationActivity.finishForSession(session.id)
+        sessionFence.terminate(session.id)
+        activeSession = null
+        state = SessionState.Idle
+        releaseSessionAudioOperation(session)
+        val outcome = if (session.cancellationRequested) "cancelled" else "error=${finalError?.first}"
+        Log.i(TAG, "Calibration session ended: ${session.id}, outcome=$outcome")
+    }
+
+    private fun restoreValidationState(session: Session): Boolean {
+        if (!session.validationOverrideApplied || session.validationOverrideRestored) return true
+        val saved = bypassState ?: return false
+        val restored = try {
+            engine.endCalibrationValidation(saved)
+        } catch (restoreError: Throwable) {
+            Log.e(TAG, "Failed to restore validation DSP state", restoreError)
+            false
+        }
+        bypassState = null
+        if (restored) session.validationOverrideRestored = true
+        return restored
+    }
+
+    private fun restoreMeasurementState(): Boolean {
+        val saved = bypassState ?: return verifyFinalState()
+        val restored = try {
+            engine.endMeasurementBypass(saved)
+        } catch (restoreError: Throwable) {
+            Log.e(TAG, "Failed to restore measurement DSP state", restoreError)
+            false
+        }
+        bypassState = null
+        return restored && verifyFinalState()
+    }
+
+    private fun verifyFinalState(): Boolean = try {
+        finalStateVerifier()
+    } catch (error: Throwable) {
+        Log.e(TAG, "Failed to verify restored measurement DSP state", error)
+        false
+    }
+
+    private fun validationRecoveryError(
+        originalError: Pair<String, String>?,
+        recovery: ValidationRecoveryResult,
+    ): Pair<String, String>? {
+        if (recovery.finalStateVerified) return originalError
+        val recoveryReason = when {
+            !recovery.validationStateRestored ->
+                "The TV could not verify restoration of its pre-validation audio state"
+            !recovery.candidateRolledBack ->
+                "The pre-candidate calibration state could not be verified after rollback"
+            else ->
+                "The final calibration state could not be verified"
+        }
+        val code = if (!recovery.validationStateRestored) {
+            "dsp_restore_failed"
+        } else {
+            "candidate_rollback_failed"
+        }
+        val prefix = originalError?.let { "${it.first}: ${it.second}. " }.orEmpty()
+        return code to prefix + recoveryReason
+    }
+
+    private fun presentValidationRecovery(session: Session, finalError: Pair<String, String>?) {
+        if (activeSession !== session) return
+        if (!session.validationRecoveryEventsPublished) {
+            publishStateSnapshot(session)
+            finalError?.let { (code, message) ->
+                session.emit("measurement.error", MeasurementSessionPayloads.error(session.id, code, message), session.replyTo)
+            }
+            publishSessionEnded(session)
+            session.validationRecoveryEventsPublished = true
+        }
+
+        val recovery = session.validationRecoveryResult ?: return
+        if (!recovery.finalStateVerified) {
+            showValidationFailure(session, finalError?.second ?: "Calibration recovery could not be verified")
+            return
+        }
+
+        val original = session.validationAbortError ?: finalError
+        val outcome = if (original != null && isUserCalibrationCancellation(original.first)) {
+            "cancelled"
+        } else {
+            "error"
+        }
+        val result = calibrationResultText(
+            outcome,
+            if (outcome == "error") original?.second else null,
+            session.rollbackTargetActive,
+        )
+        session.validationFinalizationBlocked = false
+        session.validationFatal = false
+        state = SessionState.ValidationFinalized(session)
+        watchdog?.cancel(false)
+        watchdog = null
+        CalibrationActivity.updateStatus(session.id, "${result.title}\n${result.body}")
+        CalibrationActivity.updatePrimaryAction(session.id, "Done")
+        Log.i(TAG, "Validation recovery completed: ${session.id}, outcome=$outcome, code=${original?.first}")
+    }
+
+    private fun publishSessionEvents(session: Session, error: Pair<String, String>?) {
+        error?.let { (code, message) ->
+            session.emit("measurement.error", MeasurementSessionPayloads.error(session.id, code, message), session.replyTo)
+        }
+        publishSessionEnded(session)
+    }
+
+    private fun publishSessionEnded(session: Session) {
+        if (session.endedEventPublished) return
+        session.emit("calibrationSession.ended", sessionPayload(session), session.replyTo)
+        session.endedEventPublished = true
+    }
+
+    private fun publishStateSnapshot(session: Session) {
+        try {
+            session.emit("state.snapshot", stateSnapshotProvider(), session.replyTo)
+        } catch (error: Throwable) {
+            Log.e(TAG, "Failed to publish final calibration state", error)
+        }
+    }
+
+    private fun defaultCalibrationAbortMessage(code: String): String = when {
+        isUserCalibrationCancellation(code) -> "Calibration cancelled"
+        else -> "Calibration could not be validated"
+    }
+
+    private fun showValidationFailure(session: Session, message: String) {
+        if (activeSession !== session) return
+        session.validationFinalizationBlocked = true
+        session.validationFatal = true
+        state = SessionState.AwaitingValidationFinalization(session)
+        watchdog?.cancel(false)
+        watchdog = null
+        CalibrationActivity.updateStatus(
+            session.id,
+            "Calibration recovery error.\n$message\nThe candidate transaction remains available for recovery.",
+        )
+        CalibrationActivity.updatePrimaryAction(session.id, "Close")
+    }
+
+    private fun closeValidationUi(session: Session) {
+        if (activeSession !== session) return
+        watchdog?.cancel(false)
+        watchdog = null
+        CalibrationActivity.finishForSession(session.id)
+        sessionFence.terminate(session.id)
+        activeSession = null
+        state = SessionState.Idle
+        releaseSessionAudioOperation(session)
+    }
+
+    private fun releaseSessionAudioOperation(session: Session) {
+        if (!session.audioOperationHeld) return
+        session.audioOperationHeld = false
+        releaseAudioOperation()
+    }
+
+    private fun touchWatchdog() {
+        watchdog?.cancel(false)
+        watchdog = executor.schedule({
+            activeSession?.let { session ->
+                if (state is SessionState.AwaitingValidationFinalization) {
+                    showValidationFailure(session, "The TV did not receive a final calibration result in time")
+                } else {
+                    finishWithError(session, "measurement_timeout", "Calibration session timed out")
+                }
+            }
+        }, WATCHDOG_MS, TimeUnit.MILLISECONDS)
+    }
+
+    private fun validSessionId(value: String): Boolean = isValidMeasurementSessionId(value)
+
+    private fun validChannel(value: String): Boolean = value == "both" || value == "left" || value == "right"
+
+    private fun validPhase(value: String): Boolean = value == "measurement" || value == "validation"
+
+    private fun emitError(
+        emit: (String, org.json.JSONObject, String?) -> Unit,
+        replyTo: String?,
+        sessionId: String,
+        code: String,
+        message: String
+    ) {
+        emit("measurement.error", MeasurementSessionPayloads.error(sessionId, code, message), replyTo)
+    }
+
+    private fun submit(block: () -> Unit) {
+        if (closed) return
+        try {
+            executor.execute(block)
+        } catch (error: Throwable) {
+            Log.e(TAG, "Measurement command rejected", error)
+        }
+    }
+
+    private fun sessionPayload(session: Session): JSONObject =
+        MeasurementSessionPayloads.session(sessionPayloadState(session))
+
+    private fun sessionPayloadState(session: Session): MeasurementSessionPayloadState =
+        MeasurementSessionPayloadState(
+            sessionId = session.id,
+            channel = session.channel,
+            phase = session.phase,
+            finalOutcome = session.finalOutcome,
+            cancellationRequested = session.cancellationRequested,
+        )
+}
